@@ -315,9 +315,6 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.zeroinit.c"
 #include "test.harsh.c"
 #include "test.api.c"
-#include "test.golf.c"
-#include "test.autostatic.c"
-#include "test.autounreach.c"
 #include "test.spec.c"
 #include "test.bounds.c"
 #include "test.cert.c"
@@ -325,6 +322,7 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.alphabet.c"
 #include "test.insertion.c"
 #include "test.contexts.c"
+#include "test.completeness.c"
 #include "test.runtime.c"
 /* Generated defer/orelse torture tier — not committed (see .github/gen_torture.py).
  * Present only when the CI generator step has run; the suite builds without it. */
@@ -373,9 +371,6 @@ int main(void) {
 		{"api_2",    run_api_tests_2},
 		{"api_3",    run_api_tests_3},
 		{"api_4",    run_api_tests_4},
-		{"golf",     run_golf_tests},
-		{"autostatic", run_autostatic_tests},
-		{"autounreach", run_auto_unreachable_tests},
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
 		{"cert",     run_cert_tests},
@@ -383,6 +378,8 @@ int main(void) {
 		{"alphabet", run_alphabet_tests},
 		{"insertion", run_insertion_tests},
 		{"contexts", run_contexts_tests},
+		{"completeness", run_completeness_tests},
+		{"completeness_open", run_completeness_open_tests},
 		{"runtime",  run_runtime_tests},
 #ifdef HAVE_TORTURE
 		{"torture",  run_torture_tests},

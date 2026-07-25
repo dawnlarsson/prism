@@ -139,6 +139,39 @@ static const CxTmpl cx_atomic[] = {
     {"knr-def", "int fk(a) int a; { return a; } int f(void){ int q = fk(h2(%s)); goto L; L: return q; }"},
     {"file-scope", "%s\nint f(void){ goto L; L: return 0; }"},
     {"file-scope-tentative", "int t;\n%s\nint f(void){ return t; }"},
+    /* denser heads */
+    {"head-float", "int f(void){ float q = (float)(%s); goto L; L: return (int)q; }"},
+    {"head-double", "int f(void){ double q = (double)(%s); goto L; L: return (int)q; }"},
+    {"head-long-long", "int f(void){ long long q = %s; goto L; L: return (int)q; }"},
+    {"head-unsigned", "int f(void){ unsigned q = (unsigned)(%s); goto L; L: return (int)q; }"},
+    {"cast-paren", "int f(void){ int q = (int)(%s); goto L; L: return q; }"},
+    {"addr-of", "int f(void){ int tmp = %s; int *p = &tmp; goto L; L: return *p; }"},
+    {"subscript-idx", "int f(void){ int q = arr[%s]; goto L; L: return q; }"},
+    {"member-dot", "int f(void){ struct D d; d.f = %s; goto L; L: return d.f; }"},
+    {"cond-and", "int f(void){ int q = z && (%s); goto L; L: return q; }"},
+    {"cond-or", "int f(void){ int q = z || (%s); goto L; L: return q; }"},
+    {"assign-add", "int f(void){ int q = 0; q += %s; goto L; L: return q; }"},
+    {"assign-mul", "int f(void){ int q = 1; q *= %s; goto L; L: return q; }"},
+    {"postinc-neighbor", "int f(void){ int q = %s; q++; goto L; L: return q; }"},
+    {"neg-unary", "int f(void){ int q = -(%s); goto L; L: return q; }"},
+    {"not-unary", "int f(void){ int q = !(%s); goto L; L: return q; }"},
+    {"bitnot-unary", "int f(void){ int q = ~(%s); goto L; L: return q; }"},
+    {"shift-left", "int f(void){ int q = ((%s) << 1); goto L; L: return q; }"},
+    {"shift-right", "int f(void){ int q = ((%s) >> 1); goto L; L: return q; }"},
+    {"xor-bin", "int f(void){ int q = ((%s) ^ 1); goto L; L: return q; }"},
+    {"and-bin", "int f(void){ int q = ((%s) & 7); goto L; L: return q; }"},
+    {"or-bin", "int f(void){ int q = ((%s) | 1); goto L; L: return q; }"},
+    {"cmp-lt", "int f(void){ int q = ((%s) < 2); goto L; L: return q; }"},
+    {"cmp-eq", "int f(void){ int q = ((%s) == 0); goto L; L: return q; }"},
+    {"nested-paren", "int f(void){ int q = (((%s))); goto L; L: return q; }"},
+    {"array-init-tail", "int f(void){ int a[3] = {0, 1, %s}; goto L; L: return a[2]; }"},
+    {"switch-cond", "int f(void){ switch(%s){ default: break; } goto L; L: return 0; }"},
+    {"for-cond", "int f(void){ for(; %s;) break; goto L; L: return 0; }"},
+    {"for-incr", "int f(void){ int i=0; for(; i<1; i+= (%s)?1:1) break; goto L; L: return 0; }"},
+    {"do-cond", "int f(void){ do {} while(%s && 0); goto L; L: return 0; }"},
+    {"return-paren", "int f(void){ if (z) return (%s); goto L; L: return 0; }"},
+    {"cast-long", "int f(void){ long q = (long)(%s); goto L; L: return (int)q; }"},
+    {"ptr-nullish", "int f(void){ int *p = (%s) ? (int*)0 : (int*)0; (void)p; goto L; L: return 0; }"},
 };
 #define CX_NATOMIC ((int)(sizeof(cx_atomic) / sizeof(cx_atomic[0])))
 
@@ -181,15 +214,21 @@ static const CxTmpl cx_payload[] = {
     {"oe-goto", "g() orelse goto L"},
     {"oe-block", "g() orelse { h(1); }"},
     {"oe-bare-kw", "orelse"},
+    {"oe-zero", "g() orelse 0"},
+    {"oe-null", "g() orelse (void*)0"},
+    {"oe-five", "g() orelse 5"},
+    {"oe-chain-ret", "g() orelse g() orelse return 0"},
+    {"oe-block-ret", "g() orelse { return 0; }"},
     {"df-braceless", "defer h(1)"},
     {"df-braced", "defer { h(2); }"},
     {"df-bare-kw", "defer"},
+    {"df-empty", "defer { }"},
     {"df-oe-braceless", "defer h(z orelse 1)"},
     {"df-oe-braced", "defer { int w = z orelse 1; h(w); }"},
 };
 #define CX_NPAYLOAD ((int)(sizeof(cx_payload) / sizeof(cx_payload[0])))
 /* Composition uses expression payloads only (index range below). */
-#define CX_NPAYLOAD_EXPR 10
+#define CX_NPAYLOAD_EXPR 15
 
 #define CX_SRC_MAX 8192
 

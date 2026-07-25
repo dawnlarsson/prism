@@ -101,6 +101,22 @@ static const char *ins_corpus[] = {
     "static volatile int z; static int g(void){ return z; } "
     "int f(void){ int x = g(); int y = x; return x + y; }",
     "static volatile int z; int f(void){ raw int u; u = 3; return u + z; }",
+    /* more grammar surface for boundary insertion */
+    "static volatile int z; int f(void){ int *p = &z; return *p + z; }",
+    "static volatile int z; int f(void){ enum { A = 1, B }; return A + B + z; }",
+    "static volatile int z; _Atomic int *ap; int f(void){ return z + (ap ? 1 : 0); }",
+    "static volatile int z; int f(void){ constexpr int c = 3; return c + z; }",
+    "static volatile int z; int f(void){ int a[2][2] = {{1,2},{3,4}}; return a[0][1] + z; }",
+    "static volatile int z; int f(void){ _BitInt(8) b = 1; return (int)b + z; }",
+    "static volatile int z; int f(void){ int a = z; a += 1; a *= 2; a ^= 1; return a; }",
+    "static volatile int z; int f(void){ int *p = &z; int **pp = &p; return **pp; }",
+    "static volatile int z; int f(void){ typeof(z) t = z; typeof_unqual(z) u = z; return t + u; }",
+    "static volatile int z; int f(void){ _Generic(z, int: 1, default: 0); return z; }",
+    "static volatile int z; int f(void){ struct { int a, b; } s = {.a = 1, .b = z}; return s.a + s.b; }",
+    "static volatile int z; int f(void){ int a[4] = {0}; for (int i = 0; i < 4; i++) a[i] = i; return a[z&3]; }",
+    "static volatile int z; int f(void){ switch (z) { case 0: case 1: return 1; default: return 0; } }",
+    "static volatile int z; int f(void){ int x = z; return (x < 0 ? -x : x); }",
+    "static volatile int z; int f(void){ signed char c = (signed char)z; return (int)c; }",
 };
 #define INS_NCORPUS ((int)(sizeof(ins_corpus) / sizeof(ins_corpus[0])))
 #define INS_MAX_BOUNDS 512

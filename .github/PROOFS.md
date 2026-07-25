@@ -143,6 +143,32 @@ trichotomy as the insertion suite. ~45k transpiles per full run.
 > cleanup paste (the pre-existing accept-test only checked a substring and
 > missed it, now a hard reject with the braced form required).
 
+### 5c. `test.completeness.c`: T1′ transform/annotation completeness (suites: `completeness`, `completeness_open`)
+T2/T3 lock *classifier* and *defer-machine* totality; they do not exhaust
+**transform/annotation** products. This suite does not hand-pick cells: it
+locks small **axis alphabets** and sweeps their Cartesian products with
+machine-decidable oracles (contexts/insertion aggregation style — many cells,
+a handful of CHECKs + first-failure breadcrumb).
+
+Closed generative tiers (62 hunters, thousands of cells): denser stmt-defer×wrap, orelse
+primary×fallback×site (+ assign/multi/qual), auto-static factor+specials,
+goto×obstacle (incl. defer-call/two-decl/while; C23 if/switch-init into-block),
+polarity, hunt3 shapes, autounreach attr×site, bounds array×index×eval-context
+(~970), zeroinit + **zeroinit-dense** type×qual×init, defer-cfg nest×exit,
+feature-cube 2⁶×snips (~900), golf pins, reject-alphabet, **soft-ident**
+kw×role (~54), **orelse-actions** primary×action (~72), plus post-fix densifiers
+(ctrl-paren-defer, bounds-cast-oob, stmt-expr C7/C8, orelse type-junk in
+sizeof/_Alignof/typeof/_Generic including `T *` abstract declarators and nested
+typeof, cast/desig/CL orelse edges). Open tiers remain
+gated for residual hunt cells; cast-subscript / name-semantics /
+attr-multidecl / raw-suppress / linemarker / illformed / goto-if-init are
+closed green. Contexts atomic heads densified (~2250 cells); insertion
+corpus expanded.
+
+**`completeness_open`** is registered but skipped in the default full run —
+enable with `PRISM_COMPLETENESS_OPEN=1` or `PRISM_SUITE_ONLY=completeness_open`.
+Rule: hunt findings extend an *axis*, not a one-off smoke.
+
 ### 6. `--prism-verify` / `PRISM_VERIFY=1`: translation validation (T2, per compile)
 After emitting, prism re-runs its **entire pipeline** on the emitted C. The
 certificate has two arms, both sound and both demonstrated to fire:

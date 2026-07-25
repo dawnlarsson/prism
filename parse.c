@@ -1735,7 +1735,18 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 	}
 
 	/* Direct system include = first entry into a system file from user code.
-	 * Nested system headers (bits/…) must not be re-emitted as #include. */
+	 * Nested system headers (bits/…) must not be re-emitted as #include.
+	 * Flag `1 3` on a non-system-looking path must not sticky-skip the TU. */
+	if (is_entering && is_system && filename) {
+		const char *f = filename;
+		bool looks_system =
+		    strncmp(f, "/usr/include/", 13) == 0 || strncmp(f, "/usr/local/include/", 19) == 0 ||
+		    strncmp(f, "/Library/", 9) == 0 || strncmp(f, "/Applications/Xcode", 19) == 0 ||
+		    (strstr(f, "/lib/gcc/") && strstr(f, "/include/")) ||
+		    (strstr(f, "/lib/clang/") && strstr(f, "/include")) || strstr(f, "Windows Kits") ||
+		    strstr(f, "Program Files");
+		if (!looks_system) is_system = false;
+	}
 	bool direct_system = is_entering && is_system && !*in_system_include;
 	if (is_entering && is_system) *in_system_include = true;
 	else if (is_returning && !is_system)
@@ -2041,6 +2052,65 @@ static Token *tokenize(File *file) {
 			}
 		}
 		if (sp > 0) error_tok(stack[sp - 1], "unclosed delimiter '%c'", stack[sp - 1]->ch0);
+		/* User definitions of libc noreturn/special names are ordinary unless
+		 * explicitly annotated (_Noreturn / attr). Clear keyword-cache tags so
+		 * taint + auto-unreachable do not treat `int exit(void){…}` as builtin. */
+		{
+			HashMap user_builtin = {0};
+			Token *fname = NULL;
+			int depth = 0;
+			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+				if ((t->flags & TF_OPEN) && match_ch(t, '{')) {
+					if (depth == 0 && fname &&
+					    (fname->tag & (TT_NORETURN_FN | TT_SPECIAL_FN))) {
+						Token *np = tok_next(fname);
+						if (np && match_ch(np, '(') && tok_match(np)) {
+							Token *after = tok_next(tok_match(np));
+							/* Allow noise/attrs between ) and { */
+							while (after && after != t && after->kind != TK_EOF) {
+								Token *ae = p0_attribute_group_end(after);
+								if (ae) {
+									after = tok_next(ae);
+									continue;
+								}
+								if (after->kind == TK_PREP_DIR) {
+									after = tok_next(after);
+									continue;
+								}
+								break;
+							}
+							if (after == t)
+								hashmap_put(&user_builtin,
+									    tok_loc(fname),
+									    fname->len,
+									    (void *)1);
+						}
+					}
+					depth++;
+					fname = NULL;
+					continue;
+				}
+				if ((t->flags & TF_CLOSE) && match_ch(t, '}')) {
+					if (depth > 0) depth--;
+					continue;
+				}
+				if (depth != 0) continue;
+				if (match_ch(t, ';')) {
+					fname = NULL;
+					continue;
+				}
+				if (is_potential_func_name(t)) fname = t;
+			}
+			if (user_builtin.used > 0) {
+				for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
+					if ((s->tag & (TT_NORETURN_FN | TT_SPECIAL_FN)) &&
+					    hashmap_get(&user_builtin, tok_loc(s), s->len))
+						s->tag &= ~(TT_NORETURN_FN | TT_SPECIAL_FN);
+				}
+			}
+			hashmap_discard(&user_builtin);
+		}
+
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
 		// Propagate special-function taint transitively through wrapper chains.
 		if (saw_taint_kw || saw_asm_kw) {
@@ -2417,7 +2487,8 @@ static Token *tokenize(File *file) {
 				for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
 					char ch = s->ch0;
 					if (ch == ';' || ch == '{') break;
-					if (fwd_depth == 0 && ch == ',') break;
+					/* Post-declarator attrs bind to the preceding name only. */
+					if (fwd_depth == 0 && ch == ',' && post_decl_attr) break;
 					Token *attr_end = p0_attribute_group_end(s);
 					if (attr_end) {
 						s = attr_end;
@@ -2436,8 +2507,14 @@ static Token *tokenize(File *file) {
 						if (s->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
 							      TT_TYPE | TT_STORAGE))
 							continue;
+						if (post_decl_attr) {
+							fn_name = s;
+							break;
+						}
+						/* Prefix _Noreturn / [[noreturn]] / leading attr:
+						 * tag every declarator in the list. */
+						hashmap_put(&nr_map, tok_loc(s), s->len, (void *)1);
 						fn_name = s;
-						break;
 					}
 				}
 			}
@@ -2461,7 +2538,10 @@ static Token *tokenize(File *file) {
 				}
 			}
 			if (!fn_name) continue;
-			hashmap_put(&nr_map, tok_loc(fn_name), fn_name->len, (void *)1);
+			if (post_decl_attr)
+				hashmap_put(&nr_map, tok_loc(fn_name), fn_name->len, (void *)1);
+			else if (!hashmap_get(&nr_map, tok_loc(fn_name), fn_name->len))
+				hashmap_put(&nr_map, tok_loc(fn_name), fn_name->len, (void *)1);
 		}
 
 		if (nr_map.used > 0) {
@@ -2871,10 +2951,55 @@ static PRISM_PURE Token *skip_to_semicolon(Token *tok, Token *end) {
 }
 
 /* Long same-name chains (stress TUs) get a token_index-sorted timeline for
- * O(log n) lookup instead of newest→oldest walks. Short chains keep the walk. */
+ * O(log n) lookup instead of newest→oldest walks. Short chains keep the walk.
+ * Timelines are rebuilt during Pass 1 as chains grow (not only after prescan),
+ * so bounds-check array shadows do not force O(n²) linear walks mid-TU. */
 static PRISM_THREAD_LOCAL HashMap td_tl_map; /* name → packed (base<<32)|count into td_tl_idxs */
 static PRISM_THREAD_LOCAL int *td_tl_idxs;
 static PRISM_THREAD_LOCAL int td_max_chain_seen; /* capped sample; ≥8 triggers timeline build */
+static PRISM_THREAD_LOCAL int td_tl_count_at_build; /* typedef_table.count when timelines last built */
+
+/* Bounds-check array locals live here — not in the ordinary typedef/shadow
+ * chain — so Pass 1/2 typedef lookups are not taxed by `int a[N]` × thousands
+ * of functions. Lookups use the same mid-Pass1 timeline pattern as typedefs. */
+typedef struct {
+	char *name;
+	int prev_index;
+	uint32_t token_index;
+	uint32_t scope_open_idx;
+	uint32_t scope_close_idx;
+	uint16_t len;
+	uint8_t array_rank;
+	bool array_dim_complete : 1;
+	bool is_vla_var : 1;
+	bool is_param : 1;
+} BoundsArrayEntry;
+
+typedef struct {
+	BoundsArrayEntry *entries;
+	int count;
+	int capacity;
+	HashMap name_map;
+	uint64_t bloom;
+} BoundsArrayTable;
+
+static PRISM_THREAD_LOCAL BoundsArrayTable bounds_array_table;
+static PRISM_THREAD_LOCAL HashMap ba_tl_map;
+static PRISM_THREAD_LOCAL int *ba_tl_idxs;
+static PRISM_THREAD_LOCAL int ba_max_chain_seen;
+static PRISM_THREAD_LOCAL int ba_tl_count_at_build;
+
+static void bounds_array_table_reset(void) {
+	bounds_array_table.entries = NULL;
+	bounds_array_table.count = 0;
+	bounds_array_table.capacity = 0;
+	bounds_array_table.bloom = 0;
+	hashmap_discard(&bounds_array_table.name_map);
+	hashmap_discard(&ba_tl_map);
+	ba_tl_idxs = NULL;
+	ba_max_chain_seen = 0;
+	ba_tl_count_at_build = 0;
+}
 
 static void typedef_table_reset(void) {
 	typedef_table.entries = NULL;
@@ -2885,6 +3010,8 @@ static void typedef_table_reset(void) {
 	hashmap_discard(&td_tl_map);
 	td_tl_idxs = NULL;
 	td_max_chain_seen = 0;
+	td_tl_count_at_build = 0;
+	bounds_array_table_reset();
 }
 
 static PRISM_PURE int typedef_get_index(char *name, int len) {
@@ -2901,6 +3028,7 @@ static int td_tl_cmp_tok(const void *pa, const void *pb) {
 static void td_build_timelines(void) {
 	hashmap_discard(&td_tl_map);
 	td_tl_idxs = NULL;
+	td_tl_count_at_build = typedef_table.count;
 	if (td_max_chain_seen < 8 || !typedef_table.name_map.buckets) return;
 
 	/* Walk name_map heads only (one probe per unique name). */
@@ -2961,6 +3089,161 @@ static PRISM_PURE TypedefEntry *td_lookup_timeline(char *name, int len, uint32_t
 	return tag_fallback;
 }
 
+static PRISM_PURE int bounds_array_get_index(char *name, int len) {
+	void *val = hashmap_get(&bounds_array_table.name_map, name, len);
+	return val ? (int)(intptr_t)val - 1 : -1;
+}
+
+static int ba_tl_cmp_tok(const void *pa, const void *pb) {
+	uint32_t ta = bounds_array_table.entries[*(const int *)pa].token_index;
+	uint32_t tb = bounds_array_table.entries[*(const int *)pb].token_index;
+	return (ta > tb) - (ta < tb);
+}
+
+static void ba_build_timelines(void) {
+	hashmap_discard(&ba_tl_map);
+	ba_tl_idxs = NULL;
+	ba_tl_count_at_build = bounds_array_table.count;
+	if (ba_max_chain_seen < 8 || !bounds_array_table.name_map.buckets) return;
+
+	int slots = 0;
+	int cap = bounds_array_table.name_map.capacity;
+	for (int b = 0; b < cap; b++) {
+		HashEntry *ent = &bounds_array_table.name_map.buckets[b];
+		if (!ent->key || ent->key == TOMBSTONE) continue;
+		int head = (int)(intptr_t)ent->val - 1;
+		int run = 0;
+		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index) run++;
+		if (run >= 8) slots += run;
+	}
+	if (!slots) return;
+
+	ba_tl_idxs = arena_alloc_uninit(&ctx->main_arena, (size_t)slots * sizeof(int));
+	int pos = 0;
+	for (int b = 0; b < cap; b++) {
+		HashEntry *ent = &bounds_array_table.name_map.buckets[b];
+		if (!ent->key || ent->key == TOMBSTONE) continue;
+		int head = (int)(intptr_t)ent->val - 1;
+		int run = 0;
+		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index) run++;
+		if (run < 8) continue;
+		int base = pos;
+		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index)
+			ba_tl_idxs[pos++] = j;
+		qsort(ba_tl_idxs + base, (size_t)run, sizeof(int), ba_tl_cmp_tok);
+		hashmap_put(&ba_tl_map, ent->key, ent->key_len,
+			    (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run));
+	}
+}
+
+static PRISM_PURE BoundsArrayEntry *ba_lookup_timeline(char *name, int len, uint32_t cur) {
+	void *val = hashmap_get(&ba_tl_map, name, len);
+	if (!val) return NULL;
+	uint32_t base = (uint32_t)((uintptr_t)val >> 32);
+	uint32_t run = (uint32_t)(uintptr_t)val;
+	int lo = (int)base, hi = (int)base + (int)run;
+	while (lo < hi) {
+		int mid = lo + ((hi - lo) >> 1);
+		if (bounds_array_table.entries[ba_tl_idxs[mid]].token_index <= cur)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	for (int p = lo - 1; p >= (int)base; p--) {
+		BoundsArrayEntry *e = &bounds_array_table.entries[ba_tl_idxs[p]];
+		if (cur >= e->scope_open_idx && cur < e->scope_close_idx) return e;
+	}
+	return NULL;
+}
+
+static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t array_rank,
+			     bool dim_complete, bool is_vla_var, bool is_param) {
+	int existing = bounds_array_get_index(name, len);
+	if (existing >= 0) {
+		BoundsArrayEntry *prev = &bounds_array_table.entries[existing];
+		if (prev->token_index == token_index && prev->scope_open_idx == td_scope_open &&
+		    prev->scope_close_idx == td_scope_close) {
+			prev->array_rank = array_rank;
+			prev->array_dim_complete = dim_complete;
+			prev->is_vla_var = is_vla_var;
+			prev->is_param = is_param;
+			return;
+		}
+	}
+
+	ARENA_ENSURE_CAP(&ctx->main_arena,
+			 bounds_array_table.entries,
+			 bounds_array_table.count + 1,
+			 bounds_array_table.capacity,
+			 32,
+			 BoundsArrayEntry);
+	int new_index = bounds_array_table.count++;
+	BoundsArrayEntry *e = &bounds_array_table.entries[new_index];
+	e->name = name;
+	e->len = (uint16_t)len;
+	e->prev_index = existing;
+	e->token_index = token_index;
+	e->scope_open_idx = td_scope_open;
+	e->scope_close_idx = td_scope_close;
+	e->array_rank = array_rank;
+	e->array_dim_complete = dim_complete;
+	e->is_vla_var = is_vla_var;
+	e->is_param = is_param;
+	hashmap_put(&bounds_array_table.name_map, name, len, (void *)(intptr_t)(new_index + 1));
+	bounds_array_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
+	int cl = 1;
+	for (int p = e->prev_index; p >= 0 && cl < 8; p = bounds_array_table.entries[p].prev_index) cl++;
+	if (cl > ba_max_chain_seen) ba_max_chain_seen = cl;
+	if (ba_max_chain_seen >= 8) {
+		int since = bounds_array_table.count - ba_tl_count_at_build;
+		if (!ba_tl_idxs || since >= 64) ba_build_timelines();
+	}
+}
+
+static PRISM_PURE BoundsArrayEntry *bounds_array_lookup(Token *tok) {
+	if (!is_identifier_like(tok)) return NULL;
+	unsigned c0 = tok->ch0, tl = tok->len;
+	if (!(bounds_array_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
+	char *name = tok_loc(tok);
+	uint32_t cur = tok_idx(tok);
+	if (ba_tl_idxs) {
+		int idx = bounds_array_get_index(name, (int)tok->len);
+		while (idx >= ba_tl_count_at_build) {
+			BoundsArrayEntry *e = &bounds_array_table.entries[idx];
+			if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx)
+				return e;
+			idx = e->prev_index;
+		}
+		BoundsArrayEntry *hit = ba_lookup_timeline(name, (int)tok->len, cur);
+		if (hit) return hit;
+		if (hashmap_get(&ba_tl_map, name, (int)tok->len)) return NULL;
+		while (idx >= 0) {
+			BoundsArrayEntry *e = &bounds_array_table.entries[idx];
+			if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx)
+				return e;
+			idx = e->prev_index;
+		}
+		return NULL;
+	}
+	int idx = bounds_array_get_index(name, (int)tok->len);
+	while (idx >= 0) {
+		BoundsArrayEntry *e = &bounds_array_table.entries[idx];
+		if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx)
+			return e;
+		idx = e->prev_index;
+	}
+	return NULL;
+}
+
+static PRISM_PURE BoundsArrayEntry *bounds_array_entry_for_token(Token *t) {
+	for (int ix = bounds_array_get_index(tok_loc(t), t->len); ix >= 0;
+	     ix = bounds_array_table.entries[ix].prev_index) {
+		BoundsArrayEntry *e = &bounds_array_table.entries[ix];
+		if (e->token_index == tok_idx(t)) return e;
+	}
+	return NULL;
+}
+
 static void
 typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
 	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
@@ -3018,6 +3301,12 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	int cl = 1;
 	for (int p = e->prev_index; p >= 0 && cl < 8; p = typedef_table.entries[p].prev_index) cl++;
 	if (cl > td_max_chain_seen) td_max_chain_seen = cl;
+	/* Rebuild mid-Pass1 so long same-name chains stay O(log n).
+	 * Cadence: first at chain≥8, then every 64 new table entries. */
+	if (td_max_chain_seen >= 8) {
+		int since = typedef_table.count - td_tl_count_at_build;
+		if (!td_tl_idxs || since >= 64) td_build_timelines();
+	}
 }
 
 static inline bool is_soft_keyword_identifier(Token *tok);
@@ -3033,10 +3322,35 @@ static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
 	if (td_tl_idxs) {
+		TypedefEntry *tag_fallback = NULL;
+		int idx = typedef_get_index(name, (int)tok->len);
+		/* Entries added since the last build are absent from the sorted
+		 * timeline. Walk only that short newest prefix (cadence ≤64). */
+		while (idx >= td_tl_count_at_build) {
+			TypedefEntry *e = &typedef_table.entries[idx];
+			if (e->token_index <= cur && cur >= e->scope_open_idx &&
+			    cur < e->scope_close_idx) {
+				if (!e->is_struct_tag) return e;
+				if (!tag_fallback) tag_fallback = e;
+			}
+			idx = e->prev_index;
+		}
 		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, false);
 		if (hit) return hit;
-		/* No timeline for this name (short chain) or no in-scope hit — fall through. */
+		if (tag_fallback) return tag_fallback;
+		/* Name has a timeline → old entries are covered; definitive miss. */
 		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+		/* Short chain (no timeline): finish the ordinary walk from idx. */
+		while (idx >= 0) {
+			TypedefEntry *e = &typedef_table.entries[idx];
+			if (e->token_index <= cur && cur >= e->scope_open_idx &&
+			    cur < e->scope_close_idx) {
+				if (!e->is_struct_tag) return e;
+				if (!tag_fallback) tag_fallback = e;
+			}
+			idx = e->prev_index;
+		}
+		return tag_fallback;
 	}
 	int idx = typedef_get_index(name, tok->len);
 	// ISO C11 §6.2.3: tag namespace is separate from ordinary identifiers.
@@ -3060,9 +3374,25 @@ static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
 	if (td_tl_idxs) {
+		int idx = typedef_get_index(name, (int)tok->len);
+		while (idx >= td_tl_count_at_build) {
+			TypedefEntry *e = &typedef_table.entries[idx];
+			if (e->is_struct_tag && e->token_index <= cur && cur >= e->scope_open_idx &&
+			    cur < e->scope_close_idx)
+				return e;
+			idx = e->prev_index;
+		}
 		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, true);
 		if (hit) return hit;
 		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+		while (idx >= 0) {
+			TypedefEntry *e = &typedef_table.entries[idx];
+			if (e->is_struct_tag && e->token_index <= cur && cur >= e->scope_open_idx &&
+			    cur < e->scope_close_idx)
+				return e;
+			idx = e->prev_index;
+		}
+		return NULL;
 	}
 	int idx = typedef_get_index(name, tok->len);
 	while (idx >= 0) {
@@ -3077,12 +3407,22 @@ static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 
 static inline PRISM_PURE int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
-	if (!e) return 0;
+	if (!e) {
+		BoundsArrayEntry *be = bounds_array_lookup(tok);
+		if (!be || be->is_param) return 0;
+		return TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
+	}
 	if (e->is_enum_const) return TDF_ENUM_CONST;
-	if (e->is_shadow)
-		return (e->is_volatile ? TDF_VOLATILE : 0) |
-		       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
-		       (e->is_atomic ? TDF_ATOMIC : 0) | (e->is_array ? TDF_ARRAY : 0);
+	if (e->is_shadow) {
+		int fl = (e->is_volatile ? TDF_VOLATILE : 0) |
+			 (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
+			 (e->is_atomic ? TDF_ATOMIC : 0) | (e->is_array ? TDF_ARRAY : 0);
+		if (!(fl & TDF_ARRAY)) {
+			BoundsArrayEntry *be = bounds_array_lookup(tok);
+			if (be && !be->is_param) fl |= TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
+		}
+		return fl;
+	}
 	if (e->is_vla_var)
 		return TDF_VLA | (e->is_param ? TDF_PARAM : 0) |
 		       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
@@ -3113,6 +3453,14 @@ static inline PRISM_PURE bool _is_known_typedef(Token *tok) {
 #define is_func_typedef(tok) (typedef_flags(tok) & TDF_FUNC)
 #define is_volatile_typedef(tok) (typedef_flags(tok) & TDF_VOLATILE)
 #define has_volatile_member_typedef(tok) (typedef_flags(tok) & TDF_HAS_VOL_MEMBER)
+
+static PRISM_PURE uint8_t array_rank_for_tok(Token *t) {
+	TypedefEntry *te = typedef_lookup(t);
+	if (te && te->array_rank > 0) return te->array_rank;
+	BoundsArrayEntry *be = bounds_array_lookup(t);
+	if (be && be->array_rank > 0) return be->array_rank;
+	return 0;
+}
 
 static PRISM_PURE bool is_type_keyword(Token *tok) {
 	if (tok->tag & TT_TYPE) return true;
@@ -3946,18 +4294,17 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 				r->is_vla = true;
 				if (tf & TDF_ARRAY) {
 					r->is_array = true;
-					TypedefEntry *te = typedef_lookup(t);
-					if (te && te->array_rank > 0 && r->type_array_rank < te->array_rank)
-						r->type_array_rank = te->array_rank;
+					uint8_t rk = array_rank_for_tok(t);
+					if (rk > 0 && r->type_array_rank < rk) r->type_array_rank = rk;
 				}
 				break;
 			}
 			/* `typeof(a)` / `_Atomic(a)` where `a` is a fixed array shadow. */
 			if (tf & TDF_ARRAY) {
 				r->is_array = true;
-				TypedefEntry *te = typedef_lookup(t);
-				if (te && te->array_rank > 0 && r->type_array_rank < te->array_rank)
-					r->type_array_rank = te->array_rank;
+				uint8_t rk = array_rank_for_tok(t);
+				if (rk > 0 && r->type_array_rank < rk)
+					r->type_array_rank = rk;
 				else if (r->type_array_rank == 0)
 					r->type_array_rank = 1;
 				break;
@@ -4349,8 +4696,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		}
 		if (is_array_typedef(bt)) {
 			base_is_array = true;
-			TypedefEntry *te = typedef_lookup(bt);
-			if (te) base_array_rank = te->array_rank;
+			base_array_rank = array_rank_for_tok(bt);
 			break;
 		}
 		if (is_func_typedef(bt)) {

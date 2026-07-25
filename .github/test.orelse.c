@@ -8519,6 +8519,10 @@ static int oe_ctrl_expect(OeCtrlKind ctrl, OeCtrlPos pos, OeFormKind form) {
 	if (pos == OE_POS_BODY_PAREN && (form == OE_FORM_CHAIN || form == OE_FORM_BLOCK))
 		return 0;
 	if (pos == OE_POS_BODY_BARE && form == OE_FORM_BLOCK) return -1; /* needs braces */
+	/* `do` + declaration statement without braces is ill-formed (ISO + Prism). */
+	if (pos == OE_POS_BODY_BARE && ctrl == OE_CTRL_DO &&
+	    (form == OE_FORM_DECL || form == OE_FORM_CHAIN))
+		return 0;
 	return 1;
 }
 

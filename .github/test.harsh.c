@@ -579,14 +579,5 @@ void run_harsh_review_tests(void) {
     test_harsh_braceless_switch_body_snapshot_limit();
     test_harsh_if_init_else_goto_safety_deep_do_missed();
     test_harsh_if_init_else_body_goto_safety_deep_do_missed();
-    test_harsh_stray_case_outside_switch_rejected();
-    test_harsh_stray_default_outside_switch_rejected();
-    test_harsh_plain_stray_case_rejected();
-    test_harsh_plain_stray_default_rejected();
-    test_harsh_file_scope_control_statements_rejected();
-    /* Removed: pure C-grammar validation tests (`int x,,y;`,
-     * `enum E { A=1 B=2 }`, `''`, `0x`, attribute on a number literal, etc.).
-     * Prism is a transpiler, not a compiler front-end; rejecting malformed
-     * C input is the back-end C compiler's job.  See SPEC §1 "Input
-     * Contract". */
+    /* stray case/default + file-scope control → completeness gen/reject-alphabet */
 }
