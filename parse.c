@@ -1112,28 +1112,32 @@ static void init_keyword_map(void) {
 	    {"bool", TT_TYPE, true, TF_SOFT_KW},
 	    {"_Complex", TT_TYPE, true},
 	    {"_Imaginary", TT_TYPE, true},
-	    {"__int128", TT_TYPE, true},
-	    {"__int128_t", TT_TYPE, true},
-	    {"__uint128", TT_TYPE, true},
-	    {"__uint128_t", TT_TYPE, true},
-	    {"__int8", TT_TYPE, true},
-	    {"__int16", TT_TYPE, true},
-	    {"__int32", TT_TYPE, true},
-	    {"__int64", TT_TYPE, true},
-	    {"__float128", TT_TYPE, true},
-	    {"__float80", TT_TYPE, true},
-	    {"__fp16", TT_TYPE, true},
-	    {"__bf16", TT_TYPE, true},
-	    {"_Float16", TT_TYPE, true},
-	    {"_Float32", TT_TYPE, true},
-	    {"_Float64", TT_TYPE, true},
-	    {"_Float128", TT_TYPE, true},
-	    {"_Float32x", TT_TYPE, true},
-	    {"_Float64x", TT_TYPE, true},
-	    {"_Float128x", TT_TYPE, true},
-	    {"_Decimal32", TT_TYPE, true},
-	    {"_Decimal64", TT_TYPE, true},
-	    {"_Decimal128", TT_TYPE, true},
+	    /* Extension type spellings are soft: after an established type they
+	     * are ordinary declarator names (`int _Float32;`, `int __int64;`) on
+	     * clang/gcc, matching `bool`. As a lone type specifier they keep
+	     * TT_TYPE so `_Float32 x;` / `__int64 y;` still zero-init. */
+	    {"__int128", TT_TYPE, true, TF_SOFT_KW},
+	    {"__int128_t", TT_TYPE, true, TF_SOFT_KW},
+	    {"__uint128", TT_TYPE, true, TF_SOFT_KW},
+	    {"__uint128_t", TT_TYPE, true, TF_SOFT_KW},
+	    {"__int8", TT_TYPE, true, TF_SOFT_KW},
+	    {"__int16", TT_TYPE, true, TF_SOFT_KW},
+	    {"__int32", TT_TYPE, true, TF_SOFT_KW},
+	    {"__int64", TT_TYPE, true, TF_SOFT_KW},
+	    {"__float128", TT_TYPE, true, TF_SOFT_KW},
+	    {"__float80", TT_TYPE, true, TF_SOFT_KW},
+	    {"__fp16", TT_TYPE, true, TF_SOFT_KW},
+	    {"__bf16", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float16", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float32", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float64", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float128", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float32x", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float64x", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Float128x", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Decimal32", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Decimal64", TT_TYPE, true, TF_SOFT_KW},
+	    {"_Decimal128", TT_TYPE, true, TF_SOFT_KW},
 	    {"typeof_unqual", TT_TYPE | TT_TYPEOF, true, TF_SOFT_KW},
 	    {"__typeof_unqual__", TT_TYPE | TT_TYPEOF, true},
 	    {"__typeof_unqual", TT_TYPE | TT_TYPEOF, true},
@@ -1219,14 +1223,44 @@ static void init_keyword_map(void) {
 	ctx->keyword_cache_features = ctx->features;
 }
 
+/* C11 6.4.3: \uXXXX (4 hex) or \UXXXXXXXX (8 hex). Returns length or 0. */
+static int read_ucn(char *p) {
+	if (*p != '\\') return 0;
+	int nhex;
+	if (p[1] == 'u')
+		nhex = 4;
+	else if (p[1] == 'U')
+		nhex = 8;
+	else
+		return 0;
+	for (int i = 0; i < nhex; i++)
+		if (!IS_XDIGIT(p[2 + i])) return 0;
+	return 2 + nhex;
+}
+
 static int read_ident(char *start) {
 	char *p = start;
-	if ((unsigned char)*p >= 0x80) p++;
+	int ucn = read_ucn(p);
+	if (ucn)
+		p += ucn;
+	else if ((unsigned char)*p >= 0x80)
+		p++;
 	else if (IS_ALPHA(*p))
 		p++;
 	else
 		return 0;
-	while (ident_char[(unsigned char)*p]) p++;
+	for (;;) {
+		if (ident_char[(unsigned char)*p]) {
+			p++;
+			continue;
+		}
+		ucn = read_ucn(p);
+		if (ucn) {
+			p += ucn;
+			continue;
+		}
+		break;
+	}
 	return p - start;
 }
 
@@ -1288,20 +1322,53 @@ static bool is_space(char c) {
 #define SWAR_HAS_ZERO(v) (((v) - 0x0101010101010101ULL) & ~(v) & 0x8080808080808080ULL)
 #define SWAR_BROADCAST(c) (0x0101010101010101ULL * (uint8_t)(c))
 
-static char *skip_line_comment(char *p) {
-	while ((uintptr_t)p & 7) {
-		if (*p == '\0' || *p == '\n') return p;
-		p++;
-	}
-	uint64_t nl_mask = SWAR_BROADCAST('\n');
+/* Phase 2: `\`+newline (and `\r\n`) inside // comments is spliced, so the
+ * comment continues on the next physical line. Line numbers still advance. */
+static char *skip_line_comment(char *p, TokState *ts) {
 	for (;;) {
-		uint64_t v;
-		memcpy(&v, p, 8);
-		if (SWAR_HAS_ZERO(v) || SWAR_HAS_ZERO(v ^ nl_mask)) {
-			for (int i = 0; i < 8; i++)
-				if (p[i] == '\0' || p[i] == '\n') return p + i;
+		while ((uintptr_t)p & 7) {
+			if (*p == '\0') return p;
+			if (*p == '\\') {
+				if (p[1] == '\n') {
+					p += 2;
+					ts->line_no++;
+					continue;
+				}
+				if (p[1] == '\r' && p[2] == '\n') {
+					p += 3;
+					ts->line_no++;
+					continue;
+				}
+			}
+			if (*p == '\n') return p;
+			p++;
 		}
-		p += 8;
+		uint64_t nl_mask = SWAR_BROADCAST('\n');
+		uint64_t bs_mask = SWAR_BROADCAST('\\');
+		for (;;) {
+			uint64_t v;
+			memcpy(&v, p, 8);
+			if (SWAR_HAS_ZERO(v) || SWAR_HAS_ZERO(v ^ nl_mask) || SWAR_HAS_ZERO(v ^ bs_mask)) {
+				for (int i = 0; i < 8; i++) {
+					if (p[i] == '\0') return p + i;
+					if (p[i] == '\\') {
+						if (p[i + 1] == '\n') {
+							p += i + 2;
+							ts->line_no++;
+							goto realign;
+						}
+						if (p[i + 1] == '\r' && p[i + 2] == '\n') {
+							p += i + 3;
+							ts->line_no++;
+							goto realign;
+						}
+					}
+					if (p[i] == '\n') return p + i;
+				}
+			}
+			p += 8;
+		}
+	realign:;
 	}
 }
 
@@ -1704,6 +1771,9 @@ static Token *tokenize(File *file) {
 	File *base_file = file;
 	ctx->current_file = file;
 	char *p = file->contents;
+	/* Skip leading UTF-8 BOM (EF BB BF). UTF-16 BOMs are rejected earlier. */
+	if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+		p += 3;
 	token_pool_ensure(token_count + file->contents_len / 2 + 4096);
 	uint32_t first_idx = 0;
 	uint32_t cur_idx = 0;
@@ -1741,7 +1811,7 @@ static Token *tokenize(File *file) {
 		}
 
 		if (p[0] == '/' && p[1] == '/') {
-			p = skip_line_comment(p + 2);
+			p = skip_line_comment(p + 2, &ts);
 			ts.has_space = true;
 			continue;
 		}
@@ -3043,6 +3113,10 @@ static inline bool orelse_shadow_is_kw(Token *prev) {
 	 * needs the second orelse classified as a keyword. goto is already
 	 * handled by orelse_is_label_or_goto_target above. */
 	if (prev->tag & TT_RETURN) return false;
+	/* Soft keywords (incl. type spellings used as names: `_Float32`, `bool`,
+	 * `asm`) are expression-ending. `bool orelse = 0` is handled in
+	 * orelse_kw_at via soft_keyword_decl_name_boundary before this runs. */
+	if (is_soft_keyword_identifier(prev)) return is_expr_ending_brace(prev);
 	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT | TT_SKIP_DECL |
 			 TT_ALIGNAS | TT_INLINE | TT_ATTR))
 		return false;
@@ -4985,15 +5059,51 @@ static bool generic_decl_rewrite_target(Token *generic_tok,
 	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start)) return false;
 	if (match_set(after, CH(';') | CH(',')) || (after->tag & TT_ATTR) || is_c23_attr(after)) {
 		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+			Token *name = t;
 			Token *call_open = skip_noise(tok_next(t));
-			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
-				continue;
-			if (!params_look_like_decls(call_open)) continue;
-			*name_out = t;
-			*params_open_out = call_open;
-			*params_close_out = tok_match(call_open);
-			*next_out = after;
-			return true;
+			/* Plain `name(params)` association. */
+			if (is_valid_varname(t) && call_open && match_ch(call_open, '(') &&
+			    tok_match(call_open) && params_look_like_decls(call_open)) {
+				*name_out = name;
+				*params_open_out = call_open;
+				*params_close_out = tok_match(call_open);
+				*next_out = after;
+				return true;
+			}
+			/* Glibc-style parenthesized / cast-wrapped name:
+			 * `(name)(params)` or `(const char *)(name)(params)`. */
+			if (!match_ch(t, '(') || !tok_match(t)) continue;
+			Token *inner = skip_noise(tok_next(t));
+			Token *paren_close = tok_match(t);
+			Token *after_paren = skip_noise(tok_next(paren_close));
+			/* Peel one layer of cast-like `(type)(name)` before `(params)`. */
+			if (inner && !is_valid_varname(inner) && after_paren && match_ch(after_paren, '(') &&
+			    tok_match(after_paren)) {
+				Token *maybe_name = skip_noise(tok_next(after_paren));
+				Token *name_close = tok_match(after_paren);
+				Token *params = name_close ? skip_noise(tok_next(name_close)) : NULL;
+				if (maybe_name && is_valid_varname(maybe_name) &&
+				    skip_noise(tok_next(maybe_name)) == name_close && params &&
+				    match_ch(params, '(') && tok_match(params) &&
+				    params_look_like_decls(params)) {
+					*name_out = maybe_name;
+					*params_open_out = params;
+					*params_close_out = tok_match(params);
+					*next_out = after;
+					return true;
+				}
+			}
+			/* `(name)(params)` */
+			if (inner && is_valid_varname(inner) &&
+			    skip_noise(tok_next(inner)) == paren_close && after_paren &&
+			    match_ch(after_paren, '(') && tok_match(after_paren) &&
+			    params_look_like_decls(after_paren)) {
+				*name_out = inner;
+				*params_open_out = after_paren;
+				*params_close_out = tok_match(after_paren);
+				*next_out = after;
+				return true;
+			}
 		}
 	}
 	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {

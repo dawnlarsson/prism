@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-14447%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-14478%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a lightweight and fast transpiler that makes C safer and faster without changing how you write it.
 
-- **14447+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
+- **14478+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C:** OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler:** full semantic analysis before a single byte is emitted
 - **Progressive optimization:** auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -548,6 +548,9 @@ Usage: prism [options] source.c... [-o output]
 Commands:
   run <src.c> [-- args]  Transpile, compile, and run (args passed to binary)
   transpile <src.c>      Output transpiled C to stdout
+  check <tool> [args]    Run a static analyzer (cppcheck, clang-tidy, ...) on
+                         transpiled sources; .c/.i args are swapped for analysis
+                         artifacts, findings map to original lines via #line
   install [src.c...]     Install prism to /usr/local/bin/prism
 
 Prism Flags (consumed, not passed to CC):
@@ -565,6 +568,8 @@ Prism Flags (consumed, not passed to CC):
   --prism-cc=<compiler>  Use specific compiler
   --prism-verbose        Show commands
   --prism-prof           Print per-phase timing breakdown
+  --prism-verify         Translation validation: re-transpile emitted C,
+                         require a fixed point (also: PRISM_VERIFY env)
   --                     Separator: remaining args are passed to the binary in `run` mode
 
 All other flags are passed through to CC.

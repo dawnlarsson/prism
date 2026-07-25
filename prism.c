@@ -1614,7 +1614,14 @@ static bool token_in_function_declarator_param_list(Token *tok);
 
 static inline bool is_defer_kw(Token *tok, Token *prev) {
 	if (!(tok->tag & TT_DEFER) || is_empty_known_function_call(tok)) return false;
-	if (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) return false;
+	/* Typedef *type* named `defer` stays an identifier except `defer {…}`
+	 * (unambiguous keyword). Variable/param/enum-constant shadows
+	 * (`is_shadow`) must still allow braceless `defer stmt;` — otherwise the
+	 * keyword leaks to the backend. */
+	{
+		TypedefEntry *te = typedef_lookup(tok);
+		if (te && !te->is_shadow && !match_ch(tok_next(tok), '{')) return false;
+	}
 	if (token_in_function_declarator_param_list(tok)) return false;
 	/* Type / declarator predecessor → identifier (mirror: `int defer`, `T *defer`). */
 	if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE | TT_TYPEOF |
@@ -1634,8 +1641,39 @@ static inline bool is_defer_kw(Token *tok, Token *prev) {
 	if (prev && match_ch(prev, ',')) return false;
 	Token *nx = tok_next(tok);
 	if (!nx || match_ch(nx, ':') || (nx->tag & TT_ASSIGN)) return false;
+	/* `defer;` is an empty defer statement unless a variable/enum shadow owns
+	 * the name — then it is an expression-statement of that identifier. */
+	if (match_ch(nx, ';')) {
+		TypedefEntry *te = typedef_lookup(tok);
+		return !(te && (te->is_shadow || te->is_enum_const));
+	}
 	/* Call-arg / asm-goto label tails: `f(defer)`, `(*defer)`, `:::: defer)`. */
 	if (match_ch(nx, ')') || match_ch(nx, ']') || match_ch(nx, ',')) return false;
+	/* Subscript / member on the name: `defer[i]`, `defer.x`, `defer->x`. */
+	if (match_ch(nx, '[') || (nx->tag & TT_MEMBER)) return false;
+	/* Postfix `defer++` / `defer--` vs braceless body `defer ++x;`. */
+	if (nx->len == 2 && (nx->ch0 == '+' || nx->ch0 == '-') && tok_loc(nx)[1] == nx->ch0) {
+		Token *after = tok_next(nx);
+		if (!after || match_ch(after, ';') || match_ch(after, ')') || match_ch(after, ']') ||
+		    match_ch(after, ',') || match_ch(after, ':') || (after->tag & TT_ASSIGN))
+			return false;
+	}
+	/* Infix punctuators cannot start a statement: `for (; defer < 3; )`.
+	 * Unary `&` `!` `*` `+` `-` `~` still can (`defer &x;`). */
+	if (nx->kind == TK_PUNCT) {
+		unsigned char c0 = (unsigned char)nx->ch0;
+		if (nx->len == 1) {
+			if (c0 == '<' || c0 == '>' || c0 == '?' || c0 == '%' || c0 == '^' || c0 == '|' ||
+			    c0 == '/')
+				return false;
+		} else if (nx->len == 2) {
+			char c1 = tok_loc(nx)[1];
+			if ((c0 == '<' && (c1 == '=' || c1 == '<')) ||
+			    (c0 == '>' && (c1 == '=' || c1 == '>')) || (c0 == '=' && c1 == '=') ||
+			    (c0 == '!' && c1 == '=') || (c0 == '&' && c1 == '&') || (c0 == '|' && c1 == '|'))
+				return false;
+		}
+	}
 	return true;
 }
 
@@ -1716,6 +1754,13 @@ static bool token_in_function_declarator_param_list(Token *tok) {
 static inline bool orelse_kw_at(Token *t, Token *prev) {
 	if (!(t->tag & TT_ORELSE) || (prev && (prev->tag & TT_MEMBER))) return false;
 	if (is_known_function_call(t)) return false;
+	/* Soft-keyword predecessor: may be a type specifier (`bool orelse = 0`)
+	 * or a value (`_Float32 = _Float32 orelse 2`, `x = asm orelse 2`). */
+	if (prev && is_soft_keyword_identifier(prev)) {
+		if (soft_keyword_decl_name_boundary(t)) return false;
+		if (orelse_is_label_or_goto_target(t, prev)) return false;
+		return true;
+	}
 	TypedefEntry *te = typedef_lookup(t);
 	/* Variable/param named orelse: operator only after expression-ending prev.
 	 * prev==NULL at stmt-start `orelse;` is the identifier. */
@@ -1805,7 +1850,8 @@ static void reject_orelse_side_effects(Token *start,
 		     ((s->ch0 == '+' && tok_loc(s)[1] == '+') || (s->ch0 == '-' && tok_loc(s)[1] == '-'))) ||
 		    is_assignment_operator_token(s))
 			error_tok(s, "%s with side effect %s", ctx_msg, advice);
-		if (check_asm && (s->tag & TT_ASM)) error_tok(s, "%s with inline asm %s", ctx_msg, advice);
+		if (check_asm && (s->tag & TT_ASM) && !is_soft_keyword_identifier(s))
+			error_tok(s, "%s with inline asm %s", ctx_msg, advice);
 		if ((is_valid_varname(s) && !is_type_keyword(s)) || match_ch(s, ']') || match_ch(s, ')')) {
 			Token *after_s = tok_next(s);
 			if (after_s && after_s != end && match_ch(after_s, '('))
@@ -2624,7 +2670,10 @@ static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
 }
 
 static inline bool c_value_name_token(Token *t) {
-	return t && is_valid_varname(t) && !is_type_keyword(t);
+	/* Soft type spellings (`_Float32`, `bool`, …) are valid declarator names
+	 * after an established type; treat them as value names for bounds / postfix. */
+	return t && is_valid_varname(t) &&
+	       (!(t->tag & TT_TYPE) || is_soft_keyword_identifier(t)) && !is_known_typedef(t);
 }
 
 static void p1_tag_postfix_chain(Token *p) {
@@ -4569,8 +4618,11 @@ static uint8_t decl_shape_to_bits(const DeclShape *s) {
 			 (s->is_union_type ? P1DS_UNION : 0));
 }
 
+static bool p1_type_brace_zero_unsafe(Token *type_start, Token *type_end, int depth);
+
 /* Non-init-stmt zero-init recipe. Pass 2 demotes MEMSET→AGG inside init stmts. */
 static uint8_t compute_decl_zero_kind(const DeclShape *s,
+				      Token *type_start,
 				      TypeSpecResult *type,
 				      DeclResult *decl,
 				      bool has_init,
@@ -4581,6 +4633,10 @@ static uint8_t compute_decl_zero_kind(const DeclShape *s,
 		return P1Z_NONE;
 	if (decl_shape_needs_memset(s, type, decl, has_init, is_raw, storage_static)) return P1Z_MEMSET;
 	if (s->effective_vla) return P1Z_NONE;
+	/* Empty / zero-size-only aggregates reject `= {0}` on clang/gcc. */
+	if (s->is_aggregate && type_start &&
+	    p1_type_brace_zero_unsafe(type_start, type->end, 0))
+		return P1Z_MEMSET;
 	if (s->is_aggregate || type->has_typeof || s->is_union_type || (type->has_atomic && s->is_aggregate))
 		return P1Z_AGG;
 	return P1Z_SCALAR;
@@ -4589,6 +4645,7 @@ static uint8_t compute_decl_zero_kind(const DeclShape *s,
 /* Record a local P1K_DECL + zero-init recipe for Pass 2 emit. */
 static P1FuncEntry *p1_record_local_decl(uint16_t sid,
 					 Token *var,
+					 Token *type_start,
 					 const DeclShape *shape,
 					 TypeSpecResult *type,
 					 DeclResult *decl,
@@ -4604,7 +4661,8 @@ static P1FuncEntry *p1_record_local_decl(uint16_t sid,
 	e->decl.is_static_storage = storage_static;
 	e->decl.body_close_idx = body_close_idx;
 	e->decl.shape = decl_shape_to_bits(shape);
-	e->decl.zero_kind = compute_decl_zero_kind(shape, type, decl, has_init, is_raw, storage_static);
+	e->decl.zero_kind =
+	    compute_decl_zero_kind(shape, type_start, type, decl, has_init, is_raw, storage_static);
 	return e;
 }
 
@@ -4667,6 +4725,141 @@ static Token *p1_typedef_type_start(TypedefEntry *te) {
 		i--;
 	}
 	return NULL;
+}
+
+/* True if `[dim]` is a literal zero (GNU zero-size array). */
+static bool array_dim_is_literal_zero(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!open_bracket || !close) return false;
+	Token *t = skip_noise(tok_next(open_bracket));
+	if (!t || t == close || t->kind != TK_NUM) return false;
+	if (t->len != 1 || tok_loc(t)[0] != '0') return false;
+	return skip_noise(tok_next(t)) == close;
+}
+
+/* GNU empty structs / sole `[0]` arrays cannot take `= {0}` (clang: "initializer
+ * for aggregate with no elements requires explicit braces"). Nested empty
+ * members poison parent `{0}` the same way. Route those to memset. */
+static bool p1_sue_body_brace_zero_unsafe(Token *brace, int depth);
+
+static bool p1_type_brace_zero_unsafe(Token *type_start, Token *type_end, int depth) {
+	if (!type_start || depth > 16) return false;
+	for (Token *t = type_start; t && t != type_end; t = tok_next(t)) {
+		if (!(t->tag & TT_SUE) || is_enum_kw(t)) continue;
+		Token *body = find_struct_body_brace(t);
+		if (!body) body = p1_sue_definition_body(t);
+		if (body && p1_sue_body_brace_zero_unsafe(body, depth)) return true;
+	}
+	for (Token *t = type_start; t && t != type_end; t = tok_next(t)) {
+		if (!is_identifier_like(t) || !is_known_typedef(t)) continue;
+		TypedefEntry *te = typedef_lookup(t);
+		if (!te || te->is_shadow || te->is_ptr) continue;
+		Token *alias = p1_typedef_type_start(te);
+		if (alias && te->token_index < token_count) {
+			Token *name = &token_pool[te->token_index];
+			if (p1_type_brace_zero_unsafe(alias, name, depth + 1)) return true;
+		}
+	}
+	return false;
+}
+
+static bool p1_sue_body_brace_zero_unsafe(Token *brace, int depth) {
+	if (!brace || !tok_match(brace) || depth > 16) return false;
+	Token *end = tok_match(brace);
+	bool saw_sized = false;
+	bool saw_empty_or_zero = false;
+	bool saw_any = false;
+	for (Token *stmt = skip_noise(tok_next(brace)); stmt && stmt != end;) {
+		if (stmt->kind == TK_PREP_DIR) {
+			stmt = skip_noise(tok_next(stmt));
+			continue;
+		}
+		if ((stmt->flags & TF_STATIC_ASSERT) || (stmt->tag & TT_SKIP_DECL)) {
+			/* _Static_assert / static_assert inside the body */
+			Token *n = skip_noise(tok_next(stmt));
+			if (n && match_ch(n, '(') && tok_match(n))
+				stmt = skip_noise(tok_next(tok_match(n)));
+			else
+				stmt = skip_noise(tok_next(stmt));
+			continue;
+		}
+		TypeSpecResult member_type = parse_type_specifier(stmt);
+		if (!member_type.saw_type || !member_type.end) {
+			Token *next = stmt;
+			while (next && next != end && !match_ch(next, ';')) {
+				if ((next->flags & TF_OPEN) && tok_match(next))
+					next = tok_next(tok_match(next));
+				else
+					next = tok_next(next);
+			}
+			stmt = next && match_ch(next, ';') ? skip_noise(tok_next(next)) : end;
+			continue;
+		}
+		Token *decl_start = skip_noise(member_type.end);
+		bool member_empty_type =
+		    p1_type_brace_zero_unsafe(stmt, member_type.end, depth + 1);
+		bool saw_decl = false;
+		while (decl_start && decl_start != end && !match_ch(decl_start, ';')) {
+			if (match_ch(decl_start, ':')) {
+				/* anonymous bitfield — counts as a member */
+				saw_any = true;
+				saw_sized = true;
+				break;
+			}
+			DeclResult member = parse_declarator(decl_start, false);
+			if (!member.end) break;
+			saw_decl = true;
+			saw_any = true;
+			bool zero_arr = false;
+			if (member.is_array && !member.is_pointer) {
+				for (Token *b = decl_start; b && b != member.end; b = tok_next(b)) {
+					if (match_ch(b, '[') && !(b->flags & TF_C23_ATTR) &&
+					    array_dim_is_literal_zero(b)) {
+						zero_arr = true;
+						break;
+					}
+					if ((b->flags & TF_OPEN) && tok_match(b) && !match_ch(b, '['))
+						b = tok_match(b);
+				}
+			}
+			if (member.is_pointer || member.is_func_ptr)
+				saw_sized = true;
+			else if (zero_arr || member_empty_type)
+				saw_empty_or_zero = true;
+			else
+				saw_sized = true;
+
+			Token *next = member.end;
+			while (next && next != end && !match_ch(next, ',') && !match_ch(next, ';')) {
+				if ((next->flags & TF_OPEN) && tok_match(next))
+					next = tok_next(tok_match(next));
+				else
+					next = tok_next(next);
+			}
+			if (next && match_ch(next, ',')) {
+				decl_start = skip_noise(tok_next(next));
+				continue;
+			}
+			decl_start = next;
+			break;
+		}
+		if (!saw_decl && member_empty_type) {
+			saw_any = true;
+			saw_empty_or_zero = true;
+		}
+		Token *next_stmt = decl_start;
+		while (next_stmt && next_stmt != end && !match_ch(next_stmt, ';')) {
+			if ((next_stmt->flags & TF_OPEN) && tok_match(next_stmt))
+				next_stmt = tok_next(tok_match(next_stmt));
+			else
+				next_stmt = tok_next(next_stmt);
+		}
+		stmt = next_stmt && match_ch(next_stmt, ';') ? skip_noise(tok_next(next_stmt)) : end;
+	}
+	if (!saw_any) return true;	      /* struct Empty {} */
+	if (!saw_sized) return true;      /* sole char data[0]; */
+	if (saw_empty_or_zero) return true; /* nested empty / zero-size member */
+	return false;
 }
 
 static bool p1_aggregate_body_has_const_subobject(Token *brace, int depth) {
@@ -5130,7 +5323,7 @@ static Token *process_declarators(Token *tok,
 			/* No P1K_DECL: file scope, func type, or aggregate member. */
 			shape = classify_decl_shape(type_start, type, &decl);
 			zero_kind = compute_decl_zero_kind(
-			    &shape, type, &decl, decl.has_init, decl_is_raw, type->has_static);
+			    &shape, type_start, type, &decl, decl.has_init, decl_is_raw, type->has_static);
 #ifdef PRISM_DEBUG
 			if (current_func_idx >= 0 && decl.var_name && !shape.is_func_type)
 				error_tok(decl.var_name, "internal: missing P1K_DECL recipe");
@@ -5472,6 +5665,7 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 }
 
 static inline bool is_inside_attribute(Token *tok) {
+	if (tok && (tok_ann(tok) & P1_IN_ATTR_ARGS)) return true;
 	if (!last_emitted || (!match_ch(last_emitted, '(') && !match_ch(last_emitted, ','))) return false;
 	for (Token *t = tok; t && t->kind != TK_EOF && !match_ch(t, ';') && !match_ch(t, '{');
 	     t = tok_next(t)) {
@@ -7908,9 +8102,18 @@ static void p1_build_scope_tree(Token *start) {
 					if (depth == 0 && !si->is_loop && !si->is_switch &&
 					    !si->is_conditional && !si->is_struct)
 						si->is_func_body = true;
+					/* GNU nested function `T name(...){` at block depth —
+					 * not an initializer. `prev`/`open_paren` already skip
+					 * post-declarator attrs (WB_SKIP_NOISE). Compound
+					 * literals `(T){` fail paren_is_function_declarator_params
+					 * and stay is_init; stmt-exprs are `({` not `){`. */
 					if (depth > 0 && !si->is_loop && !si->is_switch &&
-					    !si->is_conditional && !si->is_struct && !si->is_func_body)
-						si->is_init = true;
+					    !si->is_conditional && !si->is_struct && !si->is_func_body) {
+						if (paren_is_function_declarator_params(open_paren))
+							si->is_func_body = true;
+						else
+							si->is_init = true;
+					}
 				} else if (is_else_kw(prev)) {
 					si->is_conditional = true;
 				} else if (prev->tag & TT_SUE) {
@@ -8358,6 +8561,7 @@ static void p1_scan_init_shadows(Token *open,
 				DeclShape shape = classify_decl_shape(init_tok, &type, &decl);
 				p1_record_local_decl(eff_sid,
 						     decl.var_name,
+						     init_tok,
 						     &shape,
 						     &type,
 						     &decl,
@@ -8708,6 +8912,21 @@ static bool bracket_in_compound_literal_type(Token *open_bracket) {
 	return after && match_ch(after, '{');
 }
 
+/* True when `[…]` is a designated-initializer index (not an expression
+ * subscript in a value). Designator `[` follows `{` / `,` / `.name` / prior
+ * designator `]`; value subscripts follow an expression-ending name. */
+static bool bracket_is_designator_index(Token *open_bracket) {
+	Token *prev = tok_walk_back(tok_idx(open_bracket), WB_PAST_NOISE);
+	if (!prev) return false;
+	if (match_ch(prev, '{') || match_ch(prev, ',')) return true;
+	if (match_ch(prev, ']')) return true; /* [1][2] or .a[1][2] */
+	if (is_identifier_like(prev)) {
+		Token *before = tok_walk_back(tok_idx(prev), WB_PAST_NOISE);
+		return before && (before->tag & TT_MEMBER);
+	}
+	return false;
+}
+
 /* Non-ICE dimension LHS (variable / call) — illegal for compound-literal types. */
 static bool bracket_dim_lhs_nonconstant(Token *start, Token *end) {
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
@@ -8783,6 +9002,14 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 						  "'orelse' in compound-literal array dimension with "
 						  "non-constant LHS (compound literals cannot be VLAs); "
 						  "use a constant dimension or a named array");
+				/* Designator indices must be ICEs (C11 §6.7.9). Lowering
+				 * `[idx orelse 1]` to a ternary would emit illegal C. */
+				if (bracket_is_designator_index(tok) &&
+				    bracket_dim_lhs_nonconstant(tok_next(tok), s))
+					error_tok(s,
+						  "'orelse' in a designated-initializer index requires an "
+						  "integer constant expression on the left-hand side; "
+						  "hoist a constant index or use a positional initializer");
 				prev_d0_oe = s;
 			} else {
 				/* Nested orelse: check LHS of the innermost group only.
@@ -9055,9 +9282,13 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token
 					break;
 				}
 				if (s->flags & TF_OPEN) fd++;
-				else if (s->flags & TF_CLOSE)
+				else if (s->flags & TF_CLOSE) {
+					/* Unmatched `}` / `)` left the fallback expression
+					 * (brace-init close, block close). Do not scan the
+					 * next function's `name(){` as a compound literal. */
+					if (fd == 0) break;
 					fd--;
-				else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ',')))
+				} else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ',')))
 					break;
 				prev_cl = s;
 			}
@@ -9182,6 +9413,9 @@ static int p1d_try_annotate_init_orelse(Token *t,
 					Token **out_first_orelse) {
 	if (!(t->tag & TT_ORELSE)) return 0;
 	if (is_known_function_call(t)) return 1;
+	/* `.orelse` / `->orelse` — member name, not the operator. The following
+	 * `orelse` (if any) is classified on the next iteration. */
+	if (prev && (prev->tag & TT_MEMBER)) return 1;
 	if (orelse_is_label_or_goto_target(t, prev)) return 1;
 	TypedefEntry *te = typedef_lookup(t);
 	if (te && !(prev && ending(prev))) return 1;
@@ -9825,10 +10059,22 @@ static void p1d_probe_declaration(Token *tok,
 		DeclShape shape = classify_decl_shape(type_tok, &type, &decl);
 		bool in_aggregate_body =
 		    cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
+		/* Locals inside a GNU nested function must not land on the outer
+		 * function's CFG / cgoto×zeroinit gate — nested bodies are passed
+		 * through; only the outer function's own decls matter. */
+		bool in_nested_func = false;
+		for (uint16_t s = cur_sid; s != 0 && s < scope_tree_count; s = scope_tree[s].parent_id) {
+			if (scope_tree[s].is_func_body && scope_tree[s].parent_id != 0) {
+				in_nested_func = true;
+				break;
+			}
+		}
 		P1FuncEntry *p1e = NULL;
-		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !in_aggregate_body)
+		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !in_aggregate_body &&
+		    !in_nested_func)
 			p1e = p1_record_local_decl(cur_sid,
 						   decl.var_name,
+						   type_tok,
 						   &shape,
 						   &type,
 						   &decl,
@@ -11401,8 +11647,9 @@ static bool p1_annotate_pool(bool want_bchk_sentinel) {
 			if (open && match_ch(open, '(') && (open->flags & TF_OPEN) && tok_match(open)) {
 				uint32_t oi = tok_idx(open), ci = tok_idx(tok_match(open));
 				for (uint32_t j = oi; j <= ci; j++) token_pool[j].ann |= P1_IN_ATTR_ARGS;
-				i = ci;
-				continue;
+				/* Do not skip the span: typedef/shadow uses inside attribute
+				 * arguments (e.g. stmt-exprs in aligned(...)) still need
+				 * P1_HAS_ENTRY so Pass 2 is_defer_kw / is_known_typedef work. */
 			}
 		}
 		if (!is_identifier_like(t)) continue;

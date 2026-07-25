@@ -3678,6 +3678,193 @@ static void test_soft_kw_ident_false_rejects(void) {
 	}
 }
 
+/* Audit pass 2026-07: gaps found by six-domain parse hunt. */
+static void test_audit_parse_gap_fixes(void) {
+	printf("\n--- Audit parse-gap fixes ---\n");
+
+	/* Hard TT_TYPE spellings as declarator names after an established type. */
+	{
+		const char *code =
+		    "int f(void){ int _Float32, x, __int64; return x; }\n";
+		PrismResult r = prism_transpile_source(code, "typekw_zi.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typekw-as-name: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "_Float32 = 0") != NULL, "typekw-as-name: zero-inits _Float32");
+			CHECK(strstr(r.output, "x = 0") != NULL, "typekw-as-name: zero-inits sibling x");
+			CHECK(strstr(r.output, "__int64 = 0") != NULL, "typekw-as-name: zero-inits __int64");
+		}
+		prism_free(&r);
+	}
+	{
+		const char *code = "int main(void){ goto L; int _Float32; L: return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "typekw_goto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "typekw-as-name: goto-over-decl rejected");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		const char *code = "int main(void){ int _Float32[4]; int i=10; return _Float32[i]; }\n";
+		PrismResult r = prism_transpile_source(code, "typekw_bounds.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "typekw-as-name bounds: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk") != NULL,
+			      "typekw-as-name bounds: wraps subscript");
+		prism_free(&r);
+	}
+
+	/* Braceless defer under name shadow must still lower. */
+	{
+		const char *code =
+		    "int f(int defer){ int x=1; { defer x=0; } return x; }\n"
+		    "int main(void){ return f(0); }\n";
+		PrismResult r = prism_transpile_source(code, "defer_shadow_braceless.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "braceless defer+shadow: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "defer x") == NULL,
+			      "braceless defer+shadow: keyword not leaked");
+		prism_free(&r);
+	}
+
+	/* Member name orelse immediately followed by operator orelse. */
+	{
+		const char *code =
+		    "struct S { int orelse; };\n"
+		    "int main(void){ struct S s={0}; int x = s.orelse orelse 5; return x; }\n";
+		PrismResult r = prism_transpile_source(code, "dot_orelse_orelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "s.orelse orelse decl-init: accepted");
+		if (r.output) {
+			CHECK(strstr(r.output, "s.orelse") != NULL, "s.orelse orelse: keeps member name");
+			CHECK(strchr(r.output, '?') != NULL, "s.orelse orelse: operator lowered to ternary");
+			CHECK(strstr(r.output, "orelse 5") == NULL && strstr(r.output, "orelse5") == NULL,
+			      "s.orelse orelse: keyword not left as operator");
+		}
+		prism_free(&r);
+	}
+
+	/* GNU nested function labels / outer cgoto. */
+	{
+		const char *code =
+		    "int main(void){ void nest(void){ goto L; L: ; } nest(); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "nested_goto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nested fn goto/label: accepted");
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "int main(void){ goto end; void nest(void){} end: return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "goto_over_nested.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "label after nested fn: accepted");
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "  int nest(void){ int x; return x; }\n"
+		    "  void *p = &&L; goto *p;\n"
+		    "L: return nest();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_cgoto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nested locals must not block outer cgoto");
+		prism_free(&r);
+	}
+
+	/* Non-ICE designator-dimension orelse must reject (not emit illegal C). */
+	{
+		const char *code =
+		    "int main(void){ int idx=0; int a[8]={ [idx orelse 1]=42 }; return a[1]!=42; }\n";
+		PrismResult r = prism_transpile_source(code, "desig_dim_nonice.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "non-ICE designator-dim orelse: rejected");
+		prism_free(&r);
+	}
+
+	/* Parenthesized _Generic association name (glibc N3322). */
+	{
+		const char *code =
+		    "extern char *_Generic(0, default: (strchr)(const char *, int));\n"
+		    "char *strchr(const char *, int);\n"
+		    "int main(void){ return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "generic_paren.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "parenthesized _Generic name: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "_Generic") == NULL, "parenthesized _Generic: folded away");
+			CHECK(strstr(r.output, "(strchr)") != NULL, "parenthesized _Generic: emits (strchr)");
+		}
+		prism_free(&r);
+	}
+
+	/* Empty / zero-size-only aggregates: memset, not illegal = {0}. */
+	{
+		const char *code =
+		    "struct Empty {};\n"
+		    "struct Wrapper { struct Empty e; int x; };\n"
+		    "int main(void){ struct Wrapper w; return w.x; }\n";
+		PrismResult r = prism_transpile_source(code, "empty_struct_zi.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "empty-struct nest zi: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset") != NULL, "empty-struct nest zi: uses memset");
+			CHECK(strstr(r.output, "w = {0}") == NULL, "empty-struct nest zi: no = {0}");
+		}
+		prism_free(&r);
+	}
+	{
+		const char *code = "struct Z { char data[0]; }; int main(void){ struct Z z; return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "zero_arr_zi.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "sole [0] zi: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL, "sole [0] zi: uses memset");
+		prism_free(&r);
+	}
+
+	/* Soft type spelling as value + orelse. */
+	{
+		const char *code =
+		    "int main(void){ int _Float32 = 0; _Float32 = _Float32 orelse 2; return _Float32; }\n";
+		PrismResult r = prism_transpile_source(code, "soft_type_orelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "soft type value orelse: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_oe") != NULL || strstr(r.output, "?") != NULL,
+			      "soft type value orelse: lowered");
+		prism_free(&r);
+	}
+
+	/* Shadowed `defer;` must not allocate a phantom defer (goto-skip). */
+	{
+		const char *code =
+		    "void f(void){ int defer = 42; goto skip; defer; skip: (void)defer; }\n";
+		PrismResult r = prism_transpile_source(code, "defer_semi_shadow.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "shadowed defer; expression stmt: accepted");
+		prism_free(&r);
+	}
+
+	/* Empty `defer;` without a shadow remains a keyword statement. */
+	{
+		const char *code = "void f(void){ defer; }\n";
+		PrismResult r = prism_transpile_source(code, "defer_semi_empty.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "empty defer; keyword: accepted");
+		prism_free(&r);
+	}
+
+	/* Soft-kw matrix: defer as for-init loop variable. */
+	{
+		const char *code =
+		    "int f(void){ int n = 0; for (int defer = 0; defer < 3; defer++) n += defer; return n; }\n";
+		PrismResult r = prism_transpile_source(code, "defer_for_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer as for-init identifier: accepted");
+		prism_free(&r);
+	}
+
+	/* Typedef named defer inside attribute stmt-expr stays an identifier. */
+	{
+		const char *code =
+		    "typedef int defer;\n"
+		    "void f(void){ __attribute__((aligned( ({ defer x = 8; x; }) ))) int buf; (void)buf; }\n";
+		PrismResult r = prism_transpile_source(code, "defer_typedef_attr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typedef defer in attr stmt-expr: accepted");
+		prism_free(&r);
+	}
+}
+
 // Regression: nested function defined inside a statement expression (GNU),
 // assigned to a function pointer — same nested-fn rejection as a flat nested def.
 static void test_plain_c_stmt_expr_nested_function_false_positive(void) {
@@ -6755,6 +6942,7 @@ void run_safe_tests(void) {
 	test_plain_c_nested_function_passthrough();
 	test_nested_function_orelse_rejected();
 	test_soft_kw_ident_false_rejects();
+	test_audit_parse_gap_fixes();
 	test_plain_c_stmt_expr_nested_function_false_positive();
 	test_plain_c_if_switch_init_vla_false_positive();
 	test_plain_c_asm_goto_decl_false_positive();

@@ -1979,30 +1979,34 @@ static void test_win_signal_tempfile_cleanup(void) {
 		CHECK(rm2 == 0, "signal_cleanup: unlink succeeds after fclose (proves fix)");
 	}
 
-	// Test: Verify the open_memstream temp file path is cleaned up properly
-	// when closed before unlinking.
+	// Memstream uses FILE_FLAG_DELETE_ON_CLOSE (no path bookkeeping). Verify
+	// the TLS slot is released on fclose so a later open_memstream works, and
+	// that signal cleanup closing win32_memstream_fp cannot leave a durable file.
 	{
 		char *membuf = NULL;
 		size_t memsize = 0;
 		FILE *mfp = open_memstream(&membuf, &memsize);
 		CHECK(mfp != NULL, "signal_cleanup: open_memstream succeeds");
 		if (mfp) {
-			// The memstream file path should exist
-			CHECK(access(win32_memstream_path, F_OK) == 0,
-			      "signal_cleanup: memstream temp file exists while open");
-
-			char saved_path[MAX_PATH];
-			strncpy(saved_path, win32_memstream_path, MAX_PATH - 1);
-			saved_path[MAX_PATH - 1] = '\0';
-
-			// Close via normal path (fclose wrapper handles cleanup)
+			fprintf(mfp, "sig-mem");
 			fclose(mfp);
+			CHECK(membuf != NULL, "signal_cleanup: memstream buffer populated");
+			CHECK(memsize == 7, "signal_cleanup: memstream size is 7");
+			if (membuf) {
+				CHECK(strcmp(membuf, "sig-mem") == 0,
+				      "signal_cleanup: memstream content matches");
+				free(membuf);
+			}
 
-			// After fclose, the temp file should be gone (wrapper deletes it)
-			CHECK(access(saved_path, F_OK) != 0,
-			      "signal_cleanup: memstream temp file removed after fclose");
-
-			free(membuf);
+			char *membuf2 = NULL;
+			size_t memsize2 = 0;
+			FILE *mfp2 = open_memstream(&membuf2, &memsize2);
+			CHECK(mfp2 != NULL,
+			      "signal_cleanup: open_memstream reusable after fclose");
+			if (mfp2) {
+				fclose(mfp2);
+				free(membuf2);
+			}
 		}
 	}
 }
@@ -2362,28 +2366,25 @@ static void test_win_memstream_wide_temp(void) {
 		}
 	}
 
-	// Test 2: Verify the temp file path stored in win32_memstream_path is
-	// valid UTF-8 (not ANSI-mangled).
+	// Test 2: GetTempFileNameW / CreateFileW path (DELETE_ON_CLOSE) must still
+	// round-trip non-ASCII buffer content through the read-back on fclose.
 	{
 		char *buf = NULL;
 		size_t sz = 0;
 		FILE *fp = open_memstream(&buf, &sz);
 		CHECK(fp != NULL, "memstream_wide: second open_memstream succeeds");
 		if (fp) {
-			// While open, the path should be valid and the file should exist
-			CHECK(win32_memstream_path[0] != '\0',
-			      "memstream_wide: temp path is non-empty");
-			CHECK(access(win32_memstream_path, F_OK) == 0,
-			      "memstream_wide: temp file exists at stored path");
-
-			// Verify the path is valid UTF-8 by round-tripping through wide
-			wchar_t wcheck[MAX_PATH];
-			int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-			                             win32_memstream_path, -1, wcheck, MAX_PATH);
-			CHECK(wn > 0, "memstream_wide: temp path is valid UTF-8");
-
+			/* UTF-8 "テスト" — proves the wide-char temp open didn't
+			 * force an ANSI codepage on the stream content. */
+			const char *payload = "hello \xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88";
+			fprintf(fp, "%s", payload);
 			fclose(fp);
-			free(buf);
+			CHECK(buf != NULL, "memstream_wide: UTF-8 buffer non-NULL");
+			if (buf) {
+				CHECK(strcmp(buf, payload) == 0,
+				      "memstream_wide: UTF-8 content round-trips");
+				free(buf);
+			}
 		}
 	}
 }
@@ -2875,29 +2876,28 @@ static void test_win_path_basename_backslash(void) {
 	      "basename_bs: MSVC-style path yields assert.h");
 }
 
-// Regression: win32_memstream_path must be large enough for UTF-8 expansion.
+// Regression: open_memstream (DELETE_ON_CLOSE, no path buffer) must still
+// return the full written payload on fclose for large-ish content.
 static void test_win_memstream_buffer_size(void) {
 	printf("  Testing open_memstream buffer sizing...\n");
 
-	// Verify that win32_memstream_path can hold an expanded UTF-8 path.
-	// MAX_PATH wide chars can expand to MAX_PATH*3 UTF-8 bytes.
-	// The buffer should be at least MAX_PATH*3.
-	CHECK(sizeof(win32_memstream_path) >= MAX_PATH * 3,
-	      "memstream_buf: win32_memstream_path >= MAX_PATH*3");
+	/* PATH_MAX remains the wide/UTF-8 scratch size for GetTempPathW callers. */
+	CHECK(PATH_MAX >= MAX_PATH * 3, "memstream_buf: PATH_MAX >= MAX_PATH*3");
 
-	// Verify open_memstream works (it uses win32_memstream_path internally)
 	char *buf = NULL;
 	size_t sz = 0;
 	FILE *fp = open_memstream(&buf, &sz);
 	CHECK(fp != NULL, "memstream_buf: open_memstream succeeds");
 	if (fp) {
-		fprintf(fp, "test data");
+		/* Write more than a typical pipe/page so read-back sizing matters. */
+		for (int i = 0; i < 4000; i++)
+			fputc('A' + (i % 26), fp);
 		fclose(fp);
 		CHECK(buf != NULL, "memstream_buf: buffer is populated");
-		CHECK(sz > 0, "memstream_buf: size > 0");
+		CHECK(sz == 4000, "memstream_buf: size is 4000");
 		if (buf) {
-			CHECK(strcmp(buf, "test data") == 0,
-			      "memstream_buf: content matches");
+			CHECK(buf[0] == 'A' && buf[25] == 'Z' && buf[3999] == 'A' + (3999 % 26),
+			      "memstream_buf: content matches pattern");
 			free(buf);
 		}
 	}
@@ -2993,35 +2993,32 @@ static void test_win_empty_env_block(void) {
 	      "empty_env: NULL envp returns NULL");
 }
 
-// Regression: open_memstream must register its temp file for signal cleanup
-// so Ctrl-C doesn't leave stale prmXXXX.tmp files.
+// Regression: DELETE_ON_CLOSE memstreams must NOT register in signal_temps —
+// the OS unlinks on last handle close; signal_cleanup only needs to fclose
+// win32_memstream_fp (see prism_thread_cleanup / signal path).
 static void test_win_memstream_signal_register(void) {
-	printf("  Testing open_memstream signal temp registration...\n");
+	printf("  Testing open_memstream does not need signal_temps registration...\n");
+
+	sig_atomic_t n_before = signal_temps_load();
 
 	char *buf = NULL;
 	size_t sz = 0;
 	FILE *fp = open_memstream(&buf, &sz);
 	CHECK(fp != NULL, "memstream_reg: open_memstream succeeds");
 	if (fp) {
-		// The temp file path should be registered in signal_temps[]
-		// Search for win32_memstream_path in the signal_temps array.
-		CHECK(strlen(win32_memstream_path) > 0,
-		      "memstream_reg: path is non-empty");
-
-		bool found = false;
-		sig_atomic_t n = signal_temps_load();
-		for (sig_atomic_t i = 0; i < n; i++) {
-			if (signal_temps_ready_load(i) &&
-			    strcmp(signal_temps[i], win32_memstream_path) == 0) {
-				found = true;
-				break;
-			}
-		}
-		CHECK(found, "memstream_reg: path registered in signal_temps");
+		sig_atomic_t n_open = signal_temps_load();
+		CHECK(n_open == n_before,
+		      "memstream_reg: open_memstream does not grow signal_temps");
 
 		fprintf(fp, "signal test");
 		fclose(fp);
+		CHECK(buf != NULL && strcmp(buf, "signal test") == 0,
+		      "memstream_reg: content recovered on fclose");
 		if (buf) free(buf);
+
+		sig_atomic_t n_after = signal_temps_load();
+		CHECK(n_after == n_before,
+		      "memstream_reg: fclose leaves signal_temps unchanged");
 	}
 }
 
@@ -3062,37 +3059,36 @@ static void test_win_capture_handle_whitelist(void) {
 	CloseHandle(hWrite);
 }
 
-// Regression: win32_fclose_wrapper must use win32_unlink_utf8 (not raw _unlink)
-// to properly delete temp files with non-ASCII paths.
+// Regression: win32_fclose_wrapper must read back DELETE_ON_CLOSE memstream
+// contents and clear the TLS slot (OS deletes the name with the last handle).
 static void test_win_fclose_uses_utf8_unlink(void) {
-	printf("  Testing fclose wrapper uses UTF-8 unlink shim...\n");
+	printf("  Testing fclose wrapper memstream read-back / slot clear...\n");
 
-	// open_memstream creates a temp file and stores it in win32_memstream_path.
-	// When we fclose it, the wrapper should call win32_unlink_utf8, which
-	// converts UTF-8 to wide before calling _wunlink.
 	char *buf = NULL;
 	size_t sz = 0;
 	FILE *fp = open_memstream(&buf, &sz);
 	CHECK(fp != NULL, "fclose_utf8: open_memstream succeeds");
 	if (fp) {
 		fprintf(fp, "test content for unlink");
-		// Note the path before fclose deletes it
-		char saved_path[4096];
-		strncpy(saved_path, win32_memstream_path, sizeof(saved_path) - 1);
-		saved_path[sizeof(saved_path) - 1] = '\0';
-
-		// Verify the temp file exists
-		struct _stat st;
-		int exists_before = (win32_stat_utf8(saved_path, &st) == 0);
-		CHECK(exists_before, "fclose_utf8: temp file exists before fclose");
-
 		fclose(fp);
+		CHECK(buf != NULL, "fclose_utf8: buffer populated after fclose");
+		CHECK(sz == strlen("test content for unlink"),
+		      "fclose_utf8: size matches payload");
+		if (buf) {
+			CHECK(strcmp(buf, "test content for unlink") == 0,
+			      "fclose_utf8: content matches");
+			free(buf);
+		}
 
-		// After fclose, the temp file should be deleted by win32_unlink_utf8
-		int exists_after = (win32_stat_utf8(saved_path, &st) == 0);
-		CHECK(!exists_after, "fclose_utf8: temp file deleted after fclose");
-
-		if (buf) free(buf);
+		/* Slot must be free for a subsequent open. */
+		char *buf2 = NULL;
+		size_t sz2 = 0;
+		FILE *fp2 = open_memstream(&buf2, &sz2);
+		CHECK(fp2 != NULL, "fclose_utf8: reopen after fclose succeeds");
+		if (fp2) {
+			fclose(fp2);
+			free(buf2);
+		}
 	}
 }
 
