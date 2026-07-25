@@ -2238,8 +2238,9 @@ static void test_c23_typedef_union_initializer_zeroinit_supported(void) {
 }
 
 static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
-	/* _Atomic aggregate init-statements are valid C and should not be rejected
-	 * as "needs memset"; declaration-time aggregate init is valid here. */
+	/* clang/gcc reject `= {0}` on `_Atomic` aggregates ("illegal initializer
+	 * type"). Init-statements cannot emit memset, so Prism must reject rather
+	 * than demote to a backend-illegal initializer. */
 	const char *if_atomic_struct_code =
 	    "struct S { int x; };\n"
 	    "int f(void) {\n"
@@ -2248,12 +2249,8 @@ static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r1 = prism_transpile_source(
 	    if_atomic_struct_code, "c23_if_atomic_struct.c", prism_defaults());
-	CHECK(r1.status == PRISM_OK && r1.output,
-	      "c23-if-atomic-struct-zeroinit: atomic aggregate in if-initializer must transpile");
-	if (r1.output) {
-		CHECK(strstr(r1.output, "if (_Atomic(struct S) s = {0}; 1)") != NULL,
-		      "c23-if-atomic-struct-zeroinit: atomic aggregate gets = {0}");
-	}
+	CHECK(r1.status != PRISM_OK,
+	      "c23-if-atomic-struct-zeroinit: atomic aggregate in if-initializer rejected");
 	prism_free(&r1);
 
 	const char *for_atomic_struct_code =
@@ -2264,12 +2261,8 @@ static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r2 = prism_transpile_source(
 	    for_atomic_struct_code, "c23_for_atomic_struct.c", prism_defaults());
-	CHECK(r2.status == PRISM_OK && r2.output,
-	      "c23-for-atomic-struct-zeroinit: atomic aggregate in for-initializer must transpile");
-	if (r2.output) {
-		CHECK(strstr(r2.output, "for (_Atomic(struct S) s = {0}; 0; )") != NULL,
-		      "c23-for-atomic-struct-zeroinit: atomic aggregate gets = {0}");
-	}
+	CHECK(r2.status != PRISM_OK,
+	      "c23-for-atomic-struct-zeroinit: atomic aggregate in for-initializer rejected");
 	prism_free(&r2);
 
 	const char *if_atomic_struct_typedef_code =
@@ -2280,12 +2273,8 @@ static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r3 = prism_transpile_source(
 	    if_atomic_struct_typedef_code, "c23_if_atomic_struct_typedef.c", prism_defaults());
-	CHECK(r3.status == PRISM_OK && r3.output,
-	      "c23-if-atomic-struct-typedef-zeroinit: typedef atomic aggregate in if-initializer must transpile");
-	if (r3.output) {
-		CHECK(strstr(r3.output, "if (_Atomic(S) s = {0}; 1)") != NULL,
-		      "c23-if-atomic-struct-typedef-zeroinit: typedef atomic aggregate gets = {0}");
-	}
+	CHECK(r3.status != PRISM_OK,
+	      "c23-if-atomic-struct-typedef-zeroinit: typedef atomic aggregate in if-initializer rejected");
 	prism_free(&r3);
 
 	const char *for_atomic_struct_typedef_code =
@@ -2296,18 +2285,14 @@ static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r4 = prism_transpile_source(
 	    for_atomic_struct_typedef_code, "c23_for_atomic_struct_typedef.c", prism_defaults());
-	CHECK(r4.status == PRISM_OK && r4.output,
-	      "c23-for-atomic-struct-typedef-zeroinit: typedef atomic aggregate in for-initializer must transpile");
-	if (r4.output) {
-		CHECK(strstr(r4.output, "for (_Atomic(S) s = {0}; 0; )") != NULL,
-		      "c23-for-atomic-struct-typedef-zeroinit: typedef atomic aggregate gets = {0}");
-	}
+	CHECK(r4.status != PRISM_OK,
+	      "c23-for-atomic-struct-typedef-zeroinit: typedef atomic aggregate in for-initializer rejected");
 	prism_free(&r4);
 }
 
 static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
-	/* _Atomic(union ...) in init-statements is valid C and should transpile
-	 * with declaration-time zero initialization, not hard-reject. */
+	/* Same as atomic struct: `= {0}` is illegal for `_Atomic` unions in
+	 * for/if/switch init-statements — reject instead of demoting. */
 	const char *if_atomic_union_code =
 	    "union U { int x; long y; };\n"
 	    "int f(void) {\n"
@@ -2316,12 +2301,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r1 = prism_transpile_source(
 	    if_atomic_union_code, "c23_if_atomic_union.c", prism_defaults());
-	CHECK(r1.status == PRISM_OK && r1.output,
-	      "c23-if-atomic-union-zeroinit: atomic union in if-initializer must transpile");
-	if (r1.output) {
-		CHECK(strstr(r1.output, "if (_Atomic(union U) u = {0}; 1)") != NULL,
-		      "c23-if-atomic-union-zeroinit: atomic union gets = {0}");
-	}
+	CHECK(r1.status != PRISM_OK,
+	      "c23-if-atomic-union-zeroinit: atomic union in if-initializer rejected");
 	prism_free(&r1);
 
 	const char *switch_atomic_union_code =
@@ -2331,12 +2312,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r2 = prism_transpile_source(
 	    switch_atomic_union_code, "c23_switch_atomic_union.c", prism_defaults());
-	CHECK(r2.status == PRISM_OK && r2.output,
-	      "c23-switch-atomic-union-zeroinit: atomic union in switch-initializer must transpile");
-	if (r2.output) {
-		CHECK(strstr(r2.output, "switch (_Atomic(union U) u = {0}; 0)") != NULL,
-		      "c23-switch-atomic-union-zeroinit: atomic union gets = {0}");
-	}
+	CHECK(r2.status != PRISM_OK,
+	      "c23-switch-atomic-union-zeroinit: atomic union in switch-initializer rejected");
 	prism_free(&r2);
 
 	const char *for_atomic_union_code =
@@ -2347,12 +2324,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r3 = prism_transpile_source(
 	    for_atomic_union_code, "c23_for_atomic_union.c", prism_defaults());
-	CHECK(r3.status == PRISM_OK && r3.output,
-	      "c23-for-atomic-union-zeroinit: atomic union in for-initializer must transpile");
-	if (r3.output) {
-		CHECK(strstr(r3.output, "for (_Atomic(union U) u = {0}; 0; )") != NULL,
-		      "c23-for-atomic-union-zeroinit: atomic union gets = {0}");
-	}
+	CHECK(r3.status != PRISM_OK,
+	      "c23-for-atomic-union-zeroinit: atomic union in for-initializer rejected");
 	prism_free(&r3);
 
 	const char *if_atomic_union_typedef_code =
@@ -2363,12 +2336,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r4 = prism_transpile_source(
 	    if_atomic_union_typedef_code, "c23_if_atomic_union_typedef.c", prism_defaults());
-	CHECK(r4.status == PRISM_OK && r4.output,
-	      "c23-if-atomic-union-typedef-zeroinit: typedef atomic union in if-initializer must transpile");
-	if (r4.output) {
-		CHECK(strstr(r4.output, "if (_Atomic(U) u = {0}; 1)") != NULL,
-		      "c23-if-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
-	}
+	CHECK(r4.status != PRISM_OK,
+	      "c23-if-atomic-union-typedef-zeroinit: typedef atomic union in if-initializer rejected");
 	prism_free(&r4);
 
 	const char *switch_atomic_union_typedef_code =
@@ -2378,12 +2347,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r5 = prism_transpile_source(
 	    switch_atomic_union_typedef_code, "c23_switch_atomic_union_typedef.c", prism_defaults());
-	CHECK(r5.status == PRISM_OK && r5.output,
-	      "c23-switch-atomic-union-typedef-zeroinit: typedef atomic union in switch-initializer must transpile");
-	if (r5.output) {
-		CHECK(strstr(r5.output, "switch (_Atomic(U) u = {0}; 0)") != NULL,
-		      "c23-switch-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
-	}
+	CHECK(r5.status != PRISM_OK,
+	      "c23-switch-atomic-union-typedef-zeroinit: typedef atomic union in switch-initializer rejected");
 	prism_free(&r5);
 
 	const char *for_atomic_union_typedef_code =
@@ -2394,12 +2359,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r6 = prism_transpile_source(
 	    for_atomic_union_typedef_code, "c23_for_atomic_union_typedef.c", prism_defaults());
-	CHECK(r6.status == PRISM_OK && r6.output,
-	      "c23-for-atomic-union-typedef-zeroinit: typedef atomic union in for-initializer must transpile");
-	if (r6.output) {
-		CHECK(strstr(r6.output, "for (_Atomic(U) u = {0}; 0; )") != NULL,
-		      "c23-for-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
-	}
+	CHECK(r6.status != PRISM_OK,
+	      "c23-for-atomic-union-typedef-zeroinit: typedef atomic union in for-initializer rejected");
 	prism_free(&r6);
 
 	const char *switch_atomic_union_typedef_code2 =
@@ -2409,12 +2370,8 @@ static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
 	    "}\n";
 	PrismResult r7 = prism_transpile_source(
 	    switch_atomic_union_typedef_code2, "c23_switch_atomic_union_typedef2.c", prism_defaults());
-	CHECK(r7.status == PRISM_OK && r7.output,
-	      "c23-switch-atomic-union-typedef2-zeroinit: typedef atomic union in switch-initializer must transpile");
-	if (r7.output) {
-		CHECK(strstr(r7.output, "switch (_Atomic(U) u = {0}; 0)") != NULL,
-		      "c23-switch-atomic-union-typedef2-zeroinit: typedef atomic union gets = {0}");
-	}
+	CHECK(r7.status != PRISM_OK,
+	      "c23-switch-atomic-union-typedef2-zeroinit: typedef atomic union in switch-initializer rejected");
 	prism_free(&r7);
 }
 
@@ -3037,12 +2994,8 @@ static void test_c23_multidecl_initializer_zeroinit_supported(void) {
 	    "    switch (_Atomic(struct S) a, b; 0) { default: return a.x + b.x; }\n"
 	    "}\n",
 	    "c23_switch_multidecl_atomic_struct.c", prism_defaults());
-	CHECK(r2.status == PRISM_OK && r2.output,
-	      "c23-switch-multidecl-atomic-zeroinit: atomic struct multidecl in switch-initializer must transpile");
-	if (r2.output) {
-		CHECK(strstr(r2.output, "switch (_Atomic(struct S) a = {0}, b = {0}; 0)") != NULL,
-		      "c23-switch-multidecl-atomic-zeroinit: both atomic struct declarators get = {0}");
-	}
+	CHECK(r2.status != PRISM_OK,
+	      "c23-switch-multidecl-atomic-zeroinit: atomic struct multidecl in switch-initializer rejected");
 	prism_free(&r2);
 
 	PrismResult r3 = prism_transpile_source(

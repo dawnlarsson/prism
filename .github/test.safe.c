@@ -3802,7 +3802,9 @@ static void test_audit_parse_gap_fixes(void) {
 		PrismResult r = prism_transpile_source(code, "empty_struct_zi.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "empty-struct nest zi: transpiles");
 		if (r.output) {
-			CHECK(strstr(r.output, "memset") != NULL, "empty-struct nest zi: uses memset");
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
+			      "empty-struct nest zi: uses memset/byte-loop");
 			CHECK(strstr(r.output, "w = {0}") == NULL, "empty-struct nest zi: no = {0}");
 		}
 		prism_free(&r);
@@ -3812,7 +3814,9 @@ static void test_audit_parse_gap_fixes(void) {
 		PrismResult r = prism_transpile_source(code, "zero_arr_zi.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "sole [0] zi: transpiles");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL, "sole [0] zi: uses memset");
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
+			      "sole [0] zi: uses memset/byte-loop");
 		prism_free(&r);
 	}
 
@@ -6692,6 +6696,365 @@ static void test_phase1_reject_corpus(void) {
 	printf("--- p1 corpus summary: %d ok, %d fail ---\n", ok, fail);
 }
 
+/* Second six-domain parse hunt — silent miscompiles and false rejects. */
+static void test_parse_hunt2_regressions(void) {
+	{
+		PrismResult r = prism_transpile_source(
+		    "void die(void) __attribute__((noreturn)), live(void);\n"
+		    "void die(void){ for(;;) ; }\n"
+		    "void live(void){ }\n"
+		    "int main(void){ live(); return 42; }\n",
+		    "hunt2_noreturn_md.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: multi-decl post-attr noreturn binds die");
+		CHECK(r.output && strstr(r.output, "live();") &&
+			  !strstr(r.output, "live(); __builtin_unreachable") &&
+			  !strstr(r.output, "live(); __assume(0)"),
+		      "hunt2: live() must not get unreachable");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "enum E : unsigned { defer = 5 };\n"
+		    "int main(void) { int x = 0; return x + defer + 2; }\n",
+		    "hunt2_defer_infix.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: enum defer in x+defer+y");
+		CHECK(r.output && strstr(r.output, "defer") && !strstr(r.output, "+  +"),
+		      "hunt2: defer not eaten between +");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int f(int n){ int big[8]={10,20,30,40,50,60,70,80}; int *p[n];\n"
+		    " p[0]=big; volatile int j=2; return p[0][j]; }\n"
+		    "int main(void){ return f(2); }\n",
+		    "hunt2_vla_ptr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: VLA-of-pointers transpiles");
+		CHECK(r.output && !strstr(r.output, "sizeof(p[0])/sizeof(p[0][0])"),
+		      "hunt2: no pointee false bounds wrap");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int a[4]={1,2,3,4}; typeof(a) b;\n"
+		    " volatile int i=1; return b[i]; }\n",
+		    "hunt2_typeof_arr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: typeof(fixed array) bounds");
+		CHECK(r.output && strstr(r.output, "__prism_bchk"),
+		      "hunt2: typeof(a) registers for bounds");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Sole { char data[]; };\n"
+		    "int main(void){ struct Sole s; return 0; }\n",
+		    "hunt2_fam.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: sole FAM uses memset not ={0}");
+		CHECK(r.output &&
+			  (strstr(r.output, "memset") || strstr(r.output, "__prism_p_")) &&
+			  !strstr(r.output, "s = {0}"),
+		      "hunt2: sole FAM → memset");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ register struct {} e; return 0; }\n",
+		    "hunt2_reg_empty.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt2: register empty aggregate rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct E {};\n"
+		    "int main(void){ const struct { int x; struct E e; } s; return s.x; }\n",
+		    "hunt2_const_empty.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt2: const nested-empty memset rejected");
+		prism_free(&r);
+	}
+	GNUC_ONLY({
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ typeof(_BitInt(32)) a; return (int)(a != 0); }\n",
+		    "hunt2_bitint.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: typeof(_BitInt) zero-init");
+		CHECK(r.output && (strstr(r.output, "memset") || strstr(r.output, "= 0") ||
+				   strstr(r.output, "= {0}") || strstr(r.output, "__prism_p_")),
+		      "hunt2: typeof(_BitInt) gets zi");
+		prism_free(&r);
+	});
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "void f(void) { raw { int a; int b[8]; b[1] = 1; } }\n",
+		    "hunt2_raw_block.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: raw { } block");
+		CHECK(r.output && !strstr(r.output, "raw {"),
+		      "hunt2: raw block strips keyword");
+		CHECK(r.output && !strstr(r.output, "b[__prism_bchk"),
+		      "hunt2: raw block suppresses bounds on b[1]");
+		CHECK(r.output && strstr(r.output, "int a;") && !strstr(r.output, "int a = 0"),
+		      "hunt2: raw block suppresses zero-init");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int raw;\n"
+		    "int main(void){ raw raw x; return x; }\n",
+		    "hunt2_raw_raw.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: raw raw x strips keyword");
+		CHECK(r.output && strstr(r.output, "raw x") && !strstr(r.output, "raw raw x"),
+		      "hunt2: one raw remains as typedef type");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int x=0; asm (\"nop\" : [orelse] \"+r\"(x)); return x; }\n",
+		    "hunt2_asm_orelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: asm symbolic [orelse] allowed");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "enum E : typeof(unsigned) { orelse = 1 };\n"
+		    "int main(void){ return orelse; }\n",
+		    "hunt2_enum_typeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: enum : typeof + enumerator orelse");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void){ defer _Pragma(\"GCC diagnostic push\") { cleanup(); } }\n",
+		    "hunt2_defer_pragma.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: defer _Pragma { }");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.flatten_headers = false;
+		PrismResult r = prism_transpile_source(
+		    "# 1 \"/usr/include/stdio.h\" 1 3\n"
+		    "extern int printf(const char *, ...);\n"
+		    "# 1 \"user.c\" 2 3\n"
+		    "int main(void){ return 0; }\n",
+		    "user.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "hunt2: line marker 2 3 to user path");
+		CHECK(r.output && strstr(r.output, "main"),
+		      "hunt2: user TU after 2 3 not dropped");
+		prism_free(&r);
+	}
+}
+
+/* Third parse-hunt: expression-context defer, typeof(_Atomic), goto×zi,
+ * orelse edges, for-init zi, auto-static attrs/misses, digraph line markers. */
+static void test_parse_hunt3_regressions(void) {
+	/* Critical: sizeof/unary/cast/ternary must not eat undeclared defer. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int x=4; int r; r = sizeof defer; x; return r; }\n",
+		    "hunt3_sizeof_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: sizeof defer transpiles");
+		CHECK(r.output && strstr(r.output, "sizeof defer") && !strstr(r.output, "sizeof x"),
+		      "hunt3: sizeof defer not spliced to sizeof x");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int x=0; int r; r = ! defer; x; return r; }\n",
+		    "hunt3_bang_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: !defer transpiles");
+		CHECK(r.output && strstr(r.output, "! defer") && !strstr(r.output, "! x"),
+		      "hunt3: !defer not spliced to !x");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "static int defer(void){ return 3; }\n"
+		    "int main(void){ int (*t[])(void)={ defer }; return t[0]()==3?0:1; }\n",
+		    "hunt3_brace_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: brace-init { defer }");
+		CHECK(r.output && strstr(r.output, "{ defer }"),
+		      "hunt3: { defer } kept as identifier");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ typeof(_Atomic(int)) x; return (int)x; }\n",
+		    "hunt3_typeof_atomic.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: typeof(_Atomic(int)) zi");
+		CHECK(r.output && (strstr(r.output, "memset") || strstr(r.output, "__prism_p_") ||
+				   strstr(r.output, "= 0") || strstr(r.output, "= {0}")),
+		      "hunt3: typeof(_Atomic) gets zero-init");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ goto L; int x; L: x = x + 1; return x & 255; }\n",
+		    "hunt3_goto_self.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt3: goto over zi rejects x=x+1 assigned-first");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "static int hits;\n"
+		    "static void dtor(void *p){ (void)p; hits=1; }\n"
+		    "static void f(void){\n"
+		    "  __attribute__((cleanup(dtor))) const int arr[3] = {1,2,3};\n"
+		    "  (void)arr;\n"
+		    "}\n"
+		    "int main(void){ hits=0; f(); return hits; }\n",
+		    "hunt3_as_cleanup.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: auto-static skips leading cleanup attr");
+		CHECK(r.output && strstr(r.output, "__attribute__((cleanup(dtor))) const int arr") &&
+			  !strstr(r.output, "static __attribute__((cleanup") &&
+			  !strstr(r.output, "static  __attribute__((cleanup"),
+		      "hunt3: cleanup decl not prefixed with static");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ [[maybe_unused]] const int arr[3]={1,2,3}; return arr[0]; }\n",
+		    "hunt3_as_c23attr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: auto-static skips leading [[attr]]");
+		CHECK(r.output && strstr(r.output, "[[maybe_unused]]") &&
+			  !strstr(r.output, "static  [[") && !strstr(r.output, "static [["),
+		      "hunt3: no static before [[attr]]");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int x=0; x = x orelse orelse 1; return x; }\n",
+		    "hunt3_oe_mid.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt3: mid-chain empty orelse rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *g(void);\n"
+		    "int main(void){ int *_Nonnull p = g() orelse 0; return p?1:0; }\n",
+		    "hunt3_oe_nonnull.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: _Nonnull + orelse");
+		CHECK(r.output && strstr(r.output, "_Nonnull p") && strstr(r.output, "p ="),
+		      "hunt3: _Nonnull decl stays in scope (not if/else scoped)");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "_Atomic int rd(void);\n"
+		    "int main(void){ const _Atomic int x = rd() orelse 5; return (int)x; }\n",
+		    "hunt3_oe_const_atomic.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: const _Atomic orelse");
+		CHECK(r.output && strstr(r.output, "if (!__prism_oe_") && !strstr(r.output, "? __prism_oe_"),
+		      "hunt3: const _Atomic uses if-assign not ternary double-load");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int rd(void);\n"
+		    "int main(void){ const volatile int x = rd() orelse 5; return x; }\n",
+		    "hunt3_oe_const_vol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: const volatile orelse");
+		CHECK(r.output && strstr(r.output, "if (!__prism_oe_"),
+		      "hunt3: const volatile uses if-assign");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int b=0; return 0, b = 0 orelse 5; }\n",
+		    "hunt3_oe_return.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt3: return-expr orelse rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S { int a; int b; };\n"
+		    "int main(void){ for (_Atomic struct S s; ; ) return s.a; }\n",
+		    "hunt3_zi_for_atomic.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt3: for-init _Atomic agg memset rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct P { struct {} e; int x; };\n"
+		    "int main(void){ for (register struct P p; ; ) return p.x!=0; }\n",
+		    "hunt3_zi_for_reg.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "hunt3: for-init register brace-unsafe rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "enum E : _Atomic(int) { orelse = 1 };\n"
+		    "int main(void){ return orelse; }\n",
+		    "hunt3_enum_atomic.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: enum : _Atomic(int) { orelse }");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "union U { int a; float b; };\n"
+		    "struct S { const union U u; int x; };\n"
+		    "int main(void){ struct S s; return s.x; }\n",
+		    "hunt3_zi_member.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: const union member not false-rejected");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.flatten_headers = false;
+		PrismResult r = prism_transpile_source(
+		    "%: 1 \"hunt3_dg.i\"\n"
+		    "%: 1 \"/usr/include/stdio.h\" 1 3\n"
+		    "extern int printf(const char *, ...);\n"
+		    "%: 2 \"hunt3_dg.i\" 2\n"
+		    "int main(void){ int x; return x; }\n",
+		    "hunt3_dg.i", f);
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: digraph %: line markers");
+		CHECK(r.output && strstr(r.output, "main") && !strstr(r.output, "printf"),
+		      "hunt3: digraph markers flatten system body away");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef const int cint;\n"
+		    "int main(void){ cint arr[8]={1,2,3,4,5,6,7,8}; return arr[0]; }\n",
+		    "hunt3_as_td_const.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: typedef-const auto-static");
+		CHECK(r.output && strstr(r.output, "static") && strstr(r.output, "cint arr"),
+		      "hunt3: typedef const array promoted");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ const char msg[] = \"hello world\"; return msg[0]; }\n",
+		    "hunt3_as_str.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: unbraced string auto-static");
+		CHECK(r.output && strstr(r.output, "static") && strstr(r.output, "msg[]"),
+		      "hunt3: char msg[] = \"...\" promoted");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ const bool arr[2]={true,false}; return arr[0]; }\n",
+		    "hunt3_as_bool.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: C23 true/false auto-static");
+		CHECK(r.output && strstr(r.output, "static") && strstr(r.output, "true"),
+		      "hunt3: {true,false} literal init promoted");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ const typeof(int[8]) arr={1,2,3,4,5,6,7,8}; return arr[0]; }\n",
+		    "hunt3_as_typeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "hunt3: typeof(int[N]) auto-static");
+		CHECK(r.output && strstr(r.output, "static") && strstr(r.output, "typeof"),
+		      "hunt3: typeof arrayness promoted");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -7108,4 +7471,12 @@ void run_safe_tests(void) {
 
         // Objective-C ivar block zero-init suppression
         test_objc_ivar_block_zeroinit();
+
+	/* Second parse-hunt cluster (noreturn multi-decl, defer infix, VLA-ptr
+	 * bounds, typeof array, FAM/{0}, raw block, asm [orelse], …). */
+	test_parse_hunt2_regressions();
+
+	/* Third parse-hunt cluster (expr defer, typeof(_Atomic), goto×zi,
+	 * orelse/_Nonnull/const-atomic, for-init zi, auto-static, digraph %:). */
+	test_parse_hunt3_regressions();
 }
