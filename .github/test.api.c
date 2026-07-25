@@ -851,12 +851,13 @@ static void test_memory_leak_stress(void) {
 
 	long baseline_mem = get_memory_usage_kb();
 
+	bool stress_ok = true;
 	for (int i = 0; i < iterations; i++) {
 		PrismResult result = prism_transpile_source(stress_src, "stress.c", features);
 		if (result.status != PRISM_OK) {
 			printf("[FAIL] stress iteration %d failed: %s\n", i,
 			       result.error_msg ? result.error_msg : "unknown");
-			failed++;
+			stress_ok = false;
 			prism_free(&result);
 			break;
 		}
@@ -898,9 +899,14 @@ static void test_memory_leak_stress(void) {
 		}
 	}
 
-	passed++;
 	total++;
-	printf("[PASS] completed %d stress iterations\n", iterations);
+	if (stress_ok) {
+		passed++;
+		printf("[PASS] completed %d stress iterations\n", iterations);
+	} else {
+		failed++;
+		printf("[FAIL] did not complete %d stress iterations\n", iterations);
+	}
 }
 
 #ifndef _WIN32

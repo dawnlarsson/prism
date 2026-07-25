@@ -488,6 +488,13 @@ int main(void) {
 	printf("\n");
 #endif
 	printf("========================================\n");
+	bool accounting_ok = total_tests == total_pass + total_fail;
+	if (!accounting_ok)
+		fprintf(stderr,
+			"[FAIL] harness accounting invariant: total(%d) != passed(%d) + failed(%d)\n",
+			total_tests,
+			total_pass,
+			total_fail);
 
-	return (total_fail == 0) ? 0 : 1;
+	return (total_fail == 0 && accounting_ok) ? 0 : 1;
 }

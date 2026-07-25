@@ -5646,12 +5646,50 @@ static inline Token *try_detect_noreturn_call(Token *tok) {
 	// Respect C scoping: if a local variable/parameter shadows a noreturn
 	TypedefEntry *te = typedef_lookup(tok);
 	if (te && te->is_shadow) return NULL;
+	/* A direct call can still be the operand of the no-paren form of sizeof:
+	 *
+	 *     sizeof +die();
+	 *     sizeof -(int)die();
+	 *
+	 * In both cases the call is unevaluated even though the token immediately
+	 * before the callee is not `sizeof`.  If we mistake it for a statement-level
+	 * call, auto-unreachable makes the reachable continuation undefined.  Walk
+	 * only cast and unary-prefix syntax; stop at a binary +/-, so
+	 * `sizeof(x) + die();` still gets the optimization. */
+	Token *ue = tok_walk_back(tok_idx(tok), WB_ATTR_NOISE);
+	for (;;) {
+		if (ue && match_ch(ue, ')') && close_paren_ends_cast_type_name(ue)) {
+			Token *open = tok_match(ue);
+			ue = open ? tok_walk_back(tok_idx(open), WB_PAST_NOISE) : NULL;
+			continue;
+		}
+		if (ue && ue->kind == TK_IDENT && equal(ue, "__extension__")) {
+			ue = tok_walk_back(tok_idx(ue), WB_PAST_NOISE);
+			continue;
+		}
+		if (ue && ue->kind == TK_PUNCT && ue->len == 1 &&
+		    (ue->ch0 == '+' || ue->ch0 == '-' || ue->ch0 == '!' || ue->ch0 == '~')) {
+			Token *before = tok_walk_back(tok_idx(ue), WB_ATTR_NOISE);
+			if ((ue->ch0 == '+' || ue->ch0 == '-') && before && is_expr_ending(before) &&
+			    !is_sizeof_like(before) &&
+			    !(before->kind == TK_IDENT && equal(before, "__extension__")) &&
+			    !close_paren_ends_cast_type_name(before))
+				break; /* binary + / - */
+			ue = tok_walk_back(tok_idx(ue), WB_PAST_NOISE);
+			continue;
+		}
+		break;
+	}
+	if (ue && is_sizeof_like(ue)) return NULL;
 	if (tok_idx(tok) >= 1) {
 		Token *prev = tok_walk_back(tok_idx(tok), WB_PAST_NOISE);
 		if (prev && (prev->tag & TT_MEMBER)) return NULL;
 		if (prev && (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_SUE)))
 			return NULL;
 		if (prev && match_ch(prev, '*')) return NULL;
+		/* `sizeof die();` / `_Alignof die();` — call is unevaluated;
+		 * must not inject unreachable after the statement. */
+		if (prev && is_sizeof_like(prev)) return NULL;
 	}
 	Token *call = tok_next(tok);
 	if (!call || !match_ch(call, '(') || !tok_match(call)) return NULL;

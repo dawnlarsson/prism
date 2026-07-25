@@ -349,7 +349,7 @@ static const char *cx_ident_tmpl[] = {
 
 static void run_ident_namespace_tier(void) {
 	static const char *kw[2] = {"orelse", "defer"};
-	int rejects = 0, total = 0;
+	int rejects = 0, cells = 0;
 	char first_rej[192] = "";
 	char src[CX_SRC_MAX];
 	for (int k = 0; k < 2; k++) {
@@ -358,7 +358,7 @@ static void run_ident_namespace_tier(void) {
 			const char *w = kw[k];
 			/* templates use the keyword up to 4 times */
 			snprintf(src, sizeof(src), t, w, w, w, w);
-			total++;
+			cells++;
 			PrismResult r = prism_transpile_source(src, "cxid.c", prism_defaults());
 			if (r.status != PRISM_OK) {
 				if (!rejects)
@@ -374,7 +374,7 @@ static void run_ident_namespace_tier(void) {
 	snprintf(name, sizeof(name),
 		 "contexts[ident-namespaces]: %d identifier uses of defer/orelse accepted, 0 "
 		 "false rejects%s%s",
-		 total, rejects ? " -- " : "", rejects ? first_rej : "");
+		 cells, rejects ? " -- " : "", rejects ? first_rej : "");
 	CHECK(rejects == 0, name);
 }
 

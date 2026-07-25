@@ -1327,6 +1327,18 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 				out_char(' ');
 				emit_deferred_range(defer_stack[i].stmt, defer_stack[i].end);
 				out_char(';');
+				/* Braceless `defer die();` stores the body as
+				 * `[die, ';')` and synthesizes `;` here — so
+				 * emit_statements never sees the semicolon that
+				 * normally triggers auto-unreachable. Re-detect
+				 * a top-level noreturn call on the body start.
+				 * Braced bodies / `defer if (0) die();` already
+				 * handle (or correctly suppress) injection. */
+				if (FEAT(F_AUTO_UNREACHABLE) && defer_stack[i].stmt &&
+				    !match_ch(defer_stack[i].stmt, '{')) {
+					Token *nr = try_detect_noreturn_call(defer_stack[i].stmt);
+					if (nr) EMIT_UNREACHABLE();
+				}
 			}
 			current_defer = scope->defer_start_idx - 1;
 		}
@@ -2616,18 +2628,22 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		}
 
 		track_generic_token(tok);
-		{
-			Token *next = try_orelse_expr_rewrites(tok);
-			if (next) {
-				tok = next;
-				continue;
-			}
-		}
-
+		/* Bounds before bracket-orelse: `a[i orelse 0]` must wrap the
+		 * ternary index. try_bounds_check_subscript already lowers
+		 * P1_OE_BRACKET indexes inside __prism_bchk; orelse-only
+		 * brackets (declarator dims, uneval, non-arrays) still fall
+		 * through to try_orelse_expr_rewrites. */
 		if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
 			Token *bc = try_bounds_checks(tok);
 			if (bc) {
 				tok = bc;
+				continue;
+			}
+		}
+		{
+			Token *next = try_orelse_expr_rewrites(tok);
+			if (next) {
+				tok = next;
 				continue;
 			}
 		}
@@ -3299,8 +3315,12 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			bool unary = true;
 			if (tok_idx(prev) >= 1) {
 				Token *pp = &token_pool[tok_idx(prev) - 1];
+				/* `)` after a cast type-name `(void)` / `(int *)` still
+				 * leaves `&` unary — `(void)&a[n]` is one-past-legal.
+				 * Expression `)` (`(x)&a[i]`) is binary `&`. */
 				if (bounds_is_name_token(pp) || pp->kind == TK_NUM || pp->kind == TK_STR ||
-				    match_ch(pp, ')') || match_ch(pp, ']'))
+				    match_ch(pp, ']') ||
+				    (match_ch(pp, ')') && !close_paren_ends_cast_type_name(pp)))
 					unary = false;
 			}
 			if (unary) return NULL;
@@ -4558,6 +4578,11 @@ static void check_typeof_paren_orelse_type_junk(Token *open) {
 }
 
 static void check_orelse_in_parens(Token *open) {
+	/* Several Pass-2 debug backstops are reached from generic balanced-group
+	 * walks. Braces (initializer lists) and brackets have their own Phase-1
+	 * classifiers; treating them as parentheses false-rejects ordinary
+	 * `defer` identifiers in `{ defer }` and valid `[i orelse j]` indexes. */
+	if (!open || !match_ch(open, '(')) return;
 	check_paren_orelse_defer(open, false);
 }
 
@@ -4881,6 +4906,23 @@ static P1FuncEntry *p2_lookup_decl_entry(Token *var) {
 	}
 	return NULL;
 }
+
+#ifdef PRISM_DEBUG
+/* Phase 1 deliberately excludes locals inside GNU nested functions from the
+ * outer function's recipe/CFG table. Pass 2 still walks their declarations,
+ * so a missing-recipe assertion must recognize that intentional omission. */
+static bool p1_token_in_nested_function(Token *tok) {
+	if (!tok) return false;
+	uint32_t idx = tok_idx(tok);
+	for (uint16_t sid = 1; sid < scope_tree_count; sid++) {
+		ScopeInfo *s = &scope_tree[sid];
+		if (s->is_func_body && s->parent_id != 0 && s->open_tok_idx < idx &&
+		    idx < s->close_tok_idx)
+			return true;
+	}
+	return false;
+}
+#endif
 
 static bool decl_shape_explicit_const(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	bool excl = (type->has_const && !decl->is_func_ptr && !decl->is_pointer) || decl->is_const;
@@ -5670,7 +5712,8 @@ static Token *process_declarators(Token *tok,
 			zero_kind = compute_decl_zero_kind(
 			    &shape, type_start, type, &decl, decl.has_init, decl_is_raw, type->has_static);
 #ifdef PRISM_DEBUG
-			if (current_func_idx >= 0 && decl.var_name && !shape.is_func_type)
+			if (current_func_idx >= 0 && decl.var_name && !shape.is_func_type &&
+			    !p1_token_in_nested_function(decl.var_name))
 				error_tok(decl.var_name, "internal: missing P1K_DECL recipe");
 #endif
 		}
@@ -9330,6 +9373,54 @@ static bool bracket_in_compound_literal_type(Token *open_bracket) {
 /* True when `[…]` is a designated-initializer index (not an expression
  * subscript in a value). Designator `[` follows `{` / `,` / `.name` / prior
  * designator `]`; value subscripts follow an expression-ending name. */
+static bool bracket_in_offsetof_member(Token *open_bracket) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth == 0 && match_ch(t, '(')) {
+				Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+				if (!before) return false;
+				/* Both carry TF_SIZEOF — match lexeme so sizeof/alignof
+				 * are not treated as offsetof member designators. */
+				if ((before->kind == TK_IDENT || before->kind == TK_KEYWORD) &&
+				    ((before->len == 8 &&
+				      prism_memeq_static(tok_loc(before), "offsetof", 8)) ||
+				     (before->len == 18 &&
+				      prism_memeq_static(tok_loc(before), "__builtin_offsetof", 18))))
+					return true;
+				return false;
+			}
+			if (depth > 0) depth--;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
+	}
+	return false;
+}
+
+/* `.a[…]` and `.outer.inner[…]` are initializer designators only when the
+ * member chain has a leading dot.  A value expression such as `s.a[i]` or
+ * `p->a[i]` has a base expression and must not inherit the designator ICE
+ * restriction. */
+static bool bracket_has_leading_member_designator(Token *member_name) {
+	Token *name = member_name;
+	while (name && is_identifier_like(name)) {
+		Token *member = tok_walk_back(tok_idx(name), WB_PAST_NOISE);
+		if (!member || !(member->tag & TT_MEMBER) || !match_ch(member, '.')) return false;
+		Token *left = tok_walk_back(tok_idx(member), WB_PAST_NOISE);
+		if (!left || match_ch(left, '{') || match_ch(left, ',')) return true;
+		if (!is_identifier_like(left)) return false;
+		name = left;
+	}
+	return false;
+}
+
 static bool bracket_is_designator_index(Token *open_bracket) {
 	Token *prev = tok_walk_back(tok_idx(open_bracket), WB_PAST_NOISE);
 	if (!prev) return false;
@@ -9337,7 +9428,11 @@ static bool bracket_is_designator_index(Token *open_bracket) {
 	if (match_ch(prev, ']')) return true; /* [1][2] or .a[1][2] */
 	if (is_identifier_like(prev)) {
 		Token *before = tok_walk_back(tok_idx(prev), WB_PAST_NOISE);
-		return before && (before->tag & TT_MEMBER);
+		if (before && (before->tag & TT_MEMBER))
+			return bracket_has_leading_member_designator(prev) ||
+			       bracket_in_offsetof_member(open_bracket);
+		/* offsetof(T, field[…]) / __builtin_offsetof(T, field[…]) */
+		if (before && match_ch(before, ',')) return bracket_in_offsetof_member(open_bracket);
 	}
 	return false;
 }
@@ -9355,6 +9450,91 @@ static bool bracket_contains_gnu_range(Token *open_bracket) {
 			t = tok_match(t);
 			continue;
 		}
+	}
+	return false;
+}
+
+/* True when `[…]` sits in an `_Alignof`/`alignof` type operand — those
+ * require a complete non-VLA type, so non-ICE dim orelse is unsound.
+ * Walk through type-specifier ctors (`_Atomic(…)`, `typeof(…)`, `_BitInt(…)`)
+ * so `_Alignof(_Atomic(int[n orelse 1]))` still rejects. */
+static bool bracket_in_alignof_type_operand(Token *open_bracket) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth == 0 && match_ch(t, '(')) {
+				Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+				if (!before) return false;
+				/* `_Alignof` is TK_KEYWORD; soft `alignof` is TK_IDENT. */
+				if ((before->kind == TK_IDENT || before->kind == TK_KEYWORD) &&
+				    ((before->len == 8 &&
+				      prism_memeq_static(tok_loc(before), "_Alignof", 8)) ||
+				     (before->len == 7 &&
+				      prism_memeq_static(tok_loc(before), "alignof", 7))))
+					return true;
+				/* Peel type-specifier constructors and keep looking. */
+				if ((before->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) ||
+				    ((before->tag & TT_TYPE) && equal(before, "_Atomic")))
+					continue;
+				return false;
+			}
+			if (depth > 0) depth--;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
+	}
+	return false;
+}
+
+/* `_Generic(…, T[n orelse 1]: val, …)` — association types need complete
+ * non-VLA types (same ICE rule as designator indices / alignof dims). */
+static bool bracket_in_generic_association_type(Token *open_bracket) {
+	Token *gen_open = NULL;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (!(t->flags & TF_OPEN) || !match_ch(t, '(') || !tok_match(t) ||
+		    tok_idx(tok_match(t)) <= tok_idx(open_bracket))
+			continue; /* not an ancestor group */
+		Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+		if (before && (before->tag & TT_GENERIC)) {
+			gen_open = t;
+			break; /* innermost containing _Generic owns the association */
+		}
+	}
+	if (!gen_open || !tok_match(gen_open)) return false;
+	Token *gen_close = tok_match(gen_open);
+	int d = 0, commas = 0;
+	for (Token *t = tok_next(gen_open); t && t != open_bracket; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			d++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			if (d > 0) d--;
+			continue;
+		}
+		if (d == 0 && match_ch(t, ',')) commas++;
+	}
+	if (commas < 1) return false; /* still in controlling expression */
+	d = 0;
+	for (Token *t = open_bracket; t && t != gen_close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			d++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			if (d > 0) d--;
+			continue;
+		}
+		if (d == 0 && match_ch(t, ':')) return true;
+		if (d == 0 && match_ch(t, ',')) return false;
 	}
 	return false;
 }
@@ -9537,6 +9717,26 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 						  "'orelse' in a designated-initializer index requires an "
 						  "integer constant expression on the left-hand side; "
 						  "hoist a constant index or use a positional initializer");
+				/* GNU range designators cannot be ternary-lowered. */
+				if (bracket_is_designator_index(tok) && bracket_contains_gnu_range(tok))
+					error_tok(s,
+						  "'orelse' cannot be used in a GNU range designator "
+						  "'[first ... last]' (ternary lowering would destroy "
+						  "the range syntax)");
+				/* `_Alignof(int[n orelse 1])` — alignof needs a non-VLA type. */
+				if (bracket_in_alignof_type_operand(tok) &&
+				    bracket_dim_lhs_nonconstant(tok_next(tok), s))
+					error_tok(s,
+						  "'orelse' in an array dimension inside "
+						  "_Alignof/alignof requires an integer constant "
+						  "expression on the left-hand side");
+				/* `_Generic(…, int[n orelse 1]: …)` — association types too. */
+				if (bracket_in_generic_association_type(tok) &&
+				    bracket_dim_lhs_nonconstant(tok_next(tok), s))
+					error_tok(s,
+						  "'orelse' in an array dimension inside a "
+						  "_Generic association type requires an integer "
+						  "constant expression on the left-hand side");
 				prev_d0_oe = s;
 			} else {
 				/* Nested orelse: check LHS of the innermost group only.
@@ -9624,6 +9824,15 @@ static void p1d_annotate_typeof_orelse(Token *typeof_tok, uint16_t cur_sid, int 
 				Token *rp = tok_match(lp);
 				Token *prev_u = lp;
 				for (Token *u = tok_next(lp); u && u != rp; u = tok_next(u)) {
+					/* Type-name dims `sizeof(int[0 orelse 1])` /
+					 * `_Alignof(int[…])` lower via ternary — do not
+					 * treat them as expression-orelse rejects here. */
+					if (match_ch(u, '[') && (u->flags & TF_OPEN) && tok_match(u) &&
+					    !(u->flags & TF_C23_ATTR)) {
+						u = tok_match(u);
+						prev_u = u;
+						continue;
+					}
 					if (orelse_kw_at(u, prev_u) || orelse_after_type_in_parens(u, prev_u))
 						error_tok(u,
 							  "'orelse' cannot be used inside parentheses "
@@ -11601,6 +11810,26 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 											     ps->p1d_cur_func,
 											     /*hard_ctx=*/false,
 											     /*allow_se_hoist=*/false);
+							/* _Static_assert needs an ICE — VLA dims from
+							 * `sizeof(char[n orelse 1])` are not ICEs. */
+							if (match_ch(inner, '[') && (tok_ann(inner) & P1_OE_BRACKET)) {
+								Token *bc = tok_match(inner);
+								for (Token *oe = tok_next(inner); oe && oe != bc;
+								     oe = tok_next(oe)) {
+									if (!(tok_ann(oe) & P1_IS_ORELSE_KW))
+										continue;
+									if (bracket_dim_lhs_nonconstant(
+										tok_next(inner), oe))
+										error_tok(
+										    oe,
+										    "'orelse' in an array "
+										    "dimension inside "
+										    "_Static_assert/static_assert "
+										    "requires an integer constant "
+										    "expression on the left-hand "
+										    "side");
+								}
+							}
 						}
 					Token *prev_sa = lp;
 					for (Token *s = tok_next(lp); s && s != rp; s = tok_next(s)) {
@@ -11864,10 +12093,11 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				Token *body = skip_noise(tok_next(ps->tok));
 				Token *bare_oe = find_bare_orelse(body);
 				if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT))) {
-					/* `return orelse;` of a param/var named orelse is fine;
-					 * reject only when orelse is an operator in the expr. */
-					Token *before = tok_walk_back(tok_idx(bare_oe), WB_PAST_NOISE);
-					if (!(before && (before->tag & TT_RETURN)))
+					/* `return orelse;` — identifier operand starts the expr.
+					 * Do not walk back with WB_PAST_NOISE: it skips `(x)`, so
+					 * `return (x) orelse 1` looked like `return orelse` and
+					 * leaked the keyword to the backend. */
+					if (body != bare_oe)
 						error_tok(bare_oe,
 							  "'orelse' cannot be used in a return expression; "
 							  "assign to a temporary first");
@@ -12741,6 +12971,16 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		}
 
 		track_common_token_state(tok);
+		/* Bounds before bracket-orelse — same ordering as emit_statements /
+		 * walk_balanced. Otherwise `return a[i orelse 0]` lowers the
+		 * index ternary but skips __prism_bchk (v1 hook-order bug). */
+		if (ctx->raw_block_depth == 0) {
+			Token *bc = try_bounds_checks(tok);
+			if (bc) {
+				tok = bc;
+				continue;
+			}
+		}
 		if (ctx->raw_block_depth == 0) {
 			Token *next = try_orelse_expr_rewrites(tok);
 			if (next) {
@@ -12753,14 +12993,6 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
 			error_tok(tok, ERR_ORELSE_STMT_LEVEL);
 #endif
-		// Declarator brackets are tagged P1_DECL_BRACKET in Phase 1 and skipped.
-		if (ctx->raw_block_depth == 0) {
-			Token *bc = try_bounds_checks(tok);
-			if (bc) {
-				tok = bc;
-				continue;
-			}
-		}
 
 		tok = emit_advance(tok);
 	}

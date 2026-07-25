@@ -770,7 +770,7 @@ struct _orelse_struct_body {
 	int v;
 };
 
-static struct _orelse_struct_body *_osb_get(struct _orelse_struct_body *p) {
+static void *_osb_get(void *p) {
 	return p;
 }
 
@@ -779,10 +779,13 @@ void test_orelse_struct_body_multi_decl(void) {
 
 	struct _orelse_struct_body {
 		int v;
-	} *p = _osb_get(&a) orelse return, *q = &a;
+	} *p = _osb_get(&a) orelse return, *q = p;
 
-	CHECK_EQ(p->v, 42, "orelse struct body multi-decl: p deref");
-	CHECK_EQ(q->v, 42, "orelse struct body multi-decl: q deref");
+	/* The block-scope tag intentionally denotes a distinct C type from the
+	 * file-scope tag. Check declaration/split behavior without relying on the
+	 * incompatible-pointer conversions older Clang merely warned about. */
+	CHECK(p != NULL, "orelse struct body multi-decl: p initialized");
+	CHECK(q == p, "orelse struct body multi-decl: q declared");
 }
 
 static int _orelse_defer_multi_decl_helper(int val, int *out) {
@@ -1866,6 +1869,10 @@ static void test_array_typedef_const_orelse_ternary(void) {
 	// to extract the element type safely.
 	CHECK(strstr(result.output, "carr_t") != NULL || strstr(result.output, "arr_t") != NULL,
 	      "arr_td const orelse: type name appears in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
 }
 
 static void test_bare_orelse_compound_literal_ternary(void) {
@@ -1897,6 +1904,10 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
 	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
 	      "bare orelse compound: compound literal present in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
 }
 
 static void test_chained_bare_orelse(void) {
@@ -1951,6 +1962,10 @@ static void test_chained_bare_orelse(void) {
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
 	      "chained bare orelse: compound literal preserved");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
 }
 
 static void test_decl_orelse_ternary_lifetime(void) {
@@ -1980,6 +1995,10 @@ static void test_decl_orelse_ternary_lifetime(void) {
 	      "decl ternary lifetime: no if-based pattern (would kill literal)");
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL,
 	      "decl ternary lifetime: compound literal preserved");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
 }
 
 static void test_bare_orelse_compound_literal_no_block_scope(void) {
@@ -2135,6 +2154,24 @@ static void test_orelse_leak_in_expr_parens(void) {
 	CHECK(!leaked,
 	      "orelse-leak-expr: orelse inside parens in return+defer must be rejected, not emitted raw");
 	prism_free(&r);
+
+	/* `return (x) orelse 1` — WB_PAST_NOISE walked through `(x)` back to
+	 * `return`, falsely exempting the keyword so it leaked. */
+	{
+		PrismResult r2 = prism_transpile_source(
+		    "int f(void){ int x=0; return (x) orelse 1; }\n"
+		    "int g(void){ int a[4]={1}; return (a[0]) orelse 0; }\n"
+		    "int h(void){ int orelse=3; return orelse; }\n",
+		    "oe_ret_paren.c", prism_defaults());
+		CHECK(r2.status != PRISM_OK,
+		      "return (x) orelse must reject (not leak)");
+		prism_free(&r2);
+		r2 = prism_transpile_source(
+		    "int h(void){ int orelse=3; return orelse; }\n",
+		    "oe_ret_ident.c", prism_defaults());
+		CHECK_EQ(r2.status, PRISM_OK, "return orelse identifier still ok");
+		prism_free(&r2);
+	}
 }
 
 static void test_orelse_after_label_sweeps_label_into_cond(void) {
@@ -8975,10 +9012,10 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
-		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* static_assert */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, 1, 1, 1},
 		/* defer_body */ {1, 1, 1, 1, 1, 1, 0, 0, -1, 1, 0, 0, 0},
 		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, 0, -1, 0, 0, 0, 0},
 		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -8997,7 +9034,7 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 0, 0, 1, 1, 0, 1, -1, 1, 1, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
 		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -9019,7 +9056,7 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
 		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -9041,10 +9078,10 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 0, 0},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
-		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* static_assert */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 0, 0, 0},
 		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0},
 		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0},
@@ -9063,10 +9100,10 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
-		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* static_assert */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 0, 1, 1},
 		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
 		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0},
@@ -9085,7 +9122,7 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, -1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
 		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
 		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -9107,10 +9144,10 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, 1, 1, 1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
 		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
-		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* static_assert */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, 1, 1, 1},
 		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, 0, -1, 1, 0, 0, 0},
 		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, 0, -1, 0, 0, 0, 0},
 		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -9129,7 +9166,7 @@ static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUN
 		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, -1, -1, -1},
 		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
 		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
-		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1, -1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 0, -1, 1, -1, 0, -1, -1, -1},
 		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
 		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
 		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -9401,7 +9438,9 @@ static void test_fcse_spec_pressure(void) {
 	     "int main(void){ _Atomic int a=0; int b[a orelse 4]; (void)b; return 0; }\n", NULL, 0},
 	    {"alignof orelse call",
 	     "int get(void); int main(void){ return (int)_Alignof(char[get() orelse 4]); }\n",
-	     "get()", 0},
+	     "get()", 1},
+	    {"alignof orelse VLA",
+	     "int n; int main(void){ return (int)_Alignof(char[n orelse 4]); }\n", NULL, 1},
 	    {"brace designator orelse RHS",
 	     "int main(void){ int a[2] = { [0] = 0 orelse 1 }; return a[0]; }\n", NULL, 1},
 	    {"bitfield width orelse",
@@ -10255,6 +10294,74 @@ void run_orelse_tests(void) {
 		    "_Static_assert((0 orelse 1) == 1, \"x\"); int main(void){return 0;}\n",
 		    "oe_sa_paren.c", prism_defaults());
 		CHECK(r.status != PRISM_OK, "static_assert nested paren orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int n; int main(void){ return (int)_Alignof(char[n orelse 4]); }\n",
+		    "oe_alignof_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "alignof VLA dim orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ return (int)_Alignof(char[0 orelse 4]); }\n",
+		    "oe_alignof_ice.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "alignof ICE dim orelse: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "alignof ICE dim orelse: does not leak");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int n; int main(void){ return (int)_Alignof(_Atomic(int[n orelse 1])); }\n",
+		    "oe_alignof_atomic.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "alignof _Atomic VLA dim orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int n; int main(void){ return _Generic(0, int[n orelse 1]: 1, default: 0); }\n",
+		    "oe_generic_dim.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "generic assoc VLA dim orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ return _Generic(0, int[0 orelse 1]: 1, default: 0); }\n",
+		    "oe_generic_ice.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic assoc ICE dim orelse: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "generic assoc ICE dim orelse: does not leak");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S{int a[4];}; int n; int main(void){\n"
+		    "  return (int)__builtin_offsetof(struct S, a[n orelse 1]); }\n",
+		    "oe_off_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "offsetof VLA desig orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S{int a[4];}; int main(void){\n"
+		    "  return (int)__builtin_offsetof(struct S, a[0 ... 2 orelse 3]); }\n",
+		    "oe_off_range.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "offsetof GNU range orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S{int a[4];}; int main(void){\n"
+		    "  return (int)__builtin_offsetof(struct S, a[0 orelse 1]); }\n",
+		    "oe_off_ice.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "offsetof ICE desig orelse: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "offsetof ICE desig orelse: does not leak");
 		prism_free(&r);
 	}
 	{

@@ -1,14 +1,27 @@
-# Prism Verification Architecture: defer / orelse never fail, never misfire
+# Prism Verification Architecture and Proof Boundary
 
 **Companion:** [`SPEC.md`](SPEC.md) (Part II is the semantic contract), [`CERTIFICATION.md`](CERTIFICATION.md).
 
-This document states the correctness claims as theorems, names the artifact that
-discharges each one, and gives the arguments that lift bounded, mechanical checks
-to unbounded programs. Every artifact runs in CI; none of this is aspirational.
+This document states the correctness claims, names the artifact that supports
+each one, and records the exact proof boundary.  The `defer_walk` finite-state
+machine has a bounded-exhaustion + induction argument over unbounded stack
+depth.  The whole C transformer does **not**: its parser, classifier, `orelse`,
+zero-init, bounds, and backend composition are supported by exhaustive finite
+products, metamorphic checks, sanitizers, differential execution, and
+translation validation.  Those are strong verification evidence, not a formal
+proof over every possible C token stream.  CBMC is an on-demand artifact; the
+remaining executable artifacts run in CI.
 
 ---
 
-## The theorems
+## The claims and their proof status
+
+| Claim | Status |
+|---|---|
+| `defer_walk` order/stop properties P1–P5 | Proved for the stated finite-state abstraction; bounded real-code equivalence plus the small-model induction below |
+| End-to-end `defer` parsing/emission | Bounded exhaustive differential verification (`torture`) plus runtime and CFG products |
+| `orelse` classification and semantics | Bounded combinatorial/metamorphic/differential verification; not formally proved |
+| Parse termination/crash-freedom for arbitrary input | Fuzzed and watchdog-checked in debug builds; not formally proved |
 
 **T1: Parse totality.** For every input, prism terminates and either emits
 output or raises a diagnostic. Never a crash, never a hang, never a silent drop.
@@ -150,7 +163,7 @@ locks small **axis alphabets** and sweeps their Cartesian products with
 machine-decidable oracles (contexts/insertion aggregation style — many cells,
 a handful of CHECKs + first-failure breadcrumb).
 
-Closed generative tiers (62 hunters, thousands of cells): denser stmt-defer×wrap, orelse
+Closed generative tiers (87 hunters, 8k+ cells): denser stmt-defer×wrap, orelse
 primary×fallback×site (+ assign/multi/qual), auto-static factor+specials,
 goto×obstacle (incl. defer-call/two-decl/while; C23 if/switch-init into-block),
 polarity, hunt3 shapes, autounreach attr×site, bounds array×index×eval-context
@@ -159,7 +172,9 @@ feature-cube 2⁶×snips (~900), golf pins, reject-alphabet, **soft-ident**
 kw×role (~54), **orelse-actions** primary×action (~72), plus post-fix densifiers
 (ctrl-paren-defer, bounds-cast-oob, stmt-expr C7/C8, orelse type-junk in
 sizeof/_Alignof/typeof/_Generic including `T *` abstract declarators and nested
-typeof, cast/desig/CL orelse edges). Open tiers remain
+typeof, cast/desig/CL orelse edges), plus constructor-depth `_Generic`
+association types, member-value-subscript × LHS × fallback × site, and executed
+finite scalar truth/evaluation-count products. Open tiers remain
 gated for residual hunt cells; cast-subscript / name-semantics /
 attr-multidecl / raw-suppress / linemarker / illformed / goto-if-init are
 closed green. Contexts atomic heads densified (~2250 cells); insertion
@@ -263,9 +278,11 @@ suite and in `gen_torture.py`.
    watchdogs + fuzz ────────── termination and crash-freedom backstops
 ```
 
-## Trust base (what is *not* proven here)
+## Trust base and proof boundary (what is *not* proven here)
 
-The backend C compiler; the system preprocessor; cross-TU escapes
+The backend C compiler; the system preprocessor; correctness of the full C
+grammar/context abstraction outside the enumerated products; the assumption
+that `defer_walk`'s audited carried-state classes are complete; cross-TU escapes
 (`longjmp` through opaque function pointers, SPEC UB items 3); struct
 padding semantics (SPEC Known Limitations 1); and the documented UB items in
 SPEC Part II. `p1_verify_cfg` refuses (hard error) the constructs it cannot

@@ -110,6 +110,7 @@ static void cm_gen_taint_defer(void);
 static void cm_gen_label_defer_loop(void);
 static void cm_gen_orelse_type_junk_dense(void);
 static void cm_gen_generic_assoc(void);
+static void cm_gen_member_subscript_orelse(void);
 static void cm_gen_comma_orelse_split(void);
 static void cm_gen_braceless_ctrl_defer(void);
 static void cm_gen_cast_orelse_junk(void);
@@ -122,6 +123,27 @@ static void cm_gen_pp_span_orelse(void);
 static void cm_gen_empty_orelse_action(void);
 static void cm_gen_dim_orelse_uneval(void);
 static void cm_gen_bounds_param_shadow(void);
+/* Market-seven densify (defer/orelse/zi/raw/bounds/aur/as). */
+static void cm_gen_bounds_addr_modes(void);
+static void cm_gen_market7_cross(void);
+static void cm_gen_raw_prefix_feat(void);
+static void cm_gen_zi_typeof_product(void);
+static void cm_gen_orelse_bare_ctrl(void);
+static void cm_gen_defer_switch_product(void);
+static void cm_gen_soft_ident_expr(void);
+static void cm_gen_aur_call_shapes(void);
+static void cm_gen_as_init_shapes(void);
+#ifndef _WIN32
+static void cm_gen_runtime_defer(void);
+static void cm_gen_runtime_orelse(void);
+static void cm_gen_runtime_bounds(void);
+static void cm_gen_runtime_zi(void);
+static void cm_gen_runtime_cross(void);
+#endif
+static void cm_gen_market7_deep(void);
+static void cm_gen_feature_pair(void);
+static void cm_gen_defer_exit_dense(void);
+static void cm_gen_bounds_emit_paths(void);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * CLOSED generative sweeps
@@ -1273,6 +1295,26 @@ static void cm_gen_feature_cube(void) {
 		"void f(void){ struct { int a; } s; (void)s; }",
 		"void f(void){ raw { int x; (void)x; } }",
 		"void f(void){ int *p=0; (void)(p); }",
+		/* Cross-feature interaction snips (hand suites → cube ×64). */
+		"void cleanup(void); void f(void){ defer { int a[4]; (void)a[1]; } cleanup(); }",
+		"int *g(void); void cleanup(void); void f(void){ defer cleanup(); int *p = g() orelse 0; (void)p; }",
+		"void f(void){ raw { int a[4]; (void)a[1]; const int k[2]={1,2}; (void)k; } }",
+		"void cleanup(void); void f(void){ raw { defer cleanup(); } }",
+		"int *g(void); void f(void){ raw { int *p = g() orelse 0; (void)p; } }",
+		"_Noreturn void die(void); void f(void){ raw { die(); } }",
+		"void f(void){ int a[4]; (void)&a[4]; }",
+		"void f(void){ const typeof(int[3]) k={1,2,3}; (void)k; }",
+		"void cleanup(void); void f(void){ for(int i=0;i<1;i++){ defer cleanup(); break; } }",
+		"int *g(void); void f(void){ for(int i=0;i<1;i++){ int *p = g() orelse continue; (void)p; } }",
+		"void cleanup(void); void f(void){ switch(0){ default: { defer cleanup(); } break; } }",
+		"void f(void){ int a[8]; (void)a[0]; (void)a[7]; }",
+		"void f(void){ raw int a[4]; (void)a[1]; }",
+		"void cleanup(void); int *g(void); void f(void){ defer { int *p = g() orelse 0; (void)p; } cleanup(); }",
+		"_Noreturn void die(void); void cleanup(void); void f(void){ defer cleanup(); die(); }",
+		"void f(void){ const int k[2]={[0]=1,[1]=2}; (void)k; }",
+		"void f(void){ int x; int y; (void)x; (void)y; }",
+		"int *g(void); void f(void){ int *p = g() orelse g() orelse 0; (void)p; }",
+		"void f(void){ raw { int x; const int k[2]={1,2}; (void)x; (void)k; } }",
 	};
 	CmStats st = {0};
 	/* 2^6 = 64 feature masks × 6 snips = 384 cells */
@@ -1292,21 +1334,23 @@ static void cm_gen_feature_cube(void) {
 				prism_free(&r);
 				continue;
 			}
-			/* leak invariants when feature ON and accept */
+			/* leak invariants when feature ON and accept.
+			 * raw { … } intentionally keeps defer/orelse keywords. */
 			if (cm_ok(&r) && r.output) {
-				if ((mask & 1) && strstr(snips[s], "defer") &&
+				int in_raw = strstr(snips[s], "raw") != NULL;
+				if ((mask & 1) && !in_raw && strstr(snips[s], "defer") &&
 				    cm_kw(r.output, "defer"))
 					cm_note(&st, "cube defer leak mask=%u", mask);
-				if (((mask >> 1) & 1) && strstr(snips[s], "orelse") &&
+				if (((mask >> 1) & 1) && !in_raw && strstr(snips[s], "orelse") &&
 				    cm_kw(r.output, "orelse"))
 					cm_note(&st, "cube orelse leak mask=%u", mask);
-				if (!((mask >> 2) & 1) && strstr(snips[s], "a[1]") &&
+				if (!((mask >> 2) & 1) && strstr(snips[s], "a[1]") && !in_raw &&
 				    cm_has_bchk_wrap(r.output))
 					cm_note(&st, "cube bounds off leak mask=%u", mask);
-				if (!((mask >> 3) & 1) && strstr(snips[s], "const int k") &&
+				if (!((mask >> 3) & 1) && strstr(snips[s], "const int k") && !in_raw &&
 				    strstr(r.output, "static const int"))
 					cm_note(&st, "cube as off leak mask=%u", mask);
-				if (!((mask >> 4) & 1) && strstr(snips[s], "die") &&
+				if (!((mask >> 4) & 1) && strstr(snips[s], "die") && !in_raw &&
 				    cm_has_unreach(r.output))
 					cm_note(&st, "cube aur off leak mask=%u", mask);
 			}
@@ -1494,6 +1538,7 @@ void run_completeness_tests(void) {
 	cm_gen_label_defer_loop();
 	cm_gen_orelse_type_junk_dense();
 	cm_gen_generic_assoc();
+	cm_gen_member_subscript_orelse();
 	cm_gen_comma_orelse_split();
 	cm_gen_braceless_ctrl_defer();
 	cm_gen_cast_orelse_junk();
@@ -1506,6 +1551,27 @@ void run_completeness_tests(void) {
 	cm_gen_empty_orelse_action();
 	cm_gen_dim_orelse_uneval();
 	cm_gen_bounds_param_shadow();
+	/* Market-seven densify layer. */
+	cm_gen_bounds_addr_modes();
+	cm_gen_market7_cross();
+	cm_gen_raw_prefix_feat();
+	cm_gen_zi_typeof_product();
+	cm_gen_orelse_bare_ctrl();
+	cm_gen_defer_switch_product();
+	cm_gen_soft_ident_expr();
+	cm_gen_aur_call_shapes();
+	cm_gen_as_init_shapes();
+	cm_gen_market7_deep();
+	cm_gen_feature_pair();
+	cm_gen_defer_exit_dense();
+	cm_gen_bounds_emit_paths();
+#ifndef _WIN32
+	cm_gen_runtime_defer();
+	cm_gen_runtime_orelse();
+	cm_gen_runtime_bounds();
+	cm_gen_runtime_zi();
+	cm_gen_runtime_cross();
+#endif
 }
 
 /*
@@ -2729,6 +2795,7 @@ static void cm_gen_unreach_sites(void) {
 	static const char *must_not[] = {
 		"void die(void); void f(void){ die(); }",
 		"_Noreturn void die(void); void f(void){ sizeof(die()); }",
+		"_Noreturn void die(void); void f(void){ (void)sizeof die(); }",
 		"_Noreturn void die(void); void f(void){ if(0) die(); else (void)0; }",
 		"_Noreturn void die(void); void f(void){ (void)(0 ? die() : 0); }",
 		"_Noreturn void die(void); void f(void){ raw { die(); } }",
@@ -2990,10 +3057,12 @@ static void cm_gen_generic_assoc(void) {
 		"int f(int x){ return _Generic(x, int: 1, default: 0); }",
 		"int f(void){ return _Generic(0, int: 1, default: 0); }",
 		"int f(int *p){ return _Generic(p, int *: 1, default: 0); }",
+		"int f(void){ return _Generic(0, int[0 orelse 1]: 1, default: 0); }",
 	};
 	static const char *must_err[] = {
 		"int f(void){ return _Generic(0 orelse 1, default: 0); }",
 		"int f(void){ return _Generic(int orelse 0, default: 0); }",
+		"int f(int n){ return _Generic(0, int[n orelse 1]: 1, default: 0); }",
 	};
 	CmStats st = {0};
 	for (size_t i = 0; i < sizeof(must_ok)/sizeof(must_ok[0]); i++) {
@@ -3008,7 +3077,76 @@ static void cm_gen_generic_assoc(void) {
 		if (!cm_err(&r)) cm_note(&st, "generic accept %zu", i);
 		prism_free(&r);
 	}
+	/* Association type constructor x dimension-ICE product.  The direct
+	 * `int[n]` spelling is not enough: an ancestor search must see through
+	 * typeof layers and abstract declarator parentheses. */
+	static const char *assoc_types[] = {
+		"int[%s orelse 1]",
+		"typeof(int[%s orelse 1])",
+		"typeof(typeof(int[%s orelse 1]))",
+		"int (*)[%s orelse 1]",
+		"typeof(int (*)[%s orelse 1])",
+	};
+	static const char *dims[] = { "0", "n" };
+	char src[768], assoc[384];
+	for (size_t a = 0; a < sizeof(assoc_types) / sizeof(assoc_types[0]); a++) {
+		for (size_t d = 0; d < sizeof(dims) / sizeof(dims[0]); d++) {
+			snprintf(assoc, sizeof(assoc), assoc_types[a], dims[d]);
+			snprintf(src, sizeof(src),
+				 "int f(int n){ return _Generic((void *)0, %s: 1, default: 0); }",
+				 assoc);
+			st.cells++;
+			PrismResult r = cm_tx(src);
+			if (d == 0) {
+				if (!cm_ok(&r) || !r.output || cm_kw(r.output, "orelse"))
+					cm_note(&st, "generic ctor false-rej a=%zu", a);
+			} else if (!cm_err(&r)) {
+				cm_note(&st, "generic ctor VM accept a=%zu", a);
+			}
+			prism_free(&r);
+		}
+	}
 	cm_report("gen/generic-assoc", &st);
+}
+
+/* Value-member subscript x LHS x fallback x expression-site.  Member access
+ * and initializer designators share the token shape `.name[…]`; this product
+ * proves dynamic value subscripts are not accidentally subjected to the
+ * designator ICE rule. */
+static void cm_gen_member_subscript_orelse(void) {
+	static const char *accesses[] = {
+		"s.a[0][%s orelse %s]",
+		"p->a[0][%s orelse %s]",
+		"(*p).a[0][%s orelse %s]",
+		"o.in.a[0][%s orelse %s]",
+	};
+	static const char *lhs[] = { "0", "i" };
+	static const char *fallback[] = { "0", "1" };
+	static const char *sites[] = {
+		"return %s;",
+		"int x = %s; return x;",
+		"return (int)sizeof(%s);",
+	};
+	CmStats st = {0};
+	char expr[256], body[384], src[1200];
+	for (size_t a = 0; a < sizeof(accesses) / sizeof(accesses[0]); a++)
+		for (size_t l = 0; l < sizeof(lhs) / sizeof(lhs[0]); l++)
+			for (size_t f = 0; f < sizeof(fallback) / sizeof(fallback[0]); f++)
+				for (size_t s = 0; s < sizeof(sites) / sizeof(sites[0]); s++) {
+					snprintf(expr, sizeof(expr), accesses[a], lhs[l], fallback[f]);
+					snprintf(body, sizeof(body), sites[s], expr);
+					snprintf(src, sizeof(src),
+						 "struct I{int a[2][2];}; struct O{struct I in;}; "
+						 "int test(struct I s, struct I *p, struct O o, int i){ %s }",
+						 body);
+					st.cells++;
+					PrismResult r = cm_tx(src);
+					if (!cm_ok(&r) || !r.output || cm_kw(r.output, "orelse"))
+						cm_note(&st, "member-subscript a=%zu l=%zu f=%zu s=%zu",
+							a, l, f, s);
+					prism_free(&r);
+				}
+	cm_report("gen/member-subscript-orelse", &st);
 }
 
 static void cm_gen_comma_orelse_split(void) {
@@ -3163,10 +3301,23 @@ static void cm_gen_designator_orelse(void) {
 	static const char *must_ok[] = {
 		"void f(void){ int a[4] = { [0 orelse 0] = 1 }; (void)a; }",
 		"void f(void){ int a[4] = { [1 orelse 2] = 3, [0] = 4 }; (void)a; }",
+		"void f(void){ int a[2][2] = { [0 orelse 1][0] = 1 }; (void)a; }",
+		"void f(void){ int defer=1; int a[3] = { [defer] = 2 }; (void)a; }",
+		"struct S{int a[4];}; void f(void){ (void)__builtin_offsetof(struct S,a[0 orelse 1]); }",
+		"struct S{int a[4];}; void f(void){ (void)offsetof(struct S,a[1 orelse 0]); }",
 	};
 	static const char *must_err[] = {
 		"void f(void){ int a[4] = { [0] = 1 orelse 2 }; (void)a; }",
 		"void f(void){ struct { int x; } s = { .x = 1 orelse 2 }; (void)s; }",
+		/* GNU range designator — ternary would destroy `...`. */
+		"void f(void){ int a[8] = { [0 ... 2 orelse 3] = 9 }; (void)a; }",
+		"void f(void){ int a[8] = { [0 orelse 1 ... 3] = 9 }; (void)a; }",
+		"void f(void){ int a[8] = { [0 orelse 1 ... 2 orelse 3] = 9 }; (void)a; }",
+		"void f(void){ int idx=0; int a[8]={ [idx orelse 1]=42 }; (void)a; }",
+		/* offsetof member designators need ICEs; GNU range must not ternary. */
+		"struct S{int a[4];}; void f(int n){ (void)__builtin_offsetof(struct S,a[n orelse 1]); }",
+		"struct S{int a[4];}; void f(void){ (void)__builtin_offsetof(struct S,a[0 ... 2 orelse 3]); }",
+		"struct S{int a[4];}; int n; void f(void){ (void)offsetof(struct S,a[n orelse 0]); }",
 	};
 	CmStats st = {0};
 	for (size_t i = 0; i < sizeof(must_ok)/sizeof(must_ok[0]); i++) {
@@ -3311,6 +3462,13 @@ static void cm_gen_dim_orelse_uneval(void) {
 		"void f(void){ typedef int (*F)(int a[0 orelse 1]); (void)sizeof(F*); }",
 		"void f(int (*fp)(int a[0 orelse 1]));",
 		"void f(void){ void (*fp)(int a[0 orelse 1]); (void)fp; }",
+		"void f(int n){ _Static_assert(sizeof(char[n orelse 1]) > 0, \"\"); }",
+		"void f(int n){ (void)_Alignof(int[n orelse 1]); }",
+		"void f(int n){ (void)alignof(char[n orelse 1]); }",
+		"int n; int main(void){ return (int)_Alignof(char[n orelse 4]); }",
+		"void f(int n){ (void)_Alignof(_Atomic(int[n orelse 1])); }",
+		"void f(int n){ (void)_Alignof(typeof(int[n orelse 1])); }",
+		"int n; int main(void){ return _Generic(0, int[n orelse 1]: 1, default: 0); }",
 	};
 	static const char *must_ok[] = {
 		"void f(void){ int a[sizeof(int) orelse 1]; (void)a; }",
@@ -3320,6 +3478,11 @@ static void cm_gen_dim_orelse_uneval(void) {
 		"void f(int n){ _Atomic(int[n orelse 1]) *p; (void)p; }",
 		"void f(void){ _Atomic(int[0 orelse 1]) *p; (void)p; }",
 		"void f(int n){ int (*p)[n orelse 1]; (void)p; }",
+		"void f(void){ typeof(sizeof(int[0 orelse 1])) x; (void)x; }",
+		"void f(void){ typeof(_Alignof(int[0 orelse 1])) x; (void)x; }",
+		"void f(void){ int x = sizeof(int[0 orelse 1]); (void)x; }",
+		"void f(void){ int x = _Alignof(int[0 orelse 1]); (void)x; }",
+		"void f(void){ _Static_assert(sizeof(char[0 orelse 1]) > 0, \"\"); }",
 	};
 	CmStats st = {0};
 	for (size_t i = 0; i < sizeof(must_err)/sizeof(must_err[0]); i++) {
@@ -3369,6 +3532,1017 @@ static void cm_gen_bounds_param_shadow(void) {
 	cm_report("gen/bounds-param-shadow", &st);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Market-seven densify — pull hand-suite patterns into axis products for
+ * defer / orelse / zeroinit / raw / bounds-check / auto-unreachable /
+ * auto-static. Oracles stay machine-decidable (leak / wrap / inject /
+ * reject); runtime LIFO logs stay in test.defer.c / test.orelse.c.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Bounds address/access forms from test.bounds.c — wrap / no-wrap / reject. */
+static void cm_gen_bounds_addr_modes(void) {
+	enum { W = 1, N = 0, R = -1 };
+	static const struct {
+		const char *expr;
+		int expect; /* W wrap, N no-wrap, R reject */
+	} forms[] = {
+		{ "a[i]", W },
+		{ "(a)[i]", W },
+		{ "a[(0,i)]", W },
+		{ "(0,a)[i]", W },
+		{ "&a[i]", N },
+		{ "&(a)[i]", N },
+		{ "(void)&a[4]", N },
+		{ "(void)&(a)[4]", N },
+		{ "(int*)&a[4]", N },
+		{ "sizeof(a[i])", N },
+		{ "sizeof a[i]", N },
+		{ "_Alignof(a[0])", N },
+		{ "i[a]", R },
+		{ "(i)[a]", R },
+		{ "*(a+i)", R },
+		{ "(a+i)[0]", R },
+		{ "(+a)[i]", R },
+		{ "*(&a[0]+i)", R },
+		{ "0[a]", R },
+		{ "(0)[a]", R },
+	};
+	static const char *idxs[] = { "0", "1", "3" };
+	CmStats st = {0};
+	char src[512];
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t fi = 0; fi < sizeof(forms) / sizeof(forms[0]); fi++) {
+		/* Forms that hardcode `4` / `0` don't need idx product. */
+		int fixed = strstr(forms[fi].expr, "4") != NULL ||
+			    (strstr(forms[fi].expr, "Alignof") != NULL);
+		size_t nidx = fixed ? 1 : sizeof(idxs) / sizeof(idxs[0]);
+		for (size_t ii = 0; ii < nidx; ii++) {
+			const char *ix = fixed ? "1" : idxs[ii];
+			char expr[192];
+			/* Substitute i only when present as a whole index token. */
+			if (strchr(forms[fi].expr, 'i') && !fixed) {
+				/* naive replace first 'i' that is the index var */
+				const char *p = forms[fi].expr;
+				char *o = expr;
+				while (*p && (size_t)(o - expr) + 8 < sizeof(expr)) {
+					if (*p == 'i' && (p == forms[fi].expr ||
+							  !((p[-1] >= 'a' && p[-1] <= 'z') ||
+							    (p[-1] >= 'A' && p[-1] <= 'Z') ||
+							    p[-1] == '_')) &&
+					    !((p[1] >= 'a' && p[1] <= 'z') ||
+					      (p[1] >= 'A' && p[1] <= 'Z') || p[1] == '_' ||
+					      (p[1] >= '0' && p[1] <= '9'))) {
+						size_t n = strlen(ix);
+						memcpy(o, ix, n);
+						o += n;
+						p++;
+					} else
+						*o++ = *p++;
+				}
+				*o = 0;
+			} else {
+				snprintf(expr, sizeof(expr), "%s", forms[fi].expr);
+			}
+			snprintf(src, sizeof(src),
+				 "void f(void){ int a[4]={0}; int i=%s; (void)(%s); }\n",
+				 ix, expr);
+			st.cells++;
+			PrismResult r = cm_txf(src, f);
+			if (forms[fi].expect == R) {
+				if (!cm_err(&r)) cm_note(&st, "addr-mode accept %zu/%s", fi, expr);
+			} else if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "addr-mode status %zu/%s", fi, expr);
+			} else {
+				int wrap = cm_has_bchk_wrap(r.output);
+				if (forms[fi].expect == W && !wrap)
+					cm_note(&st, "addr-mode miss-wrap %zu/%s", fi, expr);
+				if (forms[fi].expect == N && wrap)
+					cm_note(&st, "addr-mode false-wrap %zu/%s", fi, expr);
+			}
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/bounds-addr-modes", &st);
+}
+
+/*
+ * Nest context × marketed payload. One product covers defer/orelse/bounds/
+ * zi/raw/aur/as interactions the hand suites probe in isolation.
+ */
+static void cm_gen_market7_cross(void) {
+	static const char *nests[] = {
+		"%s",
+		"if (1) { %s }",
+		"for (int _i = 0; _i < 1; _i++) { %s }",
+		"while (0) { %s }",
+		"do { %s } while (0);",
+		"switch (0) { default: { %s } break; }",
+		"{ %s }",
+		"{{ %s }}",
+		"int _r = ({ { %s } 0; }); (void)_r;",
+		"if (0) { (void)0; } else { %s }",
+		"for (;;) { %s break; }",
+		"switch (1) { case 1: { %s } break; default: break; }",
+	};
+	enum {
+		P_DEFER = 1 << 0,
+		P_ORELSE = 1 << 1,
+		P_BOUNDS = 1 << 2,
+		P_ZI = 1 << 3,
+		P_RAW = 1 << 4,
+		P_AUR = 1 << 5,
+		P_AS = 1 << 6,
+		P_NO_BCHK = 1 << 7, /* payload must not wrap */
+		P_NO_AUR = 1 << 8,
+		P_NO_AS = 1 << 9,
+	};
+	static const struct {
+		const char *payload;
+		unsigned flags;
+	} payloads[] = {
+		{ "defer cleanup();", P_DEFER },
+		{ "defer { cleanup(); }", P_DEFER },
+		{ "defer { cleanup(); cleanup(); }", P_DEFER },
+		{ "int *p = g() orelse 0; (void)p;", P_ORELSE },
+		{ "int x = 0 orelse 1; (void)x;", P_ORELSE },
+		{ "int a[4]; (void)a[1];", P_BOUNDS },
+		{ "int a[4]; (void)&a[4];", P_BOUNDS | P_NO_BCHK },
+		{ "int z; (void)z;", P_ZI },
+		{ "struct { int a; } s; (void)s;", P_ZI },
+		{ "raw { int y; (void)y; }", P_RAW | P_NO_AS },
+		{ "raw { int a[4]; (void)a[1]; }", P_RAW | P_NO_BCHK },
+		{ "die();", P_AUR },
+		{ "raw { die(); }", P_RAW | P_NO_AUR },
+		{ "const int k[3]={1,2,3}; (void)k;", P_AS },
+		{ "raw { const int k[3]={1,2,3}; (void)k; }", P_RAW | P_NO_AS },
+		{ "defer cleanup(); int a[4]; (void)a[1];", P_DEFER | P_BOUNDS },
+		{ "defer cleanup(); int *p = g() orelse 0; (void)p;", P_DEFER | P_ORELSE },
+		{ "int *p = g() orelse 0; int z; (void)p; (void)z;", P_ORELSE | P_ZI },
+		{ "defer { cleanup(); } const int k[2]={1,2}; (void)k;", P_DEFER | P_AS },
+		{ "int a[4]; (void)(a)[1];", P_BOUNDS },
+		{ "int a[4]; (void)&(a)[4];", P_BOUNDS | P_NO_BCHK },
+		{ "raw { defer cleanup(); int a[4]; (void)a[1]; }", P_RAW | P_DEFER | P_NO_BCHK },
+		{ "int *p = g() orelse return; (void)p;", P_ORELSE },
+		{ "defer { int z; (void)z; } cleanup();", P_DEFER | P_ZI },
+		{ "const char s[]=\"hi\"; (void)s;", P_AS },
+		{ "die(); int live=1; (void)live;", P_AUR },
+	};
+	CmStats st = {0};
+	char body[768], src[1600];
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t n = 0; n < sizeof(nests) / sizeof(nests[0]); n++) {
+		for (size_t p = 0; p < sizeof(payloads) / sizeof(payloads[0]); p++) {
+			/* Stmt-expr top-level defer is rejected — payload is
+			 * wrapped in `{ %s }` above so all payloads are legal. */
+			snprintf(body, sizeof(body), nests[n], payloads[p].payload);
+			snprintf(src, sizeof(src),
+				 "void cleanup(void); _Noreturn void die(void); int *g(void);\n"
+				 "void f(void){ %s }\n",
+				 body);
+			st.cells++;
+			PrismResult r = cm_txf(src, f);
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "m7 status n=%zu p=%zu", n, p);
+				prism_free(&r);
+				continue;
+			}
+			if ((payloads[p].flags & P_DEFER) && !(payloads[p].flags & P_RAW) &&
+			    cm_kw(r.output, "defer"))
+				cm_note(&st, "m7 defer leak n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_ORELSE) && !(payloads[p].flags & P_RAW) &&
+			    cm_kw(r.output, "orelse"))
+				cm_note(&st, "m7 orelse leak n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_BOUNDS) && !(payloads[p].flags & P_NO_BCHK) &&
+			    !(payloads[p].flags & P_RAW) && !cm_has_bchk_wrap(r.output))
+				cm_note(&st, "m7 bounds miss n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_NO_BCHK) && cm_has_bchk_wrap(r.output))
+				cm_note(&st, "m7 bounds false n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_AUR) && !(payloads[p].flags & P_NO_AUR) &&
+			    !cm_has_unreach(r.output)) {
+				/* while(0)/for-with-false-cond may leave die() unreachable
+				 * for injection purposes — skip those nests. */
+				if (n == 2 || n == 3)
+					; /* for/while nests: no hard miss */
+				else
+					cm_note(&st, "m7 aur miss n=%zu p=%zu", n, p);
+			}
+			if ((payloads[p].flags & P_NO_AUR) && cm_has_unreach(r.output))
+				cm_note(&st, "m7 aur false n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_AS) && !(payloads[p].flags & P_NO_AS) &&
+			    !strstr(r.output, "static"))
+				cm_note(&st, "m7 as miss n=%zu p=%zu", n, p);
+			if ((payloads[p].flags & P_NO_AS) && strstr(r.output, "static const"))
+				cm_note(&st, "m7 as false n=%zu p=%zu", n, p);
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/market7-cross", &st);
+}
+
+/* raw as storage/type prefix × feature payload (from test.raw.c). */
+static void cm_gen_raw_prefix_feat(void) {
+	static const char *prefixes[] = {
+		"raw",
+		"raw const",
+		"const raw",
+		"static raw",
+		"raw static",
+		"raw volatile",
+	};
+	static const struct {
+		const char *suffix; /* after prefix, before `;` use */
+		unsigned check;	    /* 1=no bchk on a[1], 2=no as, 4=accept only */
+	} objs[] = {
+		{ "int a[4]; (void)a[1]", 1 },
+		{ "int x; (void)x", 4 },
+		{ "const int k[2]={1,2}; (void)k", 2 },
+	};
+	CmStats st = {0};
+	char src[512];
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+		for (size_t o = 0; o < sizeof(objs) / sizeof(objs[0]); o++) {
+			/* `const raw` / `raw const` with another const in obj — skip clash. */
+			if (strstr(prefixes[p], "const") && strstr(objs[o].suffix, "const int"))
+				continue;
+			if (strstr(prefixes[p], "static") && strstr(objs[o].suffix, "const int k"))
+				; /* ok: static raw const int — may be odd */
+			snprintf(src, sizeof(src), "void f(void){ %s %s; }\n", prefixes[p],
+				 objs[o].suffix);
+			st.cells++;
+			PrismResult r = cm_txf(src, f);
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "raw-prefix status p=%zu o=%zu", p, o);
+				prism_free(&r);
+				continue;
+			}
+			if ((objs[o].check & 1) && cm_has_bchk_wrap(r.output))
+				cm_note(&st, "raw-prefix bchk p=%zu o=%zu", p, o);
+			/* Already-`static` prefixes keep `static` after raw strip —
+			 * only flag false auto-static promotion on non-static prefixes. */
+			if ((objs[o].check & 2) && !strstr(prefixes[p], "static") &&
+			    strstr(r.output, "static const"))
+				cm_note(&st, "raw-prefix as p=%zu o=%zu", p, o);
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/raw-prefix-feat", &st);
+}
+
+/* typeof × type × init — pull typeof/VLA/partial shapes from test.zeroinit.c. */
+static void cm_gen_zi_typeof_product(void) {
+	static const char *types[] = {
+		"int",
+		"int[4]",
+		"struct { int x; }",
+		"typeof(int)",
+		"typeof(int[4])",
+		"typeof(struct { int x; })",
+	};
+	static const char *inits[] = {
+		"",
+		" = {0}",
+		" = {1}",
+	};
+	CmStats st = {0};
+	char src[768], decl[384];
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = false;
+	for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+		for (size_t i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+			int is_arr = strstr(types[t], "[") != NULL;
+			if (is_arr)
+				snprintf(decl, sizeof(decl), "%s x%s", types[t], inits[i]);
+			else if (strstr(types[t], "struct") && !strstr(types[t], "typeof"))
+				snprintf(decl, sizeof(decl), "%s x%s", types[t],
+					 inits[i][0] ? inits[i] : "");
+			else
+				snprintf(decl, sizeof(decl), "%s x%s", types[t], inits[i]);
+			/* `int[4] x` is invalid — use `int x[4]`. */
+			if (!strcmp(types[t], "int[4]"))
+				snprintf(decl, sizeof(decl), "int x[4]%s", inits[i]);
+			snprintf(src, sizeof(src), "void f(void){ %s; (void)x; }\n", decl);
+			st.cells++;
+			PrismResult r = cm_txf(src, f);
+			int want_zi = (inits[i][0] == 0);
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "zi-typeof status t=%zu i=%zu", t, i);
+				prism_free(&r);
+				continue;
+			}
+			int has = r.output &&
+				  (strstr(r.output, "memset") || strstr(r.output, "= {0}") ||
+				   strstr(r.output, "= 0") || strstr(r.output, "__prism_p_"));
+			if (want_zi && !has)
+				cm_note(&st, "zi-typeof miss t=%zu i=%zu", t, i);
+			prism_free(&r);
+		}
+	}
+	/* VLA typeof — must accept and zi via memset path or reject cleanly. */
+	{
+		st.cells++;
+		PrismResult r = cm_txf("void f(int n){ typeof(int[n]) x; (void)x; }\n", f);
+		if (!(cm_ok(&r) || cm_err(&r)))
+			cm_note(&st, "zi-typeof vla weird");
+		prism_free(&r);
+	}
+	cm_report("gen/zi-typeof-product", &st);
+}
+
+/* Bare orelse × braceless control — densify test.orelse.c bare/ctrl pins. */
+static void cm_gen_orelse_bare_ctrl(void) {
+	static const char *ok[] = {
+		"int *g(void); void f(void){ int *p; p = g() orelse 0; (void)p; }",
+		"int *g(void); void f(void){ int *p = g() orelse return; (void)p; }",
+		"int *g(void); void f(void){ for(;;){ int *p = g() orelse break; (void)p; } }",
+		"int *g(void); void f(void){ for(;;){ int *p = g() orelse continue; (void)p; } }",
+		"int *g(void); void f(void){ int *p = g() orelse goto L; L: (void)p; }",
+		"int *g(void); void f(void){ int *p = g() orelse { p = 0; }; (void)p; }",
+		"int *g(void); void f(void){ if (1) { int *p = g() orelse 0; (void)p; } }",
+		"int g(void); void f(void){ int x; x = g() orelse 1; (void)x; }",
+		"int *g(void); void f(void){ int *a = 0, *b = g() orelse 0; (void)a; (void)b; }",
+	};
+	static const char *err[] = {
+		"int *g(void); void f(void){ (void)(g() orelse 0); }",
+		"int *g(void); void f(void){ return g() orelse 0; }",
+		"void f(void){ if (0 orelse 1) {} }",
+		"void f(void){ while (0 orelse 1) {} }",
+		"void f(void){ for (; 0 orelse 1; ) {} }",
+		"int *g(void); void f(void){ static int *p = g() orelse 0; (void)p; }",
+	};
+	CmStats st = {0};
+	for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(ok[i]);
+		if (!cm_ok(&r) || (r.output && cm_kw(r.output, "orelse")))
+			cm_note(&st, "oe-bare ok %zu", i);
+		prism_free(&r);
+	}
+	for (size_t i = 0; i < sizeof(err) / sizeof(err[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(err[i]);
+		if (!cm_err(&r)) cm_note(&st, "oe-bare accept %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/orelse-bare-ctrl", &st);
+}
+
+/* Switch/case × defer — braced cases ok; unbraced case defer must reject. */
+static void cm_gen_defer_switch_product(void) {
+	static const char *defers[] = {
+		"defer cleanup();",
+		"defer { cleanup(); }",
+		"defer cleanup(); defer { }",
+	};
+	static const char *ok_switches[] = {
+		"switch (x) { case 0: { %s } break; default: break; }",
+		"switch (x) { default: { %s } break; }",
+		"switch (x) { case 0: case 1: { %s } break; default: break; }",
+		"switch (x) { case 0: { %s cleanup(); } break; default: break; }",
+	};
+	static const char *err_switches[] = {
+		"switch (x) { case 0: %s break; default: break; }",
+		"switch (x) { case 0: %s case 1: cleanup(); break; default: break; }",
+	};
+	CmStats st = {0};
+	char body[512], src[768];
+	for (size_t d = 0; d < sizeof(defers) / sizeof(defers[0]); d++) {
+		for (size_t s = 0; s < sizeof(ok_switches) / sizeof(ok_switches[0]); s++) {
+			snprintf(body, sizeof(body), ok_switches[s], defers[d]);
+			snprintf(src, sizeof(src),
+				 "void cleanup(void); void f(int x){ %s }\n", body);
+			st.cells++;
+			PrismResult r = cm_tx(src);
+			if (!cm_ok(&r) || (r.output && cm_kw(r.output, "defer")))
+				cm_note(&st, "defer-switch ok d=%zu s=%zu", d, s);
+			prism_free(&r);
+		}
+		for (size_t s = 0; s < sizeof(err_switches) / sizeof(err_switches[0]); s++) {
+			snprintf(body, sizeof(body), err_switches[s], defers[d]);
+			snprintf(src, sizeof(src),
+				 "void cleanup(void); void f(int x){ %s }\n", body);
+			st.cells++;
+			PrismResult r = cm_tx(src);
+			if (!cm_err(&r)) cm_note(&st, "defer-switch accept d=%zu s=%zu", d, s);
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/defer-switch-product", &st);
+}
+
+/* Expression-algebra soft-ident roles (ops/compound) from test.raw.c. */
+static void cm_gen_soft_ident_expr(void) {
+	static const char *kws[] = { "raw", "defer", "orelse" };
+	static const char *tmpls[] = {
+		"int f(void){ int %s = 1; %s += 2; %s *= 3; return %s; }",
+		"int f(void){ int %s = 1; return %s < 2 && %s > 0; }",
+		"int f(void){ int %s = 1; int *p = &%s; return *p; }",
+		"int f(void){ int %s = 1; return (%s) + (+%s); }",
+		"int f(void){ int a=1, %s=2; return a,%s; }",
+		"int f(void){ int %s=0; return %s ? 1 : 2; }",
+	};
+	CmStats st = {0};
+	char src[384];
+	for (size_t k = 0; k < sizeof(kws) / sizeof(kws[0]); k++) {
+		for (size_t t = 0; t < sizeof(tmpls) / sizeof(tmpls[0]); t++) {
+			snprintf(src, sizeof(src), tmpls[t], kws[k], kws[k], kws[k], kws[k]);
+			st.cells++;
+			PrismResult r = cm_tx(src);
+			if (!cm_ok(&r)) cm_note(&st, "soft-expr k=%s t=%zu", kws[k], t);
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/soft-ident-expr", &st);
+}
+
+/* Auto-unreachable call shapes — inject after stmt-level known-noreturn
+ * calls; paren-name / fp / braceless-if stay conservative (no inject). */
+static void cm_gen_aur_call_shapes(void) {
+	static const char *must_inj[] = {
+		"_Noreturn void die(void); void f(void){ die(); }",
+		"_Noreturn void die(void); void f(void){ ({ die(); }); }",
+		"_Noreturn void die(void); void f(void){ if(1){ die(); } }",
+		"_Noreturn void die(void); void f(void){ for(;0;) die(); die(); }",
+		"_Noreturn void die(void); void f(void){ switch(0){ default: die(); } }",
+		"_Noreturn void die(void); void f(void){ defer die(); }",
+		"_Noreturn void die(void); void f(void){ defer { die(); } }",
+		"_Noreturn void die(void); void f(void){ defer die(); return; }",
+		"_Noreturn int die(void); void f(void){ sizeof(0) + die(); }",
+		"_Noreturn int die(void); void f(void){ 1 - die(); }",
+	};
+	static const char *must_not[] = {
+		"_Noreturn void die(void); void f(void){ sizeof(die()); }",
+		"_Noreturn void die(void); void f(void){ (void)sizeof(die()); }",
+		"_Noreturn void die(void); void f(void){ (void)sizeof die(); }",
+		"_Noreturn void die(void); void f(void){ sizeof die(); }",
+		"_Noreturn void die(void); void f(void){ raw { die(); } }",
+		"void die(void); void f(void){ die(); }",
+		"_Noreturn void die(void); void f(void){ if(0) die(); }",
+		"_Noreturn void die(void); void f(void){ (die)(); }",
+		"_Noreturn void die(void); void f(void){ void (*fp)(void)=die; fp(); }",
+		"_Noreturn void die(void); void f(void){ if(1) die(); }",
+		"_Noreturn void die(void); void f(void){ defer { if(0) die(); } }",
+		"_Noreturn int die(void); void f(void){ sizeof +die(); }",
+		"_Noreturn int die(void); void f(void){ sizeof -die(); }",
+		"_Noreturn int die(void); void f(void){ sizeof !die(); }",
+		"_Noreturn int die(void); void f(void){ sizeof ~die(); }",
+		"_Noreturn int die(void); void f(void){ sizeof +(+die()); }",
+		"_Noreturn int die(void); void f(void){ sizeof +(int)die(); }",
+	};
+	CmStats st = {0};
+	for (size_t i = 0; i < sizeof(must_inj) / sizeof(must_inj[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_inj[i]);
+		if (!cm_ok(&r) || !r.output || !cm_has_unreach(r.output))
+			cm_note(&st, "aur-shape miss %zu", i);
+		prism_free(&r);
+	}
+	for (size_t i = 0; i < sizeof(must_not) / sizeof(must_not[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_not[i]);
+		if (!cm_ok(&r)) cm_note(&st, "aur-shape rej %zu", i);
+		else if (r.output && cm_has_unreach(r.output))
+			cm_note(&st, "aur-shape false %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/aur-call-shapes", &st);
+}
+
+/* Auto-static init-shape densify (desig/enum/typedef/typeof). */
+static void cm_gen_as_init_shapes(void) {
+	static const char *must[] = {
+		"void f(void){ const int a[3]={1,2,3}; (void)a; }",
+		"void f(void){ const int a[3]={[0]=1,[2]=3}; (void)a; }",
+		"void f(void){ const int a[]={1,2,3}; (void)a; }",
+		"typedef const int cint; void f(void){ cint a[2]={1,2}; (void)a; }",
+		"void f(void){ const typeof(int[2]) a={1,2}; (void)a; }",
+		"enum E { A=1,B=2 }; void f(void){ const enum E a[2]={A,B}; (void)a; }",
+	};
+	static const char *must_not[] = {
+		"void f(void){ int a[3]={1,2,3}; (void)a; }",
+		"void f(void){ const int a[3]; (void)a; }",
+		"int g(void); void f(void){ const int a[2]={g(),2}; (void)a; }",
+		"void f(void){ raw { const int a[2]={1,2}; (void)a; } }",
+	};
+	CmStats st = {0};
+	for (size_t i = 0; i < sizeof(must) / sizeof(must[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must[i]);
+		if (!cm_ok(&r) || !r.output || !strstr(r.output, "static"))
+			cm_note(&st, "as-init miss %zu", i);
+		prism_free(&r);
+	}
+	for (size_t i = 0; i < sizeof(must_not) / sizeof(must_not[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_not[i]);
+		if (!cm_ok(&r)) cm_note(&st, "as-init rej %zu", i);
+		else if (r.output && strstr(r.output, "static const"))
+			cm_note(&st, "as-init false %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/as-init-shapes", &st);
+}
+
+/* Deeper market-seven product: more nests × denser mixed payloads. */
+static void cm_gen_market7_deep(void) {
+	static const char *nests[] = {
+		"%s",
+		"{ %s }",
+		"if (1) { %s }",
+		"if (0) { (void)0; } else { %s }",
+		"for (int i = 0; i < 1; i++) { %s }",
+		"for (;;) { %s break; }",
+		"while (1) { %s break; }",
+		"do { %s } while (0);",
+		"switch (0) { default: { %s } break; }",
+		"switch (1) { case 1: { %s } break; default: break; }",
+		"{{ %s }}",
+		"int r = ({ { %s } 0; }); (void)r;",
+	};
+	static const char *payloads[] = {
+		"defer cleanup();",
+		"defer { cleanup(); }",
+		"defer cleanup(); defer { cleanup(); }",
+		"int *p = g() orelse 0; (void)p;",
+		"int x = 0 orelse 1; (void)x;",
+		"int *p = g() orelse g() orelse 0; (void)p;",
+		"int a[4]; (void)a[1];",
+		"int a[4]; (void)&a[4];",
+		"int a[2][2]; (void)a[0][1];",
+		"int z; (void)z;",
+		"struct { int a; int b; } s; (void)s;",
+		"const int k[3]={1,2,3}; (void)k;",
+		"const char m[]=\"x\"; (void)m;",
+		"raw { int y; (void)y; }",
+		"raw { int a[4]; (void)a[1]; }",
+		"raw { const int k[2]={1,2}; (void)k; }",
+		"die();",
+		"defer cleanup(); int a[4]; (void)a[1];",
+		"defer cleanup(); int *p = g() orelse 0; (void)p;",
+		"int *p = g() orelse 0; int z; (void)p; (void)z;",
+		"raw { defer cleanup(); }",
+		"raw { int *p = g() orelse 0; (void)p; }",
+	};
+	CmStats st = {0};
+	char body[900], src[1800];
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t n = 0; n < sizeof(nests) / sizeof(nests[0]); n++) {
+		for (size_t p = 0; p < sizeof(payloads) / sizeof(payloads[0]); p++) {
+			snprintf(body, sizeof(body), nests[n], payloads[p]);
+			snprintf(src, sizeof(src),
+				 "void cleanup(void); _Noreturn void die(void); int *g(void);\n"
+				 "void f(void){ %s }\n",
+				 body);
+			st.cells++;
+			PrismResult r = cm_txf(src, f);
+			int in_raw = strstr(payloads[p], "raw") != NULL;
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "m7d status n=%zu p=%zu", n, p);
+				prism_free(&r);
+				continue;
+			}
+			if (!in_raw && strstr(payloads[p], "defer") && cm_kw(r.output, "defer"))
+				cm_note(&st, "m7d defer leak n=%zu p=%zu", n, p);
+			if (!in_raw && strstr(payloads[p], "orelse") && cm_kw(r.output, "orelse"))
+				cm_note(&st, "m7d orelse leak n=%zu p=%zu", n, p);
+			if (!in_raw && strstr(payloads[p], "a[1]") && !cm_has_bchk_wrap(r.output))
+				cm_note(&st, "m7d bounds miss n=%zu p=%zu", n, p);
+			if (strstr(payloads[p], "&a[4]") && cm_has_bchk_wrap(r.output))
+				cm_note(&st, "m7d bounds false n=%zu p=%zu", n, p);
+			prism_free(&r);
+		}
+	}
+	cm_report("gen/market7-deep", &st);
+}
+
+/* Pairwise feature on/off × interaction snip (cheaper than full 2^6 densify). */
+static void cm_gen_feature_pair(void) {
+	static const char *snips[] = {
+		"void cleanup(void); void f(void){ defer cleanup(); }",
+		"int *g(void); void f(void){ int *p = g() orelse 0; (void)p; }",
+		"void f(void){ int a[4]; (void)a[1]; }",
+		"void f(void){ const int k[2]={1,2}; (void)k; }",
+		"_Noreturn void die(void); void f(void){ die(); }",
+		"void f(void){ int x; (void)x; }",
+		"void f(void){ raw { int a[4]; (void)a[1]; } }",
+		"void cleanup(void); void f(void){ defer { int a[4]; (void)a[1]; } cleanup(); }",
+	};
+	/* Feature indices: 0 defer 1 orelse 2 bounds 3 as 4 aur 5 zi */
+	CmStats st = {0};
+	for (int a = 0; a < 6; a++) {
+		for (int b = a + 1; b < 6; b++) {
+			for (unsigned bits = 0; bits < 4; bits++) {
+				PrismFeatures f = prism_defaults();
+				f.defer = f.orelse = f.bounds_check = f.auto_static =
+				    f.auto_unreachable = f.zeroinit = false;
+				int on_a = bits & 1, on_b = (bits >> 1) & 1;
+				bool *slots[] = { &f.defer, &f.orelse, &f.bounds_check,
+						 &f.auto_static, &f.auto_unreachable, &f.zeroinit };
+				*slots[a] = on_a;
+				*slots[b] = on_b;
+				for (size_t s = 0; s < sizeof(snips) / sizeof(snips[0]); s++) {
+					st.cells++;
+					PrismResult r = cm_txf(snips[s], f);
+					if (!r.output && r.status == PRISM_OK) {
+						cm_note(&st, "pair null a=%d b=%d", a, b);
+						prism_free(&r);
+						continue;
+					}
+					if (cm_ok(&r) && r.output) {
+						int in_raw = strstr(snips[s], "raw") != NULL;
+						if (f.defer && !in_raw && strstr(snips[s], "defer") &&
+						    cm_kw(r.output, "defer"))
+							cm_note(&st, "pair defer leak");
+						if (f.orelse && !in_raw && strstr(snips[s], "orelse") &&
+						    cm_kw(r.output, "orelse"))
+							cm_note(&st, "pair orelse leak");
+						if (!f.bounds_check && !in_raw &&
+						    strstr(snips[s], "a[1]") && cm_has_bchk_wrap(r.output))
+							cm_note(&st, "pair bounds off");
+					}
+					prism_free(&r);
+				}
+			}
+		}
+	}
+	cm_report("gen/feature-pair", &st);
+}
+
+/* defer × exit densify (transpile leak oracle) — expand defer_cfg alphabet. */
+static void cm_gen_defer_exit_dense(void) {
+	static const char *defers[] = {
+		"defer cleanup();",
+		"defer { cleanup(); }",
+		"defer cleanup(); defer { }",
+		"defer { cleanup(); cleanup(); }",
+		"defer { if (1) cleanup(); }",
+	};
+	static const char *nests[] = {
+		"void cleanup(void); void f(void){ %s %s }",
+		"void cleanup(void); void f(void){ { %s %s } }",
+		"void cleanup(void); void f(void){ for(int i=0;i<1;i++){ %s %s } }",
+		"void cleanup(void); void f(void){ while(1){ %s %s break; } }",
+		"void cleanup(void); void f(void){ do { %s %s } while(0); }",
+		"void cleanup(void); void f(void){ switch(0){ default: { %s %s } break; } }",
+		"void cleanup(void); void f(void){ if(1){ %s %s } }",
+		"void cleanup(void); void f(void){ for(;;){ %s %s break; } }",
+	};
+	static const char *exits[] = {
+		"",
+		"return;",
+		"break;",
+		"continue;",
+		"goto L; L:;",
+	};
+	CmStats st = {0};
+	char src[1200];
+	for (size_t d = 0; d < sizeof(defers) / sizeof(defers[0]); d++) {
+		for (size_t n = 0; n < sizeof(nests) / sizeof(nests[0]); n++) {
+			for (size_t e = 0; e < sizeof(exits) / sizeof(exits[0]); e++) {
+				int loopish = (n == 2 || n == 3 || n == 4 || n == 5 || n == 7);
+				if ((!strcmp(exits[e], "break;") || !strcmp(exits[e], "continue;")) &&
+				    !loopish)
+					continue;
+				if (!strcmp(exits[e], "continue;") && (n == 5 || n == 3 || n == 7))
+					continue; /* while(1){…break} / switch / for(;;) break nests */
+				if (!strcmp(exits[e], "continue;") && n == 3)
+					continue;
+				snprintf(src, sizeof(src), nests[n], defers[d], exits[e]);
+				st.cells++;
+				PrismResult r = cm_tx(src);
+				if (!cm_ok(&r) || (r.output && cm_kw(r.output, "defer")))
+					cm_note(&st, "defer-exit d=%zu n=%zu e=%zu", d, n, e);
+				prism_free(&r);
+			}
+		}
+	}
+	cm_report("gen/defer-exit-dense", &st);
+}
+
+/* Bounds wrapping inside defer / orelse / stmt-expr emit paths. */
+static void cm_gen_bounds_emit_paths(void) {
+	static const struct {
+		const char *src;
+		int want_wrap;
+	} cells[] = {
+		{ "void f(void){ int a[4]; defer { (void)a[1]; } }", 1 },
+		{ "void f(void){ int a[4]; defer { (void)&a[4]; } }", 0 },
+		{ "int *g(void); void f(void){ int a[4]; int *p = g() orelse 0; (void)a[1]; (void)p; }",
+		  1 },
+		{ "void f(void){ int a[4]; int r = ({ (void)a[1]; 0; }); (void)r; }", 1 },
+		{ "void f(void){ int a[4]; raw { (void)a[1]; } }", 0 },
+		{ "void f(void){ int a[4]; if(1){ (void)a[1]; } }", 1 },
+		{ "void f(void){ int a[4]; for(int i=0;i<1;i++){ (void)a[i]; } }", 1 },
+		{ "void f(void){ int a[4]; switch(0){ default: (void)a[1]; break; } }", 1 },
+		{ "void cleanup(void); void f(void){ int a[4]; defer cleanup(); (void)a[1]; }", 1 },
+		{ "int *g(void); void f(void){ int a[4]; int *p = g() orelse 0; (void)a[1]; (void)p; }",
+		  1 },
+		/* orelse-in-index must compose with bounds (was hook-order miss). */
+		{ "int f(void){ int a[4]; return a[0 orelse 1]; }", 1 },
+		{ "int f(void){ int a[4]; int i=0; return a[i orelse 1]; }", 1 },
+		{ "void f(void){ int a[4]; (void)a[0 orelse 1]; }", 1 },
+		{ "void f(void){ int a[4]; defer { (void)a[0 orelse 1]; } }", 1 },
+		{ "int f(void){ int a[4]; defer { } return a[0 orelse 1]; }", 1 },
+		{ "int f(void){ int a[0 orelse 1]; (void)a; return 0; }", 0 },
+	};
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_txf(cells[i].src, f);
+		if (!cm_ok(&r) || !r.output) {
+			cm_note(&st, "emit-path status %zu", i);
+			prism_free(&r);
+			continue;
+		}
+		int wrap = cm_has_bchk_wrap(r.output);
+		if (cells[i].want_wrap && !wrap)
+			cm_note(&st, "emit-path miss %zu", i);
+		if (!cells[i].want_wrap && wrap)
+			cm_note(&st, "emit-path false %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/bounds-emit-paths", &st);
+}
+
+#ifndef _WIN32
+/* Transpile → cc → run. Exit codes: child status, or -1000/-1001/-1002 on fail. */
+static int cm_exec(const char *src, PrismFeatures feat) {
+	PrismResult r = cm_txf(src, feat);
+	if (!cm_ok(&r) || !r.output) {
+		prism_free(&r);
+		return -1000;
+	}
+	char *path = create_temp_file(r.output);
+	prism_free(&r);
+	if (!path) return -1002;
+	char bin[PATH_MAX];
+	int fd = test_mkstemp(bin, "cm_exec_");
+	if (fd < 0) {
+		unlink(path);
+		free(path);
+		return -1002;
+	}
+	close(fd);
+	unlink(bin);
+	char cmd[PATH_MAX * 2 + 80];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, path);
+	if (run_command_status(cmd) != 0) {
+		unlink(path);
+		free(path);
+		return -1001;
+	}
+	int st = run_command_status(bin);
+	unlink(bin);
+	unlink(path);
+	free(path);
+	return st;
+}
+
+#define CM_LOG_PRE                                                                                   \
+	"#include <string.h>\n"                                                                      \
+	"static char __B[256]; static int __P;\n"                                                     \
+	"static void L(const char *s){ for(; *s && __P < 255; s++) __B[__P++]=*s; }\n"                 \
+	"static int chk(const char *e){ __B[__P]=0; return strcmp(__B, e) != 0; }\n"
+
+/* Executed defer LIFO / exit product — pulls test.defer.c oracles into a grid. */
+static void cm_gen_runtime_defer(void) {
+	static const struct {
+		const char *body;
+		const char *expect;
+	} cells[] = {
+		{ "L(\"1\"); { defer L(\"A\"); }", "1A" },
+		{ "L(\"1\"); { defer L(\"C\"); defer L(\"B\"); defer L(\"A\"); }", "1ABC" },
+		{ "{ defer L(\"A\"); { defer L(\"B\"); L(\"1\"); } }", "1BA" },
+		{ "{ defer L(\"A\"); { defer L(\"B\"); { defer L(\"C\"); L(\"1\"); } } }", "1CBA" },
+		{ "{ defer L(\"A\"); L(\"1\"); goto E; } E: L(\"2\");", "1A2" },
+		{ "{ defer L(\"A\"); { defer L(\"B\"); goto E; } } E: L(\"2\");", "BA2" },
+		/* Same-scope goto does not unwind defer until the block ends. */
+		{ "{ defer L(\"A\"); L(\"1\"); goto E; E: L(\"2\"); }", "12A" },
+		{ "for (int i = 0; i < 1; i++) { defer L(\"A\"); L(\"1\"); break; }", "1A" },
+		{ "for (int i = 0; i < 2; i++) { defer L(\"A\"); L(\"1\"); }", "1A1A" },
+		{ "for (int i = 0; i < 2; i++) { defer L(\"A\"); if (i == 0) continue; L(\"1\"); }",
+		  "A1A" },
+		{ "for (int i = 0; i < 3; i++) { defer L(\"A\"); if (i < 2) continue; L(\"1\"); }",
+		  "AA1A" },
+		{ "int i=0; while (i < 1) { defer L(\"A\"); L(\"1\"); i++; }", "1A" },
+		{ "int i=0; while (i < 2) { defer L(\"A\"); L(\"1\"); i++; }", "1A1A" },
+		{ "do { defer L(\"A\"); L(\"1\"); } while (0);", "1A" },
+		{ "int i=0; do { defer L(\"A\"); L(\"1\"); i++; } while (i < 2);", "1A1A" },
+		{ "switch (0) { default: { defer L(\"A\"); L(\"1\"); } break; }", "1A" },
+		{ "switch (1) { case 1: { defer L(\"A\"); L(\"1\"); } break; default: break; }", "1A" },
+		{ "if (1) { defer L(\"A\"); L(\"1\"); }", "1A" },
+		{ "if (0) { defer L(\"A\"); L(\"X\"); } else { defer L(\"B\"); L(\"1\"); }", "1B" },
+		{ "{ defer L(\"A\"); L(\"1\"); } return chk(\"1A\");", "1A" },
+		{ "{ defer { L(\"A\"); } L(\"1\"); }", "1A" },
+		{ "{ defer L(\"A\"); defer { L(\"B\"); } L(\"1\"); }", "1BA" },
+		{ "for (;;) { defer L(\"A\"); L(\"1\"); break; }", "1A" },
+		{ "{ defer L(\"A\"); { defer L(\"B\"); L(\"1\"); goto E; } } E:;", "1BA" },
+	};
+	CmStats st = {0};
+	char src[1800];
+	PrismFeatures f = prism_defaults();
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		if (strstr(cells[i].body, "return chk")) {
+			snprintf(src, sizeof(src),
+				 CM_LOG_PRE "int main(void){ %s }\n", cells[i].body);
+		} else {
+			snprintf(src, sizeof(src),
+				 CM_LOG_PRE "int main(void){ %s return chk(\"%s\"); }\n",
+				 cells[i].body, cells[i].expect);
+		}
+		st.cells++;
+		int ex = cm_exec(src, f);
+		if (ex != 0) cm_note(&st, "rt-defer %zu exit=%d", i, ex);
+	}
+	cm_report("gen/runtime-defer", &st);
+}
+
+/* Executed orelse value / action / defer-interaction product. */
+static void cm_gen_runtime_orelse(void) {
+	static const struct {
+		const char *src;
+	} cells[] = {
+		{ CM_LOG_PRE
+		  "static int *ok(void){ static int x=1; return &x; }\n"
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ int *p = ok() orelse nil(); L(p?\"T\":\"F\"); return chk(\"T\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *ok(void){ static int x=1; return &x; }\n"
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ int *p = nil() orelse ok(); L(p?\"T\":\"F\"); return chk(\"T\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ int *p = nil() orelse { L(\"B\"); }; L(\"Z\"); "
+		  "(void)p; return chk(\"BZ\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *ok(void){ static int x=1; return &x; }\n"
+		  "int main(void){ { defer L(\"D\"); int *p = ok() orelse { L(\"B\"); }; "
+		  "L(\"A\"); (void)p; } return chk(\"AD\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "static int helper(void){ defer L(\"D\"); "
+		  "int *p = nil() orelse return 0; L(\"X\"); (void)p; return 1; }\n"
+		  "int main(void){ (void)helper(); return chk(\"D\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ for (int i=0;i<1;i++){ defer L(\"L\"); "
+		  "int *p = nil() orelse break; (void)p; } return chk(\"L\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int g(void){ return 0; }\n"
+		  "int main(void){ int x = g() orelse 7; return x != 7; }\n" },
+		{ CM_LOG_PRE
+		  "static int g(void){ return 5; }\n"
+		  "int main(void){ int x = g() orelse 7; return x != 5; }\n" },
+		{ CM_LOG_PRE
+		  "static int g(void){ return 0; }\n"
+		  "int main(void){ int x = g() orelse g() orelse 3; return x != 3; }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "static int *ok(void){ static int x=1; return &x; }\n"
+		  "int main(void){ int *p = nil() orelse nil() orelse ok(); return p?0:1; }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ for(int i=0;i<2;i++){ int *p = nil() orelse continue; L(\"X\"); "
+		  "(void)p; } return chk(\"\"); }\n" },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ { defer L(\"D\"); int *p = nil() orelse goto done; "
+		  "L(\"X\"); done: (void)p; } return chk(\"D\"); }\n" },
+		{ "struct I{int a[2][2];}; int main(void){ struct I s={{{4,9},{2,3}}}; "
+		  "int i=0; return s.a[0][i orelse 1] != 9; }\n" },
+		{ "struct I{int a[2][2];}; int main(void){ struct I s={{{4,9},{2,3}}}; "
+		  "struct I *p=&s; int i=0; return p->a[0][i orelse 1] != 9; }\n" },
+		/* Exhaustive finite scalar model: 25 two-term and 125 three-term
+		 * truth/evaluation-count cells in one compiled program. */
+		{ "static int C[3]; static int V(int k,int v){ C[k]++; return v; }\n"
+		  "int main(void){ for(int a=-2;a<=2;a++) for(int b=-2;b<=2;b++) "
+		  "for(int c=-2;c<=2;c++){ C[0]=C[1]=C[2]=0; "
+		  "int x=V(0,a) orelse V(1,b); "
+		  "if(x!=(a?a:b)||C[0]!=1||C[1]!=(a==0)||C[2]!=0)return 1; "
+		  "C[0]=C[1]=C[2]=0; int y=V(0,a) orelse V(1,b) orelse V(2,c); "
+		  "if(y!=(a?a:(b?b:c))||C[0]!=1||C[1]!=(a==0)||"
+		  "C[2]!=((a==0)&&(b==0)))return 2; } return 0; }\n" },
+	};
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		st.cells++;
+		int ex = cm_exec(cells[i].src, f);
+		if (ex != 0) cm_note(&st, "rt-orelse %zu exit=%d", i, ex);
+	}
+	cm_report("gen/runtime-orelse", &st);
+}
+
+/* Executed bounds trap / one-past / raw-suppress product. */
+static void cm_gen_runtime_bounds(void) {
+	static const struct {
+		const char *src;
+		int expect; /* exact exit, or -1 = must trap (nonzero) */
+	} cells[] = {
+		{ "int main(void){ int a[4]={1,2,3,4}; return a[1]; }\n", 2 },
+		{ "int main(void){ int a[4]={0}; int *p=&a[4]; (void)p; return 0; }\n", 0 },
+		{ "int main(void){ int a[4]={0}; (void)&a[4]; return 0; }\n", 0 },
+		{ "int main(void){ int a[4]={0}; (void)(int*)&a[4]; return 0; }\n", 0 },
+		{ "int main(void){ int a[4]={0}; (void)a[4]; return 0; }\n", -1 },
+		{ "int main(void){ int a[4]={0}; (void)a[5]; return 0; }\n", -1 },
+		{ "int main(void){ int a[2][2]={{1,2},{3,4}}; return a[1][0]; }\n", 3 },
+		{ "int main(void){ raw int a[4]={0,1,2,3}; return a[2]; }\n", 2 },
+		{ "int main(void){ int a[4]={9,8,7,6}; int i=2; return a[i]; }\n", 7 },
+		{ "int main(void){ int a[4]={0}; int i=4; (void)a[i]; return 0; }\n", -1 },
+		{ "int main(void){ int a[4]={1}; defer { } return a[0]; }\n", 1 },
+		{ "int main(void){ int a[4]={0}; int *p=0; p = p orelse &a[0]; return *p; }\n", 0 },
+		{ "int main(void){ int a[4]={0}; (void)&(a)[4]; return 0; }\n", 0 },
+		{ "int main(void){ int a[4]={5,6,7,8}; return (a)[0]; }\n", 5 },
+		{ "int main(void){ int a[4]={10,20,30,40}; "
+		  "for(int i=0;i<4;i++)for(int j=0;j<4;j++)"
+		  "{int x=a[i orelse j]; if(x!=a[i?i:j])return 1;} return 0; }\n", 0 },
+	};
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		st.cells++;
+		int ex = cm_exec(cells[i].src, f);
+		if (ex <= -1000) {
+			cm_note(&st, "rt-bounds infra %zu (%d)", i, ex);
+			continue;
+		}
+		if (cells[i].expect < 0) {
+			if (ex == 0) cm_note(&st, "rt-bounds no-trap %zu", i);
+		} else if (ex != cells[i].expect) {
+			cm_note(&st, "rt-bounds exit %zu got=%d want=%d", i, ex, cells[i].expect);
+		}
+	}
+	cm_report("gen/runtime-bounds", &st);
+}
+
+/* Executed zero-init value product. */
+static void cm_gen_runtime_zi(void) {
+	static const char *cells[] = {
+		"int main(void){ int x; return x != 0; }\n",
+		"int main(void){ int a[4]; return a[0]|a[1]|a[2]|a[3]; }\n",
+		"int main(void){ struct { int a; int b; } s; return s.a|s.b; }\n",
+		"int main(void){ union { int a; char b[4]; } u; return u.a; }\n",
+		"int main(void){ int *p; return p != 0; }\n",
+		"int main(void){ typeof(int) x; return x != 0; }\n",
+		"int main(void){ int x, y; return x|y; }\n",
+		"int main(void){ raw int x; return 0; }\n", /* raw may skip zi — just must run */
+	};
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		st.cells++;
+		int ex = cm_exec(cells[i], f);
+		if (ex != 0) cm_note(&st, "rt-zi %zu exit=%d", i, ex);
+	}
+	cm_report("gen/runtime-zi", &st);
+}
+
+/* Cross-feature executed: defer+bounds, orelse+zi, raw suppress, as promote. */
+static void cm_gen_runtime_cross(void) {
+	static const struct {
+		const char *src;
+		int expect;
+	} cells[] = {
+		{ CM_LOG_PRE
+		  "int main(void){ int a[4]={1,2,3,4}; { defer L(\"D\"); L(\"1\"); } "
+		  "return chk(\"1D\") || (a[1] != 2); }\n",
+		  0 },
+		{ "int main(void){ const int k[3]={1,2,3}; return k[0]+k[1]+k[2] != 6; }\n", 0 },
+		{ "int main(void){ raw int a[4]={0,1,2,3}; return a[2] != 2; }\n", 0 },
+		{ CM_LOG_PRE
+		  "static int *nil(void){ return 0; }\n"
+		  "int main(void){ int z; { defer L(\"D\"); "
+		  "int *p = nil() orelse { L(\"B\"); }; (void)p; } "
+		  "return chk(\"BD\") || (z != 0); }\n",
+		  0 },
+		{ "int main(void){ int a[4]={0}; (void)&a[4]; return a[0]; }\n", 0 },
+		{ "int main(void){ int x=0; int *p = (int*)0 orelse &x; return *p; }\n", 0 },
+		{ CM_LOG_PRE
+		  "int main(void){ for(int i=0;i<2;i++){ defer L(\"A\"); L(\"1\"); } "
+		  "return chk(\"1A1A\"); }\n",
+		  0 },
+		{ "int main(void){ typeof(int[2]) a; return a[0]|a[1]; }\n", 0 },
+	};
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		st.cells++;
+		int ex = cm_exec(cells[i].src, f);
+		if (ex != cells[i].expect)
+			cm_note(&st, "rt-cross %zu exit=%d", i, ex);
+	}
+	cm_report("gen/runtime-cross", &st);
+}
+#undef CM_LOG_PRE
+#endif /* !_WIN32 */
 
 void run_completeness_open_tests(void) {
 	const char *only = getenv("PRISM_SUITE_ONLY");

@@ -5518,6 +5518,22 @@ static void test_defer_braceless_noreturn_unreachable_leak(void) {
 		      "unreachable injected at top level");
 	}
 	prism_free(&r);
+
+	/* Braceless `defer die();` synthesizes `;` outside the emit range —
+	 * must still inject unreachable (densify hunt). */
+	r = prism_transpile_source(
+	    "_Noreturn void die(void);\n"
+	    "void f(void) {\n"
+	    "    defer die();\n"
+	    "}\n",
+	    "t82_braceless_die.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "braceless defer die transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "__builtin_unreachable") != NULL ||
+		      strstr(r.output, "__assume") != NULL,
+		      "unreachable injected after braceless defer die()");
+	}
+	prism_free(&r);
 }
 
 // Braceless ctrl-flow inside defer: multi-stmt expansion must be brace-wrapped

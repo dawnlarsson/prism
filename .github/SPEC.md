@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.1.5
-**Status:** Implemented: every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (14,447+ tests in `prism run .github/test.c`, self-host stage1==stage2 in CI, zero failures, on both release and `PRISM_DEBUG` builds).
+**Status:** Implemented: every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (14,538+ platform-inclusive checks; 14,277/14,277 in the audited Darwin/Clang run, 14,346/14,346 on Arch/GCC, and 14,283/14,283 on Arch/Clang; self-host stage1==stage2; zero failures on release and `PRISM_DEBUG` builds).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -1007,7 +1007,7 @@ The bounds helper takes `idx` by value, so any side effects in the index (`arr[i
 #### Interaction with other features
 
 - **`raw`:** `raw` blocks suppress typedef-table registration at parse time, so `raw`-declared arrays are not tracked and their subscripts are not wrapped.
-- **`orelse` in subscripts:** An expression subscript whose index uses `orelse` (`arr[x orelse 0]`) is transformed to a ternary. Which hook reaches the annotated `[` first decides composition: `try_bracket_orelse` runs before the bounds-check hook in `walk_balanced`, so subscripts consumed there get the ternary but bypass the bounds wrapper (v1 ordering limitation); when `try_bounds_check_subscript` reaches a `P1_OE_BRACKET`-annotated bracket first (e.g. return-with-defer emission), it emits the ternary inside the `__prism_bchk(...)` wrapper.
+- **`orelse` in subscripts:** An expression subscript whose index uses `orelse` (`arr[x orelse 0]`) is transformed to a ternary **inside** `__prism_bchk(...)` when the base is a tracked array. Pass 2 tries `try_bounds_check_subscript` before `try_bracket_orelse` in the main emit loop, `emit_statements`, and `walk_balanced`; the bounds hook lowers `P1_OE_BRACKET` indexes via `emit_token_range_orelse`. Non-array / declarator / uneval brackets still fall through to `try_bracket_orelse` alone.
 - **`-fzeroinit`:** Orthogonal. Array declarators with zero-init emit an initializer plus `__builtin_memset` as usual; declarator brackets remain tagged `P1_DECL_BRACKET` and are never wrapped.
 
 #### Disable

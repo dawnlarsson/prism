@@ -19,6 +19,14 @@ static void bc_runtime_case(const char *src, int expected_exit, const char *labe
 	snprintf(msg, sizeof(msg), "%s: transpiles", label);
 	CHECK_EQ(r.status, PRISM_OK, msg);
 	if (r.output) {
+		/* A nonzero exit alone is not a trap oracle: an unwrapped OOB read
+		 * may return an arbitrary nonzero byte and make the test pass by
+		 * accident. Require transformed shape before executing every trap
+		 * case, then make the source return 0 if the access somehow survives. */
+		if (expected_exit < 0) {
+			snprintf(msg, sizeof(msg), "%s: bounds wrapper present", label);
+			CHECK(strstr(r.output, "[__prism_bchk") != NULL, msg);
+		}
 		FILE *fp = fopen(out_path, "w");
 		if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
 		char cmd[1024];
@@ -396,21 +404,21 @@ static void test_bounds_check_runtime(void) {
 	bc_runtime_case(
 	    "#include <stdio.h>\n"
 	    "int main(void){int a[10]; for(int i=0;i<10;i++) a[i]=i;\n"
-	    "volatile int j=15; return a[j];}\n",
+	    "volatile int j=15; (void)a[j]; return 0;}\n",
 	    -1, "bc-run-oob");
 
 	// OOB in nested inner subscript traps.
 	bc_runtime_case(
 	    "#include <stdio.h>\n"
 	    "int main(void){int arr[10]={0}; int m[3]={0,1,2};\n"
-	    "volatile int i=10; return arr[m[i]];}\n",
+	    "volatile int i=10; (void)arr[m[i]]; return 0;}\n",
 	    -1, "bc-run-nested");
 
 	// Negative index (via unsigned cast) traps.
 	bc_runtime_case(
 	    "#include <stdio.h>\n"
 	    "int main(void){int a[10]={0}; volatile int i=-1;\n"
-	    "return a[i];}\n",
+	    "(void)a[i]; return 0;}\n",
 	    -1, "bc-run-neg");
 
 	// VLA OOB traps using runtime length.
@@ -418,7 +426,7 @@ static void test_bounds_check_runtime(void) {
 	    "#include <stdio.h>\n"
 	    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
 	    "int v[n]; for(int i=0;i<n;i++) v[i]=i;\n"
-	    "volatile int j=n+5; return v[j];}\n",
+	    "volatile int j=n+5; (void)v[j]; return 0;}\n",
 	    -1, "bc-run-vla");
 
 	// Unevaluated sizeof of VLA element must not trap even with absurd index.
@@ -777,6 +785,37 @@ static void test_bounds_check_address_of(void) {
 		if (r.output)
 			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
 			      "bc-binand: binary & does not inhibit wrap");
+		prism_free(&r);
+	}
+
+	/* Cast then unary &: `(void)&a[N]` / `(int*)&a[N]` — cast's `)` must not
+	 * be mistaken for an expression operand that makes `&` binary. */
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[4]; (void)&a[4]; (void)&(a)[4]; "
+		    "int *p=(int*)&a[4]; (void)p; return 0;}\n",
+		    "bc_cast_addr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-cast-addrof: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "&a[__prism_bchk") == NULL,
+			      "bc-cast-addrof: (void)&a[4] not wrapped");
+			CHECK(strstr(r.output, "&(a)[__prism_bchk") == NULL,
+			      "bc-cast-addrof: (void)&(a)[4] not wrapped");
+			CHECK(strstr(r.output, "(int*)&a[__prism_bchk") == NULL,
+			      "bc-cast-addrof: (int*)&a[4] not wrapped");
+		}
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[4]={1}; int x=1; return (x)&a[0];}\n",
+		    "bc_expr_paren_and.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-expr-paren-and: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-expr-paren-and: (x)&a[i] still wrapped");
 		prism_free(&r);
 	}
 }
@@ -1842,13 +1881,13 @@ static void test_bounds_check_extreme_edges(void) {
 	// Huge constant index (INT32_MAX) traps.
 	bc_runtime_case(
 	    "int main(void){int a[10]={0}; volatile int i=2147483647;\n"
-	    "return a[i];}\n",
+	    "(void)a[i]; return 0;}\n",
 	    -1, "bc-run-huge");
 
 	// Index == length exactly (off-by-one) traps.
 	bc_runtime_case(
 	    "int main(void){int a[10]={0}; volatile int i=10;\n"
-	    "return a[i];}\n",
+	    "(void)a[i]; return 0;}\n",
 	    -1, "bc-run-offbyone");
 
 	// Index == length-1 (last valid) must NOT trap.
@@ -1860,7 +1899,7 @@ static void test_bounds_check_extreme_edges(void) {
 	// OOB write traps before the subsequent OOB read is reached.
 	bc_runtime_case(
 	    "int main(void){int a[10]={0}; volatile int i=20;\n"
-	    "a[i]=99; return a[i];}\n",
+	    "a[i]=99; return 0;}\n",
 	    -1, "bc-run-write");
 
 	// Side-effect in OOB index traps (double-eval would also trap, but
@@ -1870,7 +1909,7 @@ static void test_bounds_check_extreme_edges(void) {
 	    "static int evals = 0;\n"
 	    "static int idx(void){ evals++; return 50; }\n"
 	    "int main(void){int a[10]={0};\n"
-	    "int x = a[idx()]; return x;}\n",
+	    "(void)a[idx()]; return 0;}\n",
 	    -1, "bc-run-sfx");
 #endif
 }
@@ -2126,6 +2165,26 @@ static void test_bounds_check_emit_statements_paths(void) {
 		}
 		prism_free(&r);
 	}
+	/* Hook-order bug: try_bracket_orelse ran before try_bounds_check_subscript
+	 * in the main emit loop / emit_statements, so a[i orelse 0] lowered the
+	 * ternary but skipped __prism_bchk. Composition must wrap the index. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void){ int a[4]={0}; return a[0 orelse 1]; }\n"
+		    "int g(void){ int a[4]={0}; int i=0; (void)a[i orelse 1]; return 0; }\n"
+		    "int h(void){ int a[4]={0}; defer { (void)a[0 orelse 1]; } return 0; }\n",
+		    "bc_oe_idx.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bounds×orelse index: transpiles");
+		if (r.output) {
+			int n = 0;
+			for (const char *s = r.output; (s = strstr(s, "a[__prism_bchk")) != NULL; s++)
+				n++;
+			CHECK(n >= 3, "bounds×orelse index: wrapped in return/stmt/defer");
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bounds×orelse index: orelse keyword lowered");
+		}
+		prism_free(&r);
+	}
 	{
 		PrismResult r = prism_transpile_source(
 		    "int main(void) {\n"
@@ -2239,31 +2298,39 @@ static void test_bounds_selective_runtime_oracles(void) {
 	    {"ok-2d", 7,
 	     "int main(void){int m[2][3]={{1,2,3},{4,5,6}}; return m[1][2]+1;}\n"},
 	    {"oob-2d-row", -1,
-	     "int main(void){int m[2][3]={{0}}; volatile int i=2; return m[i][0];}\n"},
+	     "int main(void){int m[2][3]={{0}}; volatile int i=2; (void)m[i][0]; return 0;}\n"},
 	    {"oob-2d-col", -1,
-	     "int main(void){int m[2][3]={{0}}; volatile int j=3; return m[0][j];}\n"},
+	     "int main(void){int m[2][3]={{0}}; volatile int j=3; (void)m[0][j]; return 0;}\n"},
 	    {"ok-vla", 0,
 	     "int main(int argc,char**argv){(void)argv;int n=argc+2; int a[n];\n"
 	     " for(int i=0;i<n;i++) a[i]=i; return a[n-1]==n-1?0:1;}\n"},
 	    {"oob-vla", -1,
 	     "int main(int argc,char**argv){(void)argv;int n=argc+2; int a[n];\n"
-	     " volatile int i=n+1; return a[i];}\n"},
+	     " volatile int i=n+1; (void)a[i]; return 0;}\n"},
 	    {"ok-ptr-idx", 5,
 	     "int main(void){int a[4]={1,2,3,4}; int *p=a; return p[2]+2;}\n"},
-	    {"oob-ptr-idx", -1,
-	     "int main(void){int a[4]={0}; int *p=a; volatile int i=4; return p[i];}\n"},
+	    /* Pointer locals are explicitly outside the v1 bounds model. Keep
+	     * this runtime case defined and in-bounds; the old OOB version was UB
+	     * and falsely appeared to trap on Clang only because it returned a
+	     * nonzero indeterminate value. */
+	    {"ok-untracked-ptr-idx", 4,
+	     "int main(void){int a[4]={1,2,3,4}; int *p=a; volatile int i=3; return p[i];}\n"},
 	    {"ok-defer-idx", 0,
 	     "int main(void){int a[5]={0}; int i=2;\n"
 	     " defer { (void)a[i]; } return 0;}\n"},
 	    {"ok-orelse-idx", 0,
 	     "int main(void){int a[5]={0}; int i=1; int *p=(void*)0;\n"
 	     " p = p orelse { (void)a[i]; return 0; }; return 1;}\n"},
+	    {"ok-oe-in-index", 6,
+	     "int main(void){int a[4]={1,2,3,4}; int z=0; return a[z orelse 2]+3;}\n"},
+	    {"oob-oe-in-index", -1,
+	     "int main(void){int a[4]={0}; (void)a[0 orelse 9]; return 0;}\n"},
 	    {"ok-stmtexpr-idx", 0,
 	     "int main(void){int a[5]={9,8,7,6,5}; int i=0;\n"
 	     " int v = ({ a[i]; }); return v==9?0:1;}\n"},
 	    {"oob-stmtexpr", -1,
 	     "int main(void){int a[5]={0}; volatile int i=9;\n"
-	     " int v = ({ a[i]; }); return v;}\n"},
+	     " int v = ({ a[i]; }); (void)v; return 0;}\n"},
 	    {"ok-one-past-addr", 0,
 	     "int main(void){int a[3]; int *p=&a[3]; (void)p; return 0;}\n"},
 	};
