@@ -212,35 +212,61 @@ static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
 // will have its struct members and function declarations corrupted.
 
 // POSIX open_memstream returns a FILE* that writes to a growing buffer.
-// On fclose, *bufp and *sizep are updated.  Windows has no equivalent,
-// so we back the stream with a temp file and intercept fclose to read
-// the contents into a malloc'd buffer.
-// Thread-local storage for per-thread memstream state.
+// On fclose, *bufp and *sizep are updated. Windows has no CRT equivalent;
+// we use a temporary file with FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE
+// so the OS keeps contents cache-hot and unlinks automatically (no durable
+// disk round-trip registration).
 
 static PRISM_THREAD_LOCAL FILE *win32_memstream_fp;
 static PRISM_THREAD_LOCAL char **win32_memstream_bufp;
 static PRISM_THREAD_LOCAL size_t *win32_memstream_sizep;
-static PRISM_THREAD_LOCAL char win32_memstream_path[PATH_MAX * 3];
 
 // Grab the real CRT fclose BEFORE we macro-redirect it.
 static int (*win32_real_fclose)(FILE *) = fclose;
 
 static FILE *open_memstream(char **bufp, size_t *sizep) {
 	/* Single active memstream per thread (TLS slot). Nesting would orphan
-	 * the outer temp path and corrupt bufp/sizep on fclose. */
+	 * the outer stream and corrupt bufp/sizep on fclose. */
 	if (win32_memstream_fp) {
 		errno = EBUSY;
 		return NULL;
 	}
 	wchar_t wtmpdir[PATH_MAX], wtmpfile[PATH_MAX];
-	GetTempPathW(PATH_MAX, wtmpdir);
-	GetTempFileNameW(wtmpdir, L"prm", 0, wtmpfile);
-	// Convert wide temp path to UTF-8 for storage
-	WideCharToMultiByte(
-	    CP_UTF8, 0, wtmpfile, -1, win32_memstream_path, sizeof(win32_memstream_path), NULL, NULL);
-	signal_temps_register(win32_memstream_path);
-	FILE *fp = fopen(win32_memstream_path, "w+b");
-	if (!fp) return NULL;
+	DWORD n = GetTempPathW(PATH_MAX, wtmpdir);
+	if (n == 0 || n >= PATH_MAX) {
+		errno = EIO;
+		return NULL;
+	}
+	if (!GetTempFileNameW(wtmpdir, L"prm", 0, wtmpfile)) {
+		errno = EIO;
+		return NULL;
+	}
+	/* Re-open with DELETE_ON_CLOSE so the name vanishes when the last handle
+	 * closes — avoids signal_temps bookkeeping and durable disk retention. */
+	DeleteFileW(wtmpfile);
+	HANDLE h = CreateFileW(wtmpfile,
+			       GENERIC_READ | GENERIC_WRITE,
+			       0,
+			       NULL,
+			       CREATE_ALWAYS,
+			       FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+			       NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		errno = EIO;
+		return NULL;
+	}
+	int fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+	if (fd < 0) {
+		CloseHandle(h);
+		errno = EIO;
+		return NULL;
+	}
+	FILE *fp = _fdopen(fd, "w+b");
+	if (!fp) {
+		_close(fd);
+		errno = EIO;
+		return NULL;
+	}
 	*bufp = NULL;
 	*sizep = 0;
 	win32_memstream_fp = fp;
@@ -248,9 +274,6 @@ static FILE *open_memstream(char **bufp, size_t *sizep) {
 	win32_memstream_sizep = sizep;
 	return fp;
 }
-
-static int win32_unlink_utf8(const char *path);
-static void signal_temps_unregister(const char *path);
 
 static int win32_fclose_wrapper(FILE *fp) {
 	if (fp && fp == win32_memstream_fp) {
@@ -261,8 +284,9 @@ static int win32_fclose_wrapper(FILE *fp) {
 		char *buf = (char *)malloc((size_t)pos + 1);
 		if (!buf) {
 			win32_real_fclose(fp);
-			win32_unlink_utf8(win32_memstream_path);
-			signal_temps_unregister(win32_memstream_path);
+			win32_memstream_fp = NULL;
+			win32_memstream_bufp = NULL;
+			win32_memstream_sizep = NULL;
 			errno = ENOMEM;
 			return EOF;
 		}
@@ -270,10 +294,10 @@ static int win32_fclose_wrapper(FILE *fp) {
 		buf[nread] = '\0';
 		*win32_memstream_bufp = buf;
 		*win32_memstream_sizep = nread;
-		int ret = win32_real_fclose(fp);
-		win32_unlink_utf8(win32_memstream_path);
-		signal_temps_unregister(win32_memstream_path);
+		int ret = win32_real_fclose(fp); /* closes handle → delete-on-close */
 		win32_memstream_fp = NULL;
+		win32_memstream_bufp = NULL;
+		win32_memstream_sizep = NULL;
 		return ret;
 	}
 	return win32_real_fclose(fp);
@@ -610,14 +634,22 @@ static int mkstemps(char *tmpl, int suffix_len) {
 		wchar_t wtry[PATH_MAX];
 		int wlen = MultiByteToWideChar(CP_UTF8, 0, try_buf, -1, wtry, PATH_MAX);
 		if (wlen <= 0) wlen = MultiByteToWideChar(CP_ACP, 0, try_buf, -1, wtry, PATH_MAX);
-		if (wlen <= 0) continue;
+		if (wlen <= 0) {
+			errno = EINVAL;
+			return -1;
+		}
 		errno_t err = _wsopen_s(
 		    &fd, wtry, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYRW, _S_IREAD | _S_IWRITE);
 		if (err == 0 && fd >= 0) {
 			memcpy(tmpl, try_buf, len + 1);
 			return fd;
 		}
+		if (err != EEXIST) {
+			errno = err ? (int)err : EIO;
+			return -1;
+		}
 	}
+	errno = EEXIST;
 	return -1;
 }
 
@@ -811,10 +843,9 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	HANDLE hStdErr = GetStdHandle(STD_ERROR_HANDLE);
 	HANDLE opened_handles[SPAWN_ACTION_MAX];
 	int opened_handle_count = 0;
-	// Track which handles were explicitly redirected by file actions.
-	// Only redirected handles need SetHandleInformation — touching
-	// process-global standard handles is a thread-safety hazard in
-	// PRISM_LIB_MODE (concurrent prism_transpile_file calls).
+	HANDLE inherit_changed_handles[3];
+	int inherit_changed_count = 0;
+	// Track which standard streams were explicitly redirected by file actions.
 	bool redirected_in = false, redirected_out = false, redirected_err = false;
 
 	if (fa) {
@@ -882,7 +913,11 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 							      disposition,
 							      0,
 							      NULL);
-				if (hOpened == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+				if (hOpened == INVALID_HANDLE_VALUE) {
+					for (int j = 0; j < opened_handle_count; j++)
+						CloseHandle(opened_handles[j]);
+					return INVALID_HANDLE_VALUE;
+				}
 				opened_handles[opened_handle_count++] = hOpened;
 				if (a->fd == STDERR_FILENO) {
 					hStdErr = hOpened;
@@ -927,6 +962,7 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				HANDLE handle_list[3];
 				int handle_count = 0;
 				HANDLE candidates[3] = {hStdIn, hStdOut, hStdErr};
+				bool inherit_setup_ok = true;
 				for (int i = 0; i < 3; i++) {
 					if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
 						continue;
@@ -937,8 +973,21 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 							break;
 						}
 					if (!dup) {
-						SetHandleInformation(
-						    candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+						DWORD flags;
+						if (!GetHandleInformation(candidates[i], &flags)) {
+							inherit_setup_ok = false;
+							break;
+						}
+						if (!(flags & HANDLE_FLAG_INHERIT)) {
+							if (!SetHandleInformation(candidates[i],
+										  HANDLE_FLAG_INHERIT,
+										  HANDLE_FLAG_INHERIT)) {
+								inherit_setup_ok = false;
+								break;
+							}
+							inherit_changed_handles[inherit_changed_count++] =
+							    candidates[i];
+						}
 						handle_list[handle_count++] = candidates[i];
 					}
 				}
@@ -954,9 +1003,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				SIZE_T attr_size = 0;
 				InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 				six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
-				if (six.lpAttributeList &&
-				    InitializeProcThreadAttributeList(
-					six.lpAttributeList, 1, 0, &attr_size) &&
+				BOOL attr_initialized = FALSE;
+				if (inherit_setup_ok && six.lpAttributeList &&
+				    (attr_initialized = InitializeProcThreadAttributeList(
+					 six.lpAttributeList, 1, 0, &attr_size)) &&
 				    UpdateProcThreadAttribute(six.lpAttributeList,
 							      0,
 							      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -975,10 +1025,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 							    &six.StartupInfo,
 							    &pi);
 				}
-				if (six.lpAttributeList) {
+				if (attr_initialized)
 					DeleteProcThreadAttributeList(six.lpAttributeList);
+				if (six.lpAttributeList)
 					free(six.lpAttributeList);
-				}
 			} else {
 				// No handle redirection: don't inherit any handles.
 				STARTUPINFOW siw;
@@ -1007,9 +1057,8 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	}
 
 cleanup:
-	// Handle inheritance flags are no longer toggled process-globally — the
-	// STARTUPINFOEX handle list restricts which handles the child inherits —
-	// so there is nothing to restore here.
+	for (int i = 0; i < inherit_changed_count; i++)
+		SetHandleInformation(inherit_changed_handles[i], HANDLE_FLAG_INHERIT, 0);
 	free(env_block);
 	for (int i = 0; i < opened_handle_count; i++) CloseHandle(opened_handles[i]);
 	return hResult;
@@ -1174,16 +1223,33 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 				(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE)};
 	HANDLE handle_list[3];
 	int handle_count = 0;
+	HANDLE inherit_changed_handles[3];
+	int inherit_changed_count = 0;
+	bool inherit_setup_ok = true;
 	for (int i = 0; i < 3; i++) {
 		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL) continue;
-		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		bool dup = false;
 		for (int j = 0; j < handle_count; j++)
 			if (handle_list[j] == candidates[i]) {
 				dup = true;
 				break;
 			}
-		if (!dup) handle_list[handle_count++] = candidates[i];
+		if (!dup) {
+			DWORD flags;
+			if (!GetHandleInformation(candidates[i], &flags)) {
+				inherit_setup_ok = false;
+				break;
+			}
+			if (!(flags & HANDLE_FLAG_INHERIT)) {
+				if (!SetHandleInformation(
+					candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+					inherit_setup_ok = false;
+					break;
+				}
+				inherit_changed_handles[inherit_changed_count++] = candidates[i];
+			}
+			handle_list[handle_count++] = candidates[i];
+		}
 	}
 
 	STARTUPINFOEXW six;
@@ -1198,7 +1264,10 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
 	BOOL ok = FALSE;
-	if (six.lpAttributeList && InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	BOOL attr_initialized = FALSE;
+	if (inherit_setup_ok && six.lpAttributeList &&
+	    (attr_initialized =
+		 InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size)) &&
 	    UpdateProcThreadAttribute(six.lpAttributeList,
 				      0,
 				      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -1217,10 +1286,11 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 				    &six.StartupInfo,
 				    &pi);
 	}
-	if (six.lpAttributeList) {
-		DeleteProcThreadAttributeList(six.lpAttributeList);
+	if (attr_initialized) DeleteProcThreadAttributeList(six.lpAttributeList);
+	if (six.lpAttributeList)
 		free(six.lpAttributeList);
-	}
+	for (int i = 0; i < inherit_changed_count; i++)
+		SetHandleInformation(inherit_changed_handles[i], HANDLE_FLAG_INHERIT, 0);
 	free(wcmdline);
 	CloseHandle(hWritePipe); // Close write end in parent so reads will EOF
 	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
@@ -1296,16 +1366,33 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 				(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE)};
 	HANDLE handle_list[3];
 	int handle_count = 0;
+	HANDLE inherit_changed_handles[3];
+	int inherit_changed_count = 0;
+	bool inherit_setup_ok = true;
 	for (int i = 0; i < 3; i++) {
 		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL) continue;
-		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		bool dup = false;
 		for (int j = 0; j < handle_count; j++)
 			if (handle_list[j] == candidates[i]) {
 				dup = true;
 				break;
 			}
-		if (!dup) handle_list[handle_count++] = candidates[i];
+		if (!dup) {
+			DWORD flags;
+			if (!GetHandleInformation(candidates[i], &flags)) {
+				inherit_setup_ok = false;
+				break;
+			}
+			if (!(flags & HANDLE_FLAG_INHERIT)) {
+				if (!SetHandleInformation(
+					candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+					inherit_setup_ok = false;
+					break;
+				}
+				inherit_changed_handles[inherit_changed_count++] = candidates[i];
+			}
+			handle_list[handle_count++] = candidates[i];
+		}
 	}
 
 	STARTUPINFOEXW six;
@@ -1320,7 +1407,10 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
 	BOOL ok = FALSE;
-	if (six.lpAttributeList && InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	BOOL attr_initialized = FALSE;
+	if (inherit_setup_ok && six.lpAttributeList &&
+	    (attr_initialized =
+		 InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size)) &&
 	    UpdateProcThreadAttribute(six.lpAttributeList,
 				      0,
 				      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -1339,10 +1429,11 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 				    &six.StartupInfo,
 				    &pi);
 	}
-	if (six.lpAttributeList) {
-		DeleteProcThreadAttributeList(six.lpAttributeList);
+	if (attr_initialized) DeleteProcThreadAttributeList(six.lpAttributeList);
+	if (six.lpAttributeList)
 		free(six.lpAttributeList);
-	}
+	for (int i = 0; i < inherit_changed_count; i++)
+		SetHandleInformation(inherit_changed_handles[i], HANDLE_FLAG_INHERIT, 0);
 	free(wcmdline);
 	CloseHandle(hWritePipe);
 	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
@@ -1382,8 +1473,15 @@ static const char *get_install_path(void) {
 		// Fallback: install next to the running executable
 		DWORD mlen = GetModuleFileNameW(NULL, wpath, PATH_MAX);
 		if (mlen > 0 && mlen < PATH_MAX) {
-			WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL);
-			return path;
+			wchar_t *last_sep = wcsrchr(wpath, L'\\');
+			wchar_t *last_fwd_sep = wcsrchr(wpath, L'/');
+			if (!last_sep || (last_fwd_sep && last_fwd_sep > last_sep)) last_sep = last_fwd_sep;
+			if (last_sep && (size_t)(last_sep - wpath) + 1 + wcslen(L"prism.exe") < PATH_MAX) {
+				wcscpy(last_sep + 1, L"prism.exe");
+				if (WideCharToMultiByte(
+					CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL))
+					return path;
+			}
 		}
 		strcpy(path, "prism.exe");
 		return path;
@@ -1421,14 +1519,14 @@ static bool path_contains_dir(const char *path, const char *dir) {
 	if (!path || !dir) return false;
 	size_t dir_len = strlen(dir);
 	if (dir_len == 0) return false;
-	for (const char *p = path;;) {
-		const char *found = strstr(p, dir);
-		if (!found) return false;
-		bool at_start = (found == path || found[-1] == ';');
-		bool at_end = (found[dir_len] == '\0' || found[dir_len] == ';');
-		if (at_start && at_end) return true;
-		p = found + 1;
+	for (const char *p = path; *p;) {
+		const char *semi = strchr(p, ';');
+		size_t seg_len = semi ? (size_t)(semi - p) : strlen(p);
+		if (seg_len == dir_len && _strnicmp(p, dir, dir_len) == 0) return true;
+		if (!semi) break;
+		p = semi + 1;
 	}
+	return false;
 }
 
 // Wide-char helper: check if wdir appears as a complete ;-delimited segment in wpath.
@@ -1436,14 +1534,14 @@ static bool wpath_contains_dir(const wchar_t *wpath, const wchar_t *wdir) {
 	if (!wpath || !wdir) return false;
 	size_t dir_len = wcslen(wdir);
 	if (dir_len == 0) return false;
-	for (const wchar_t *p = wpath;;) {
-		const wchar_t *found = wcsstr(p, wdir);
-		if (!found) return false;
-		bool at_start = (found == wpath || found[-1] == L';');
-		bool at_end = (found[dir_len] == L'\0' || found[dir_len] == L';');
-		if (at_start && at_end) return true;
-		p = found + 1;
+	for (const wchar_t *p = wpath; *p;) {
+		const wchar_t *semi = wcschr(p, L';');
+		size_t seg_len = semi ? (size_t)(semi - p) : wcslen(p);
+		if (seg_len == dir_len && _wcsnicmp(p, wdir, dir_len) == 0) return true;
+		if (!semi) break;
+		p = semi + 1;
 	}
+	return false;
 }
 
 // Add a directory to the user's PATH via the registry (persistent).
@@ -1515,9 +1613,13 @@ static void add_to_user_path(const char *dir) {
 	free(current);
 
 	DWORD write_size = (DWORD)((wcslen(newpath) + 1) * sizeof(wchar_t));
-	RegSetValueExW(hKey, L"Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, write_size);
+	rc = RegSetValueExW(hKey, L"Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, write_size);
 	free(newpath);
 	RegCloseKey(hKey);
+	if (rc != ERROR_SUCCESS) {
+		fprintf(stderr, "[prism] Failed to update your PATH (registry error %ld).\n", (long)rc);
+		return;
+	}
 
 	// Notify other programs of the environment change (wide)
 	SendMessageTimeoutW(

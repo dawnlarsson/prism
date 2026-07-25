@@ -1218,6 +1218,82 @@ static void test_aur_attr_with_args(void) {
 	prism_free(&r);
 }
 
+static void test_aur_contextual_noreturn_identifier(void) {
+	const char *code =
+	    "int foo(void);\n"
+	    "void live(void);\n"
+	    "void f(void) {\n"
+	    "    int noreturn = foo();\n"
+	    "    foo();\n"
+	    "    live();\n"
+	    "    (void)noreturn;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "aur_contextual_noreturn.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "aur contextual noreturn identifier: transpiles OK");
+	if (r.output)
+		CHECK(find_unreachable(r.output) == NULL,
+		      "aur contextual noreturn identifier: foo remains returning");
+	prism_free(&r);
+}
+
+static void test_aur_parameter_noreturn_does_not_mark_function(void) {
+	const char *code =
+	    "void f(void (*cb)(void) __attribute__((noreturn)));\n"
+	    "void live(void);\n"
+	    "void caller(void) {\n"
+	    "    f((void (*)(void))0);\n"
+	    "    live();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "aur_parameter_noreturn.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "aur parameter noreturn attribute: transpiles OK");
+	if (r.output)
+		CHECK(find_unreachable(r.output) == NULL,
+		      "aur parameter noreturn attribute: enclosing function remains returning");
+	prism_free(&r);
+}
+
+static void test_p0_attribute_name_does_not_replace_function(void) {
+	const char *code =
+	    "int vfork(void);\n"
+	    "void leaf(void) __attribute__((no_sanitize(\"all\"))) { vfork(); }\n"
+	    "void wrapper(void) {\n"
+	    "    defer (void)0;\n"
+	    "    leaf();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "p0_attr_function_name.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "pass-0 attribute name: vfork taint reaches wrapper");
+	prism_free(&r);
+}
+
+static void test_p0_soft_keyword_callee_taint(void) {
+	const char *code =
+	    "int vfork(void);\n"
+	    "void noreturn(void) { vfork(); }\n"
+	    "void wrapper(void) {\n"
+	    "    defer (void)0;\n"
+	    "    noreturn();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "p0_soft_keyword_callee.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "pass-0 soft-keyword callee: vfork taint reaches wrapper");
+	prism_free(&r);
+}
+
+static void test_p0_asm_underscored_volatile_goto(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    if (0) asm __volatile__ goto(\"\" : : : : L);\n"
+	    "L:\n"
+	    "    return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "p0_asm_volatile_goto.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "pass-0 asm __volatile__ goto: defer rejected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "asm goto") != NULL,
+		      "pass-0 asm __volatile__ goto: diagnostic identifies asm goto");
+	prism_free(&r);
+}
+
 static void run_auto_unreachable_tests(void) {
 	test_aur_paren_call();
 	test_aur_comma_operator();
@@ -1280,4 +1356,9 @@ static void run_auto_unreachable_tests(void) {
 	test_aur_static_inline_noreturn();
 	test_aur_complex_ret_type();
 	test_aur_attr_with_args();
+	test_aur_contextual_noreturn_identifier();
+	test_aur_parameter_noreturn_does_not_mark_function();
+	test_p0_attribute_name_does_not_replace_function();
+	test_p0_soft_keyword_callee_taint();
+	test_p0_asm_underscored_volatile_goto();
 }

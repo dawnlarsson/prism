@@ -44,7 +44,7 @@ Defined in `parse.c`. Produces a flat pool of `Token` structs.
 | `len` | `uint32_t` | Byte length of the token text |
 | `kind` | `uint8_t` | `TK_IDENT`, `TK_KEYWORD`, `TK_PUNCT`, `TK_STR`, `TK_NUM`, `TK_PREP_DIR`, `TK_EOF` |
 | `flags` | `uint8_t` | `TF_AT_BOL`, `TF_HAS_SPACE`, `TF_IS_FLOAT`, `TF_OPEN`, `TF_CLOSE`, `TF_C23_ATTR`, `TF_RAW`, `TF_SIZEOF` (also set on `__builtin_offsetof` and `offsetof`) |
-| `ann` | `uint16_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`, `P1_REJECTED`, `P1_DECL_BRACKET`, `P1_UNEVAL_BRACKET`, `P1_IS_ORELSE_KW`). Zeroed by `new_token()` on allocation. |
+| `ann` | `uint16_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`, `P1_DECL_BRACKET`, `P1_UNEVAL_BRACKET`, `P1_IS_ORELSE_KW`). Zeroed by `new_token()` on allocation. |
 | `ch0` | `uint8_t` | First source byte: avoids `tok_loc()` indirection in hot paths |
 
 Cold path data (`TokenCold`, separate array): `loc_offset`, `line_no` (18-bit), `file_idx` (14-bit).
@@ -110,7 +110,6 @@ Flag definitions:
 | `P1_OE_DECL_INIT` | 5 | `orelse` inside a declaration initializer |
 | `P1_IS_DECL` | 6 | Phase 1D: token starts a variable declaration |
 | `P1_SCOPE_INIT` | 7 | This `{` opens an initializer (compound literal, `= {...}`) |
-| `P1_REJECTED` | 8 | Phase 1D/1F/1G rejected this token (defense-in-depth signal) |
 | `P1_DECL_BRACKET` | 9 | `[` is an array-declarator bracket, not an expression subscript (bounds-check exclusion) |
 | `P1_UNEVAL_BRACKET` | 10 | `[` is inside an unevaluated operand (`sizeof`/`typeof`/`offsetof`/…) or a static-storage initializer |
 | `P1_IS_ORELSE_KW` | 11 | This `orelse` token is the Prism keyword, not an identifier, baked by Phase 1 classification; Pass 2 trusts the bit |

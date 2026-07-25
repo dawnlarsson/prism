@@ -250,7 +250,6 @@ typedef struct {
 	char *name;
 	char *contents;
 	size_t contents_len;
-	size_t mmap_size;
 	int file_no;
 	int line_delta;
 	bool owns_contents;
@@ -336,7 +335,7 @@ struct Token {
 	uint8_t kind;
 	uint8_t _flags_pad; // Align flags to 2 bytes (keeps Token at 24)
 	uint16_t flags;	    // TF_* bitmask (TF_SOFT_KW needs bit 8)
-	uint16_t ann;	    // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL, P1_REJECTED)
+	uint16_t ann;	    // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL, …)
 	uint8_t ch0;	    // First source byte — avoids tok_loc() indirection in hot paths
 	uint8_t _pad;	    // Explicit padding to 24 bytes
 }; // 24 bytes
@@ -843,19 +842,6 @@ static char *intern_filename(const char *name) {
 
 static void free_file_contents(File *f) {
 	if (!f || !f->contents) return;
-#ifdef _WIN32
-	if (f->mmap_size) {
-		UnmapViewOfFile(f->contents);
-		f->contents = NULL;
-		return;
-	}
-#else
-	if (f->mmap_size) {
-		munmap(f->contents, f->mmap_size);
-		f->contents = NULL;
-		return;
-	}
-#endif
 	if (f->owns_contents) free(f->contents);
 }
 
@@ -1049,7 +1035,7 @@ static inline PRISM_PURE bool is_gnu_label_decl_head(Token *tok) {
 static inline PRISM_PURE uint64_t keyword_lookup(char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = KEYWORD_HASH(key, keylen);
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < 32; i++) {
 		KeywordEntry *ent = &keyword_cache[(slot + i) & 255];
 		if (!ent->name) return 0;
 		if (ent->len == keylen && !memcmp(ent->name, key, keylen)) return ent->value;
@@ -1166,6 +1152,16 @@ static void init_keyword_map(void) {
 	    {"__attribute__", TT_ATTR | TT_QUALIFIER, true},
 	    {"__attribute", TT_ATTR | TT_QUALIFIER, true},
 	    {"__declspec", TT_ATTR | TT_QUALIFIER, true},
+	    {"__cdecl", 0, true, TF_MS_CC},
+	    {"__stdcall", 0, true, TF_MS_CC},
+	    {"__fastcall", 0, true, TF_MS_CC},
+	    {"__thiscall", 0, true, TF_MS_CC},
+	    {"__vectorcall", 0, true, TF_MS_CC},
+	    {"_cdecl", 0, true, TF_MS_CC},
+	    {"_stdcall", 0, true, TF_MS_CC},
+	    {"_fastcall", 0, true, TF_MS_CC},
+	    {"cdecl", 0, true, TF_MS_CC | TF_SOFT_KW},
+	    {"stdcall", 0, true, TF_MS_CC | TF_SOFT_KW},
 	    {"_Pragma", TT_ATTR, true},
 	    {"__pragma", TT_ATTR, true},
 	    {"__extension__", TT_INLINE, true},
@@ -1388,7 +1384,10 @@ new_token(TokenKind kind, char *start, char *end, TokState *ts) {
 	tok->ann = 0;
 	tok->ch0 = (uint8_t)*start;
 	TokenCold *c = tok_cold(tok);
-	c->loc_offset = (uint32_t)(start - cf->contents);
+	ptrdiff_t off = start - cf->contents;
+	if (off < 0 || (size_t)off > (size_t)UINT32_MAX)
+		error_at(start, "source file exceeds 4 GiB; cannot record token locations");
+	c->loc_offset = (uint32_t)off;
 	{
 		long long ln = (long long)ts->line_no + cf->line_delta;
 		int clamped = ln > 0x1FFFF ? 0x1FFFF : (ln < -0x20000 ? -0x20000 : (int)ln);
@@ -1423,43 +1422,6 @@ static Token *read_char_literal(char *start, char *quote, TokState *ts) {
 	return new_token(TK_NUM, start, p + 1, ts);
 }
 
-// Check for C23 extended float suffix; returns suffix length to strip (0 if none)
-static int get_extended_float_suffix(const char *p, int len, const char **replacement) {
-	static const struct {
-		const char suffix[6];
-		int slen;
-		const char *repl;
-	} tbl[] = {
-	    {"f128x", 5, "L"},
-	    {"bf16", 4, "f"},
-	    {"f128", 4, "L"},
-	    {"f32x", 4, NULL},
-	    {"f64x", 4, "L"},
-	    {"f64", 3, NULL},
-	    {"f32", 3, "f"},
-	    {"f16", 3, "f"},
-	};
-
-	if (replacement) *replacement = NULL;
-	if (len < 3) return 0;
-	const char *e = p + len;
-	for (int i = 0; i < (int)(sizeof(tbl) / sizeof(*tbl)); i++) {
-		int sl = tbl[i].slen;
-		if (len < sl) continue;
-		bool match = true;
-		for (int j = 0; j < sl; j++)
-			if ((e[-sl + j] | 0x20) != tbl[i].suffix[j]) {
-				match = false;
-				break;
-			}
-		if (match) {
-			if (replacement) *replacement = tbl[i].repl;
-			return sl;
-		}
-	}
-	return 0;
-}
-
 static inline void classify_punct(Token *t) {
 	char *loc = tok_loc(t);
 	char c = loc[0];
@@ -1491,7 +1453,69 @@ static inline bool delimiters_match(Token *open, Token *close) {
 }
 
 static inline bool p0_token_can_name_function(Token *tok) {
-	return tok && (tok->kind == TK_IDENT || (tok->tag & (TT_DEFER | TT_ORELSE)) || (tok->flags & TF_RAW));
+	return tok && (tok->kind == TK_IDENT || (tok->tag & (TT_DEFER | TT_ORELSE)) ||
+		       (tok->flags & (TF_RAW | TF_SOFT_KW)));
+}
+
+static Token *p0_attribute_group_end(Token *tok) {
+	if (!tok) return NULL;
+	if ((tok->flags & TF_C23_ATTR) && tok_match(tok)) return tok_match(tok);
+	if (tok->kind <= TK_KEYWORD &&
+	    (equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec"))) {
+		Token *open = tok_next(tok);
+		if (open && open->ch0 == '(' && tok_match(open)) return tok_match(open);
+	}
+	return NULL;
+}
+
+static Token *p0_previous_token(Token *tok) {
+	for (uint32_t i = tok_idx(tok); i > 0;) {
+		Token *prev = &token_pool[--i];
+		if (prev->kind != TK_PREP_DIR) return prev;
+	}
+	return NULL;
+}
+
+static bool p0_soft_noreturn_is_decl_specifier(Token *tok) {
+	Token *next = tok_next(tok);
+	if (!next || next->kind == TK_EOF ||
+	    match_set(next, CH('=') | CH('(') | CH('[') | CH(',') | CH(';') | CH(')')))
+		return false;
+
+	bool followed_by_decl =
+	    (next->tag & (TT_TYPE | TT_STORAGE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR |
+			  TT_INLINE)) ||
+	    (next->flags & TF_C23_ATTR);
+	if (!followed_by_decl && p0_token_can_name_function(next) && tok_next(next) &&
+	    tok_next(next)->ch0 == '(')
+		followed_by_decl = true;
+	if (!followed_by_decl && next->kind == TK_IDENT) {
+		Token *name = tok_next(next);
+		if (p0_token_can_name_function(name) && tok_next(name) && tok_next(name)->ch0 == '(')
+			followed_by_decl = true;
+	}
+	if (!followed_by_decl) return false;
+
+	if (tok_at_bol(tok)) return true;
+	Token *prev = p0_previous_token(tok);
+	if (!prev) return true;
+	if (prev->ch0 == ';' || prev->ch0 == '{' || prev->ch0 == '}') return true;
+	if (prev->tag &
+	    (TT_TYPE | TT_STORAGE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR | TT_INLINE))
+		return true;
+	if (prev->ch0 == ']' && tok_match(prev) && (tok_match(prev)->flags & TF_C23_ATTR)) return true;
+	return false;
+}
+
+static bool p0_attribute_inside_parameter_list(Token *first, Token *attr) {
+	uint32_t attr_idx = tok_idx(attr);
+	for (Token *open = first; open && open != attr; open = tok_next(open)) {
+		if (open->ch0 != '(' || !(open->flags & TF_OPEN) || open->match_idx <= attr_idx)
+			continue;
+		Token *name = p0_previous_token(open);
+		if (p0_token_can_name_function(name)) return true;
+	}
+	return false;
 }
 
 static Token *find_wrapper_callee(Token *body) {
@@ -1656,14 +1680,14 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 
 static char *scan_pp_number(char *p, bool *is_float) {
 	bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
-	*is_float = false;
+	bool float_lit = false;
 	for (;;) {
 		char c = *p;
 		if ((c == 'e' || c == 'E' || c == 'p' || c == 'P') && (p[1] == '+' || p[1] == '-')) {
-			if (c == 'p' || c == 'P' || !is_hex) *is_float = true;
+			if (c == 'p' || c == 'P' || !is_hex) float_lit = true;
 			p += 2;
 		} else if (c == '.') {
-			*is_float = true;
+			float_lit = true;
 			p++;
 		} else if (ident_char[(unsigned char)c]) {
 			p++;
@@ -1672,6 +1696,7 @@ static char *scan_pp_number(char *p, bool *is_float) {
 		} else
 			break;
 	}
+	if (is_float) *is_float = float_lit;
 	return p;
 }
 
@@ -1692,6 +1717,7 @@ static Token *tokenize(File *file) {
 	} while (0)
 	TokState ts = {true, false, 1};
 	bool in_system_include = false;
+	bool saw_taint_kw = false, saw_asm_kw = false, saw_attr_kw = false, saw_noreturn_kw = false;
 	while (*p) {
 		if (ts.at_bol && *p == '#') {
 			char *directive_start = p;
@@ -1751,15 +1777,9 @@ static Token *tokenize(File *file) {
 		}
 		if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1]))) {
 			char *start = p;
-			bool is_float;
-			p = scan_pp_number(p, &is_float);
+			p = scan_pp_number(p, NULL);
 			Token *t = new_token(TK_NUM, start, p, &ts);
 			LINK(t);
-			if (is_float) t->flags |= TF_IS_FLOAT;
-			else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X' ||
-						       start[1] == 'b' || start[1] == 'B')) &&
-				 get_extended_float_suffix(start, t->len, NULL))
-				t->flags |= TF_IS_FLOAT;
 			continue;
 		}
 		{ // Raw string literals
@@ -1820,14 +1840,12 @@ static Token *tokenize(File *file) {
 				} else
 					t->tag = (uint32_t)kw;
 				t->flags |= (uint16_t)(kw >> KW_FLAGS_SHIFT);
-			}
-			/* MSVC calling-convention keywords — flag once at tokenize. */
-			if (!(t->flags & TF_MS_CC) && (t->ch0 == '_' || t->ch0 == 'c' || t->ch0 == 's')) {
-				if (equal(t, "__cdecl") || equal(t, "__stdcall") || equal(t, "__fastcall") ||
-				    equal(t, "__thiscall") || equal(t, "__vectorcall") ||
-				    equal(t, "_cdecl") || equal(t, "_stdcall") || equal(t, "_fastcall") ||
-				    equal(t, "cdecl") || equal(t, "stdcall"))
-					t->flags |= TF_MS_CC;
+				if (t->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) saw_taint_kw = true;
+				if (t->tag & TT_ASM) saw_asm_kw = true;
+				if (t->tag & TT_ATTR) saw_attr_kw = true;
+				if ((t->tag & TT_INLINE) && (t->tag & TT_SKIP_DECL) &&
+				    (equal(t, "_Noreturn") || equal(t, "noreturn")))
+					saw_noreturn_kw = true;
 			}
 			p += ident_len;
 			continue;
@@ -1879,8 +1897,10 @@ static Token *tokenize(File *file) {
 				    &ctx->main_arena, stack, sp + 1, stack_cap, 256, Token *);
 				stack[sp++] = t;
 				Token *tn = tok_next(t);
-				if (t->ch0 == '[' && tn && tn->ch0 == '[' && (tn->flags & TF_OPEN))
+				if (t->ch0 == '[' && tn && tn->ch0 == '[' && (tn->flags & TF_OPEN)) {
 					t->flags |= TF_C23_ATTR;
+					saw_attr_kw = true;
+				}
 			} else if (t->flags & TF_CLOSE) {
 				if (sp == 0) error_tok(t, "unmatched closing delimiter");
 				Token *open = stack[--sp];
@@ -1896,7 +1916,7 @@ static Token *tokenize(File *file) {
 		if (sp > 0) error_tok(stack[sp - 1], "unclosed delimiter '%c'", stack[sp - 1]->ch0);
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
 		// Propagate special-function taint transitively through wrapper chains.
-		{
+		if (saw_taint_kw || saw_asm_kw) {
 			typedef struct {
 				Token *name;
 				Token *body;
@@ -1907,6 +1927,11 @@ static Token *tokenize(File *file) {
 			int function_capacity = 0;
 			Token *func_name = NULL;
 			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+				Token *attr_end = p0_attribute_group_end(t);
+				if (attr_end) {
+					t = attr_end;
+					continue;
+				}
 				if (is_potential_func_name(t)) func_name = t;
 				if (t->ch0 == '{' && (t->flags & TF_OPEN) && t->match_idx) {
 					Token *end = tok_match(t);
@@ -1914,10 +1939,25 @@ static Token *tokenize(File *file) {
 						if ((b->tag & TT_SPECIAL_FN) &&
 						    !(tok_idx(b) >= 1 &&
 						      (token_pool[tok_idx(b) - 1].tag & TT_MEMBER))) {
-							if (b->ch0 == 'v' && b->len == 5) {
-								t->tag |= TT_NORETURN_FN;
-							} else
-								t->tag |= TT_SPECIAL_FN;
+							/* Skip declarator shadows: `void (*setjmp)(void)` /
+							 * `int vfork;` — not calls/refs. */
+							Token *prev =
+							    tok_idx(b) >= 1 ? &token_pool[tok_idx(b) - 1]
+									    : NULL;
+							Token *nxt = tok_next(b);
+							bool decl_shadow =
+							    prev &&
+							    (match_ch(prev, '*') ||
+							     (prev->tag &
+							      (TT_TYPE | TT_QUALIFIER | TT_STORAGE |
+							       TT_SUE))) &&
+							    nxt && nxt->ch0 != '(';
+							if (!decl_shadow) {
+								if (b->ch0 == 'v' && b->len == 5) {
+									t->tag |= TT_NORETURN_FN;
+								} else
+									t->tag |= TT_SPECIAL_FN;
+							}
 						}
 						if (b->tag & TT_ASM) {
 							/* GNU `asm [qualifiers] goto (` — require
@@ -1941,6 +1981,11 @@ static Token *tokenize(File *file) {
 								/* asm volatile/inline/goto attrs */
 								if (ag->tag &
 								    (TT_QUALIFIER | TT_INLINE | TT_ATTR))
+									continue;
+								if (equal(ag, "__volatile__") ||
+								    equal(ag, "__inline__") ||
+								    equal(ag, "volatile") ||
+								    equal(ag, "inline"))
 									continue;
 								if (ag->flags & TF_SOFT_KW) continue;
 								if ((ag->flags & TF_C23_ATTR) &&
@@ -1997,19 +2042,34 @@ static Token *tokenize(File *file) {
 					void *v = hashmap_get(&func_map, tok_loc(callee), callee->len);
 					if (v) callee_idx[i] = (int)(intptr_t)v - 1;
 				}
-			}
 
-			bool changed;
-			do {
-				changed = false;
+				/* Taint flows callee → caller along the wrapper chain. */
+				int *caller_head = arena_alloc(&ctx->main_arena,
+							       (size_t)function_count * sizeof(int));
+				int *caller_next = arena_alloc(&ctx->main_arena,
+							       (size_t)function_count * sizeof(int));
+				int *queue = arena_alloc(&ctx->main_arena,
+							 (size_t)function_count * sizeof(int));
+				for (int i = 0; i < function_count; i++) caller_head[i] = -1;
 				for (int i = 0; i < function_count; i++) {
-					if (wrapper_taint[i] || callee_idx[i] < 0) continue;
-					if (wrapper_taint[callee_idx[i]]) {
-						wrapper_taint[i] = wrapper_taint[callee_idx[i]];
-						changed = true;
+					int j = callee_idx[i];
+					if (j < 0) continue;
+					caller_next[i] = caller_head[j];
+					caller_head[j] = i;
+				}
+				int qh = 0, qt = 0;
+				for (int i = 0; i < function_count; i++)
+					if (wrapper_taint[i]) queue[qt++] = i;
+				while (qh < qt) {
+					int j = queue[qh++];
+					for (int i = caller_head[j]; i >= 0; i = caller_next[i]) {
+						if (wrapper_taint[i]) continue;
+						wrapper_taint[i] = wrapper_taint[j];
+						queue[qt++] = i;
 					}
 				}
-			} while (changed);
+			}
+
 			bool has_taint = false;
 			for (int i = 0; i < function_count; i++) {
 				if (wrapper_taint[i] ||
@@ -2036,6 +2096,18 @@ static Token *tokenize(File *file) {
 					Token *end = tok_match(body);
 					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
 						if (!p0_token_can_name_function(b)) continue;
+						/* Skip declarator occurrences (`void (*f0)(void)`,
+						 * `int f0;`) — keep bare refs so FP chains like
+						 * `fp = f0; fp();` still propagate taint. */
+						if (tok_idx(b) >= 1) {
+							Token *prev = &token_pool[tok_idx(b) - 1];
+							Token *n = tok_next(b);
+							if ((match_ch(prev, '*') ||
+							     (prev->tag & (TT_TYPE | TT_QUALIFIER |
+									   TT_STORAGE | TT_SUE))) &&
+							    n && n->ch0 != '(')
+								continue;
+						}
 						if (!(fn_bloom &
 						      (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
 							continue;
@@ -2061,30 +2133,59 @@ static Token *tokenize(File *file) {
 						edges[edge_count++] = (TaintEdge){i, j};
 					}
 				}
-				do {
-					changed = false;
+				/* Body taint: call edge i→j propagates j's taint onto i. */
+				if (edge_count > 0) {
+					int *edge_head = arena_alloc(&ctx->main_arena,
+								     (size_t)function_count * sizeof(int));
+					int *edge_next = arena_alloc(&ctx->main_arena,
+								     (size_t)edge_count * sizeof(int));
+					int *queue = arena_alloc(&ctx->main_arena,
+								 (size_t)function_count * sizeof(int));
+					uint8_t *queued = arena_alloc(&ctx->main_arena,
+								      (size_t)function_count);
+					for (int i = 0; i < function_count; i++) {
+						edge_head[i] = -1;
+						queued[i] = 0;
+					}
 					for (int e = 0; e < edge_count; e++) {
-						int i = edges[e].from, j = edges[e].to;
-						Token *body = functions[i].body;
-						if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
-						if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
-							body->tag |= wrapper_taint[j];
-							changed = true;
-						}
-						uint32_t vt = functions[j].body->tag & TT_NORETURN_FN;
-						if (vt && !(body->tag & TT_NORETURN_FN)) {
-							body->tag |= TT_NORETURN_FN;
-							changed = true;
+						int j = edges[e].to;
+						edge_next[e] = edge_head[j];
+						edge_head[j] = e;
+					}
+					int qh = 0, qt = 0;
+					for (int j = 0; j < function_count; j++) {
+						if (wrapper_taint[j] ||
+						    (functions[j].body->tag & TT_NORETURN_FN)) {
+							queue[qt++] = j;
+							queued[j] = 1;
 						}
 					}
-				} while (changed);
+					while (qh < qt) {
+						int j = queue[qh++];
+						for (int e = edge_head[j]; e >= 0; e = edge_next[e]) {
+							int i = edges[e].from;
+							Token *body = functions[i].body;
+							if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN))
+								continue;
+							uint32_t before = body->tag;
+							if (wrapper_taint[j]) body->tag |= wrapper_taint[j];
+							if (functions[j].body->tag & TT_NORETURN_FN)
+								body->tag |= TT_NORETURN_FN;
+							if (body->tag == before) continue;
+							if (!queued[i]) {
+								queue[qt++] = i;
+								queued[i] = 1;
+							}
+						}
+					}
+				}
 				free(edges);
 			} // has_taint
 		}
 	}
 
 	// When a noreturn specifier is found before a function declaration,
-	{
+	if (saw_noreturn_kw || saw_attr_kw) {
 		HashMap nr_map = {0};
 #define SKIP_ATTR_ARGS(a)                                                                                    \
 	do {                                                                                                 \
@@ -2107,13 +2208,17 @@ static Token *tokenize(File *file) {
 	} while (0)
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			bool is_noreturn = false;
+			bool attribute_form = false;
 			Token *scan_start = t;
 			Token *attr_origin = t; // original position for backward scan
 
-			if (t->kind <= TK_KEYWORD && (equal(t, "_Noreturn") || equal(t, "noreturn")))
+			if (t->kind <= TK_KEYWORD &&
+			    (equal(t, "_Noreturn") ||
+			     (equal(t, "noreturn") && p0_soft_noreturn_is_decl_specifier(t))))
 				is_noreturn = true;
 			// [[noreturn]] / [[_Noreturn]] / [[__noreturn__]] — C23 attribute
 			if (t->ch0 == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
+				attribute_form = true;
 				Token *inner = tok_next(t);
 				Token *attr_end = &token_pool[t->match_idx];
 				if (inner && inner->ch0 == '[')
@@ -2122,7 +2227,9 @@ static Token *tokenize(File *file) {
 				scan_start = t;
 			}
 
-			if (t->kind <= TK_KEYWORD && equal(t, "__attribute__")) {
+			if (t->kind <= TK_KEYWORD &&
+			    (equal(t, "__attribute__") || equal(t, "__attribute"))) {
+				attribute_form = true;
 				Token *p1 = tok_next(t);
 				if (p1 && p1->ch0 == '(') {
 					Token *p2 = tok_next(p1);
@@ -2137,6 +2244,7 @@ static Token *tokenize(File *file) {
 
 			// __declspec(noreturn) or __declspec(__noreturn__) — MSVC
 			if (t->kind <= TK_KEYWORD && equal(t, "__declspec")) {
+				attribute_form = true;
 				Token *p1 = tok_next(t);
 				if (p1 && p1->ch0 == '(' && p1->match_idx) {
 					Token *close = &token_pool[p1->match_idx];
@@ -2147,10 +2255,17 @@ static Token *tokenize(File *file) {
 			}
 
 			if (!is_noreturn) continue;
+			if (attribute_form && p0_attribute_inside_parameter_list(first, attr_origin))
+				continue;
 			Token *fn_name = NULL;
 			for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
 				char ch = s->ch0;
 				if (ch == ';' || ch == '{') break;
+				Token *attr_end = p0_attribute_group_end(s);
+				if (attr_end) {
+					s = attr_end;
+					continue;
+				}
 				if (p0_token_can_name_function(s) && tok_next(s) && tok_next(s)->ch0 == '(') {
 					if (s->tag &
 					    (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER | TT_TYPE | TT_STORAGE))
@@ -2164,6 +2279,10 @@ static Token *tokenize(File *file) {
 					Token *pt = &token_pool[pi - 1];
 					if (pt->kind == TK_PREP_DIR) continue;
 					if (pt->ch0 == ';' || pt->ch0 == '{' || pt->ch0 == '}') break;
+					if ((pt->ch0 == ')' || pt->ch0 == ']') && tok_match(pt)) {
+						pi = tok_idx(tok_match(pt)) + 1;
+						continue;
+					}
 					if (p0_token_can_name_function(pt) && tok_next(pt) &&
 					    tok_next(pt)->ch0 == '(') {
 						if (pt->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
@@ -2275,6 +2394,10 @@ Token *tokenize_file(char *path) {
 		return NULL;
 	}
 	size_t size = (size_t)st.st_size;
+	if (size > (size_t)UINT32_MAX) {
+		close(fd);
+		error("source file '%s' exceeds 4 GiB", path);
+	}
 	if (size == 0) {
 		close(fd);
 		char *buf = malloc(8);
@@ -2389,7 +2512,7 @@ typedef struct {
 	TypedefEntry *entries;
 	int count;
 	int capacity;
-	HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
+	HashMap name_map; // Maps name → (entry_index + 1) as void*, 0 = absent. Chain via prev_index.
 	uint64_t bloom;	  // Bloom filter: bit (ch0 ^ len) & 63. Fast negative lookup.
 } TypedefTable;
 
@@ -2402,7 +2525,7 @@ enum {
 	P1_OE_DECL_INIT = 1 << 5, // orelse inside declaration initializer
 	P1_IS_DECL = 1 << 6,	  // Phase 1D: token starts a variable declaration
 	P1_SCOPE_INIT = 1 << 7,	  // This '{' opens an initializer (compound literal, = {...})
-	P1_REJECTED = 1 << 8,	  // Phase 1D/1F/1G rejected this token (defense-in-depth signal)
+	/* bit 8 reserved (was P1_REJECTED; never produced/consumed) */
 	P1_DECL_BRACKET = 1 << 9, // '[' is an array-declarator bracket (not an expression subscript)
 	P1_UNEVAL_BRACKET =
 	    1 << 10, // '[' is inside an unevaluated operand (sizeof/_Alignof/typeof/offsetof/etc.)
@@ -2574,17 +2697,95 @@ static PRISM_PURE Token *skip_to_semicolon(Token *tok, Token *end) {
 	return tok;
 }
 
+/* Long same-name chains (stress TUs) get a token_index-sorted timeline for
+ * O(log n) lookup instead of newest→oldest walks. Short chains keep the walk. */
+static PRISM_THREAD_LOCAL HashMap td_tl_map; /* name → packed (base<<32)|count into td_tl_idxs */
+static PRISM_THREAD_LOCAL int *td_tl_idxs;
+static PRISM_THREAD_LOCAL int td_max_chain_seen; /* capped sample; ≥8 triggers timeline build */
+
 static void typedef_table_reset(void) {
 	typedef_table.entries = NULL;
 	typedef_table.count = 0;
 	typedef_table.capacity = 0;
 	typedef_table.bloom = 0;
 	hashmap_discard(&typedef_table.name_map);
+	hashmap_discard(&td_tl_map);
+	td_tl_idxs = NULL;
+	td_max_chain_seen = 0;
 }
 
 static PRISM_PURE int typedef_get_index(char *name, int len) {
 	void *val = hashmap_get(&typedef_table.name_map, name, len);
 	return val ? (int)(intptr_t)val - 1 : -1;
+}
+
+static int td_tl_cmp_tok(const void *pa, const void *pb) {
+	uint32_t ta = typedef_table.entries[*(const int *)pa].token_index;
+	uint32_t tb = typedef_table.entries[*(const int *)pb].token_index;
+	return (ta > tb) - (ta < tb);
+}
+
+static void td_build_timelines(void) {
+	hashmap_discard(&td_tl_map);
+	td_tl_idxs = NULL;
+	if (td_max_chain_seen < 8 || !typedef_table.name_map.buckets) return;
+
+	/* Walk name_map heads only (one probe per unique name). */
+	int slots = 0;
+	int cap = typedef_table.name_map.capacity;
+	for (int b = 0; b < cap; b++) {
+		HashEntry *ent = &typedef_table.name_map.buckets[b];
+		if (!ent->key || ent->key == TOMBSTONE) continue;
+		int head = (int)(intptr_t)ent->val - 1;
+		int run = 0;
+		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index) run++;
+		if (run >= 8) slots += run;
+	}
+	if (!slots) return;
+
+	td_tl_idxs = arena_alloc_uninit(&ctx->main_arena, (size_t)slots * sizeof(int));
+	int pos = 0;
+	for (int b = 0; b < cap; b++) {
+		HashEntry *ent = &typedef_table.name_map.buckets[b];
+		if (!ent->key || ent->key == TOMBSTONE) continue;
+		int head = (int)(intptr_t)ent->val - 1;
+		int run = 0;
+		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index) run++;
+		if (run < 8) continue;
+		int base = pos;
+		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index)
+			td_tl_idxs[pos++] = j;
+		qsort(td_tl_idxs + base, (size_t)run, sizeof(int), td_tl_cmp_tok);
+		hashmap_put(&td_tl_map, ent->key, ent->key_len,
+			    (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run));
+	}
+}
+
+static PRISM_PURE TypedefEntry *td_lookup_timeline(char *name, int len, uint32_t cur, bool tags_only) {
+	void *val = hashmap_get(&td_tl_map, name, len);
+	if (!val) return NULL;
+	uint32_t base = (uint32_t)((uintptr_t)val >> 32);
+	uint32_t run = (uint32_t)(uintptr_t)val;
+	int lo = (int)base, hi = (int)base + (int)run;
+	while (lo < hi) {
+		int mid = lo + ((hi - lo) >> 1);
+		if (typedef_table.entries[td_tl_idxs[mid]].token_index <= cur)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	TypedefEntry *tag_fallback = NULL;
+	for (int p = lo - 1; p >= (int)base; p--) {
+		TypedefEntry *e = &typedef_table.entries[td_tl_idxs[p]];
+		if (cur < e->scope_open_idx || cur >= e->scope_close_idx) continue;
+		if (tags_only) {
+			if (e->is_struct_tag) return e;
+			continue;
+		}
+		if (!e->is_struct_tag) return e;
+		if (!tag_fallback) tag_fallback = e;
+	}
+	return tag_fallback;
 }
 
 static void
@@ -2641,6 +2842,9 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->scope_close_idx = td_scope_close;
 	hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(new_index + 1));
 	typedef_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
+	int cl = 1;
+	for (int p = e->prev_index; p >= 0 && cl < 8; p = typedef_table.entries[p].prev_index) cl++;
+	if (cl > td_max_chain_seen) td_max_chain_seen = cl;
 }
 
 static inline bool is_soft_keyword_identifier(Token *tok);
@@ -2653,8 +2857,15 @@ static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 		return NULL;
 	unsigned c0 = tok->ch0, tl = tok->len;
 	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
-	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
+	if (td_tl_idxs) {
+		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, false);
+		if (hit) return hit;
+		/* No timeline for this name (short chain) or no in-scope hit — fall through. */
+		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+	}
+	int idx = typedef_get_index(name, tok->len);
 	// ISO C11 §6.2.3: tag namespace is separate from ordinary identifiers.
 	TypedefEntry *tag_fallback = NULL;
 	while (idx >= 0) {
@@ -2673,8 +2884,14 @@ static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
 	unsigned c0 = tok->ch0, tl = tok->len;
 	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
-	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
+	if (td_tl_idxs) {
+		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, true);
+		if (hit) return hit;
+		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+	}
+	int idx = typedef_get_index(name, tok->len);
 	while (idx >= 0) {
 		TypedefEntry *e = &typedef_table.entries[idx];
 		if (e->is_struct_tag && e->token_index <= cur && cur >= e->scope_open_idx &&
