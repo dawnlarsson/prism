@@ -899,10 +899,16 @@ static PRISM_COLD noreturn void error(char *fmt, ...) {
 }
 
 static PRISM_COLD void
-verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap) {
+verror_at(char *filename, char *input, int line_no, char *loc, const char *severity, const char *fmt,
+	  va_list ap) {
+	/* GCC-style severity label so `-fno-safety` warnings are not mistaken
+	 * for hard errors by humans or CI log scrapers (which key on
+	 * `file:line: warning:` / `file:line: error:`).  Defaults to "error". */
+	const char *sev = severity ? severity : "error";
 	// Digraph locs point to static storage; avoid UB from cross-object pointer comparison
 	if (!input || !loc || line_no <= 0 || is_digraph_loc(loc)) {
-		fprintf(stderr, "%s:%d: ", filename ? filename : "<unknown>", line_no > 0 ? line_no : 0);
+		fprintf(stderr, "%s:%d: %s: ", filename ? filename : "<unknown>",
+			line_no > 0 ? line_no : 0, sev);
 		vfprintf(stderr, fmt, ap);
 		fprintf(stderr, "\n");
 		return;
@@ -912,7 +918,7 @@ verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, 
 	while (input < line && line[-1] != '\n') line--;
 	char *end = loc;
 	while (*end && *end != '\n') end++;
-	int indent = fprintf(stderr, "%s:%d: ", filename, line_no);
+	int indent = fprintf(stderr, "%s:%d: %s: ", filename, line_no, sev);
 	if (indent < 0) indent = 0;
 	fprintf(stderr, "%.*s\n%*s^ ", (int)(end - line), line, indent + (int)(loc - line), "");
 	vfprintf(stderr, fmt, ap);
@@ -940,9 +946,11 @@ PRISM_COLD noreturn void error_at(char *loc, char *fmt, ...) {
 			  ctx->current_file->contents,
 			  is_digraph_loc(loc) ? 0 : count_lines(ctx->current_file->contents, loc),
 			  loc,
+			  "error",
 			  fmt,
 			  ap);
 	else {
+		fprintf(stderr, "error: ");
 		vfprintf(stderr, fmt, ap);
 		fprintf(stderr, "\n");
 	}
@@ -957,7 +965,7 @@ PRISM_COLD noreturn void error_tok(Token *tok, const char *fmt, ...) {
 #ifdef PRISM_LIB_MODE
 	if (lib_error_enabled()) lib_errorf(tok_line_no(tok), fmt, ap);
 #endif
-	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), fmt, ap);
+	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), "error", fmt, ap);
 	va_end(ap);
 	exit(1);
 }
@@ -971,7 +979,7 @@ static void warn_tok(Token *tok, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 	File *f = tok_file(tok);
-	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), fmt, ap);
+	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), "warning", fmt, ap);
 	va_end(ap);
 #endif
 }
@@ -2727,7 +2735,9 @@ static inline PRISM_PURE bool is_soft_keyword_identifier(Token *tok) {
 
 static inline bool soft_keyword_decl_name_boundary_ex(Token *tok, bool allow_rparen) {
 	Token *after = skip_noise(tok_next(tok));
-	uint64_t end = CH(';') | CH(',') | CH('=') | CH('[') | CH(':');
+	/* Include '(' so `int orelse(int);` / `T defer(void)` treat the soft
+	 * keyword as a declarator name (function prototype), not an operator. */
+	uint64_t end = CH(';') | CH(',') | CH('=') | CH('[') | CH(':') | CH('(');
 	if (allow_rparen) end |= CH(')');
 	return after && (match_set(after, end) || (after->tag & TT_ASM));
 }
@@ -2800,14 +2810,27 @@ static bool close_paren_ends_cast_type_name(Token *tok);
 static bool orelse_is_label_or_goto_target(Token *tok, Token *prev);
 static TypeSpecResult parse_type_specifier(Token *tok);
 
+static bool close_paren_ends_type_specifier_ctor(Token *tok);
+
 static inline bool orelse_shadow_is_kw(Token *prev) {
 	if (!prev) return false;
 	if (token_ends_sue_type_specifier(prev)) return false;
 	if (close_paren_ends_cast_type_name(prev)) return false;
+	/* `_BitInt(N) orelse` / `typeof(T) orelse` / `_Alignas(N) int orelse`:
+	 * the closing `)` ends a type-specifier constructor, not an expression. */
+	if (close_paren_ends_type_specifier_ctor(prev)) return false;
 	if (orelse_is_label_or_goto_target(NULL, prev)) return false;
+	/* `return orelse;` — orelse is the return operand (identifier), not an
+	 * operator. Real keyword form is `return x orelse fb;`.
+	 * Do NOT exclude break/continue: `… orelse continue orelse …` mid-chain
+	 * needs the second orelse classified as a keyword. goto is already
+	 * handled by orelse_is_label_or_goto_target above. */
+	if (prev->tag & TT_RETURN) return false;
 	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT | TT_SKIP_DECL |
 			 TT_ALIGNAS | TT_INLINE | TT_ATTR))
 		return false;
+	/* `T orelse = 0` where T is a typedef-name: mirror is_defer_kw. */
+	if (is_known_typedef(prev)) return false;
 	if (prev->len == 2 && (prev->ch0 == '+' || prev->ch0 == '-') && tok_loc(prev)[1] == prev->ch0)
 		return true;
 	return is_expr_ending_brace(prev);
@@ -3028,6 +3051,15 @@ static bool close_paren_ends_cast_type_name(Token *tok) {
 		return false;
 	}
 	return t == tok;
+}
+
+/* `)` that closes typeof(…), _BitInt(…), or _Alignas(…) — a type-specifier
+ * constructor, so a following soft keyword is a declarator name. */
+static bool close_paren_ends_type_specifier_ctor(Token *tok) {
+	if (!tok || !match_ch(tok, ')') || !tok_match(tok)) return false;
+	Token *open = tok_match(tok);
+	Token *before_open = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
+	return before_open && (before_open->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS));
 }
 
 static bool orelse_is_label_or_goto_target(Token *tok, Token *prev) {

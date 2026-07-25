@@ -3616,6 +3616,68 @@ static void test_nested_function_orelse_rejected(void) {
 	prism_free(&r);
 }
 
+/* Soft-keyword identifier false rejects: orelse/defer used as ordinary C
+ * names after typedef-names, )-ended types, in declarators, asm-goto labels,
+ * and GNU nested-function names/params — must not be classified as operators. */
+static void test_soft_kw_ident_false_rejects(void) {
+	printf("\n--- Soft-kw identifier false rejects ---\n");
+
+	struct {
+		const char *name;
+		const char *code;
+	} ok[] = {
+	    {"typedef-name orelse",
+	     "typedef int T; int f(void){ T orelse = 0; return orelse; }\n"},
+	    {"_BitInt orelse", "int f(void){ _BitInt(8) orelse = 0; return (int)orelse; }\n"},
+	    {"typeof orelse", "int f(void){ typeof(1) orelse = 0; return orelse; }\n"},
+	    {"typeof(T) orelse",
+	     "typedef int T; int f(void){ typeof(T) orelse = 0; return orelse; }\n"},
+	    {"stmtexpr typedef orelse",
+	     "typedef int T; int f(void){ return ({ T orelse = 0; orelse; }); }\n"},
+	    {"local proto orelse", "int main(void){ int orelse(int); return 0; }\n"},
+	    {"fnptr param defer",
+	     "int z(void){return 0;} int f(int (*defer)(void)){ return defer(); }\n"
+	     "int main(void){ return f(z); }\n"},
+	    {"fnptr param orelse",
+	     "int z(void){return 0;} int f(int (*orelse)(void)){ return orelse(); }\n"
+	     "int main(void){ return f(z); }\n"},
+	    {"asm goto label orelse",
+	     "int f(void){ __asm__ goto(\"jmp %l[orelse]\" ::: : orelse); orelse: return 0; }\n"},
+	    {"asm goto label defer",
+	     "int f(void){ __asm__ goto(\"jmp %l[defer]\" ::: : defer); defer: return 0; }\n"},
+	    {"nested fn named defer",
+	     "int main(void){ int defer(void){return 0;} return defer(); }\n"},
+	    {"nested fn named orelse",
+	     "int main(void){ int orelse(void){return 0;} return orelse(); }\n"},
+	    {"nested body defer ident",
+	     "int main(void){ int g(void){ int defer=0; return defer; } return g(); }\n"},
+	    {"nested param orelse",
+	     "int main(void){ int g(int orelse){return orelse;} return g(0); }\n"},
+	    {"nested param defer",
+	     "int main(void){ int g(int defer){return defer;} return g(0); }\n"},
+	};
+
+	for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+		char fname[64];
+		snprintf(fname, sizeof(fname), "soft_ident_%zu.c", i);
+		PrismResult r = prism_transpile_source(ok[i].code, fname, prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, ok[i].name);
+		prism_free(&r);
+	}
+
+	/* Still reject real operators inside nested function bodies. */
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "  int nested(void){ int x=0; defer { x=1; } return x; }\n"
+		    "  return nested();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_real_defer.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "nested body real defer still rejected");
+		prism_free(&r);
+	}
+}
+
 // Regression: nested function defined inside a statement expression (GNU),
 // assigned to a function pointer — same nested-fn rejection as a flat nested def.
 static void test_plain_c_stmt_expr_nested_function_false_positive(void) {
@@ -6692,6 +6754,7 @@ void run_safe_tests(void) {
 	test_plain_c_goto_tag_definition_false_positive();
 	test_plain_c_nested_function_passthrough();
 	test_nested_function_orelse_rejected();
+	test_soft_kw_ident_false_rejects();
 	test_plain_c_stmt_expr_nested_function_false_positive();
 	test_plain_c_if_switch_init_vla_false_positive();
 	test_plain_c_asm_goto_decl_false_positive();

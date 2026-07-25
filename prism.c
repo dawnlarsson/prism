@@ -1615,16 +1615,30 @@ static inline bool is_empty_known_function_call(Token *tok);
 static bool token_in_function_declarator_param_list(Token *tok);
 
 static inline bool is_defer_kw(Token *tok, Token *prev) {
-	return (tok->tag & TT_DEFER) && !is_empty_known_function_call(tok) &&
-	       (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
-	       !token_in_function_declarator_param_list(tok) &&
-	       !(prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE |
-					TT_TYPEOF | TT_BITINT)) ||
-			  is_known_typedef(prev) || match_ch(prev, '*'))) &&
-	       !(prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) ||
-			  _equal_2(prev, "&&"))) &&
-	       tok_next(tok) && !match_ch(tok_next(tok), ':') &&
-	       !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN));
+	if (!(tok->tag & TT_DEFER) || is_empty_known_function_call(tok)) return false;
+	if (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) return false;
+	if (token_in_function_declarator_param_list(tok)) return false;
+	/* Type / declarator predecessor → identifier (mirror: `int defer`, `T *defer`). */
+	if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE | TT_TYPEOF |
+				   TT_BITINT)) ||
+		     is_known_typedef(prev) || match_ch(prev, '*')))
+		return false;
+	/* Label / member / &&label → identifier. */
+	if (prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) ||
+		     _equal_2(prev, "&&")))
+		return false;
+	/* Expression-position predecessor: `return defer`, `f(defer`, `x=defer`,
+	 * `a[defer`. Real statements follow `;` `{` `}` `:` `else` / stmt-start. */
+	if (prev && (prev->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | TT_ASSIGN)))
+		return false;
+	if (prev && match_ch(prev, '(')) return false;
+	if (prev && match_ch(prev, '[')) return false;
+	if (prev && match_ch(prev, ',')) return false;
+	Token *nx = tok_next(tok);
+	if (!nx || match_ch(nx, ':') || (nx->tag & TT_ASSIGN)) return false;
+	/* Call-arg / asm-goto label tails: `f(defer)`, `(*defer)`, `:::: defer)`. */
+	if (match_ch(nx, ')') || match_ch(nx, ']') || match_ch(nx, ',')) return false;
+	return true;
 }
 
 static inline bool token_is_label_name(Token *tok) {
@@ -1705,7 +1719,26 @@ static inline bool orelse_kw_at(Token *t, Token *prev) {
 	if (!(t->tag & TT_ORELSE) || (prev && (prev->tag & TT_MEMBER))) return false;
 	if (is_known_function_call(t)) return false;
 	TypedefEntry *te = typedef_lookup(t);
-	return !te || orelse_shadow_is_kw(prev);
+	/* Variable/param named orelse: operator only after expression-ending prev.
+	 * prev==NULL at stmt-start `orelse;` is the identifier. */
+	if (te && te->is_shadow) return orelse_shadow_is_kw(prev);
+	/* Typedef named orelse: dual-use — type at stmt start, operator after expr. */
+	if (te && !te->is_shadow) return prev && orelse_shadow_is_kw(prev);
+	/* No typedef entry. Exclude type-specifier predecessors (`T orelse`,
+	 * `_BitInt(N) orelse`, `int orelse(`) and `return orelse` (operand).
+	 * Keep keyword after continue/break (TT_SKIP_DECL makes shadow_is_kw
+	 * false — mid-chain needs the keyword) and after call `)`. */
+	if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT |
+				   TT_ALIGNAS | TT_INLINE | TT_ATTR | TT_RETURN)) ||
+		     is_known_typedef(prev) || token_ends_sue_type_specifier(prev) ||
+		     close_paren_ends_type_specifier_ctor(prev)))
+		return false;
+	if (!prev) return true;
+	/* Prefer shadow_is_kw; also treat break/continue/goto as keyword predecessors
+	 * for mid-chain (`… orelse continue orelse …`). */
+	if (orelse_shadow_is_kw(prev)) return true;
+	if (prev->tag & (TT_BREAK | TT_CONTINUE | TT_GOTO)) return true;
+	return false;
 }
 
 static inline bool orelse_kw_at_bare(Token *t, Token *prev) {
@@ -4262,7 +4295,17 @@ static void check_paren_orelse_defer(Token *open, bool ctrl_cond) {
 					  "(it must appear at the top level of a declaration)");
 			}
 		}
-		if (FEAT(F_DEFER) && is_defer_kw(t, pi))
+		/* Paren scan: do not use is_defer_kw — it treats prev=='(' as
+		 * expression position (call args / declarators). Inside an
+		 * already-open paren group, a statement-shaped defer is always
+		 * illegal (`while ((defer …))`, `(defer (void)0, 1)`). */
+		if (FEAT(F_DEFER) && (t->tag & TT_DEFER) && !typedef_lookup(t) &&
+		    !(pi && (pi->tag & (TT_MEMBER | TT_GOTO))) &&
+		    !(pi && is_gnu_label_decl_head(pi)) && !(pi && _equal_2(pi, "&&")) &&
+		    tok_next(t) && !match_ch(tok_next(t), ':') &&
+		    !(tok_next(t)->tag & TT_ASSIGN) &&
+		    !match_ch(tok_next(t), ')') && !match_ch(tok_next(t), ',') &&
+		    !match_ch(tok_next(t), ']'))
 			error_tok(t, "defer cannot be at top level of a parenthesized expression");
 	}
 }
@@ -5391,15 +5434,10 @@ static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 
 static Token *handle_defer_keyword(Token *tok) {
 	if (!FEAT(F_DEFER)) return NULL;
-	if (is_empty_known_function_call(tok)) return NULL;
-	if (match_ch(tok_next(tok), ':') ||
-	    (last_emitted && ((last_emitted->tag & (TT_MEMBER | TT_GOTO)) ||
-			      is_gnu_label_decl_head(last_emitted) || _equal_2(last_emitted, "&&"))) ||
-	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
-	    (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) ||
-	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
-	    is_inside_attribute(tok))
-		return NULL;
+	/* Share the Phase-1 classifier so `int (*defer)(void)`, asm-goto labels,
+	 * and other identifier uses are not consumed as defer statements. */
+	if (!is_defer_kw(tok, last_emitted)) return NULL;
+	if (in_struct_body() || is_inside_attribute(tok)) return NULL;
 	bool in_sw = false;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
@@ -9296,8 +9334,10 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 		}
 		if (!stmt_expr_open && is_stmt_expr_open(inner)) stmt_expr_open = inner;
 		if (se_depth == 0 && cur_func >= 0 && prev_saved &&
-		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) && is_defer_kw(inner, prev_inner) &&
-		    !is_known_function_call(inner) && is_identifier_like(tok_next(inner)))
+		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) && (inner->tag & TT_DEFER) &&
+		    !typedef_lookup(inner) && !is_known_function_call(inner) &&
+		    is_identifier_like(tok_next(inner)) && !match_ch(tok_next(inner), ':') &&
+		    !(tok_next(inner)->tag & TT_ASSIGN))
 			error_tok(inner, ERR_DEFER_CTRL_PAREN);
 		if (se_depth == 0 && prev_saved && (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    is_orelse_kw(inner) && !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
@@ -9442,10 +9482,14 @@ static void p1d_probe_declaration(Token *tok,
 						Token *fn_open = func_meta[cur_func].body_open;
 						Token *fn_close = fn_open ? tok_match(fn_open) : NULL;
 						if (fn_open && fn_close) {
+							Token *prev_s = NULL;
 							for (Token *s = tok_next(fn_open);
 							     s && s != fn_close && s->kind != TK_EOF;
-							     s = tok_next(s)) {
-								if (is_defer_kw(s, NULL)) {
+							     prev_s = s, s = tok_next(s)) {
+								/* Pass prev so a nested function *named*
+								 * defer / a param named defer is not
+								 * mistaken for a defer statement. */
+								if (is_defer_kw(s, prev_s)) {
 									outer_uses_defer = true;
 									break;
 								}
@@ -9460,7 +9504,7 @@ static void p1d_probe_declaration(Token *tok,
 							for (Token *s = tok_next(body_open);
 							     s && s != nclose && s->kind != TK_EOF;
 							     prev_n = s, s = tok_next(s)) {
-								if (is_defer_kw(s, NULL) ||
+								if (is_defer_kw(s, prev_n) ||
 								    (is_orelse_kw_shadow(s) &&
 								     orelse_shadow_is_kw(prev_n))) {
 									nested_uses_prism = true;
@@ -9900,6 +9944,9 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	s->p1d_saw_raw = false;
 	s->p1d_saw_static = false;
 	s->p1d_ctrl_pending = false;
+	/* Predecessor of the first statement in the block is the '{', not a
+	 * stale token from before the brace (e.g. for/if's closing ')'). */
+	s->p1d_prev = tok;
 	s->tok = tok_next(tok);
 }
 
@@ -10071,7 +10118,8 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				   match_ch(pv, ']') ||
 				   (is_identifier_like(pv) &&
 				    !(pv->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF |
-						 TT_BITINT | TT_ALIGNAS | TT_INLINE | TT_ATTR)) &&
+						 TT_BITINT | TT_ALIGNAS | TT_INLINE | TT_ATTR | TT_RETURN |
+						 TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 				    !is_known_typedef(pv)));
 			if (cur_sid < scope_tree_count &&
 			    (scope_tree[cur_sid].is_enum || scope_tree[cur_sid].is_struct) && expr_ctx)

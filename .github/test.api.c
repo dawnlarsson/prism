@@ -1258,6 +1258,90 @@ static void test_cli_no_zeroinit_suppresses_bypass_warning(void) {
 #endif
 }
 
+/* A CFG diagnostic must carry a GCC-style severity label: `error:` when it is
+ * a hard error (default), `warning:` when downgraded by -fno-safety.  Without
+ * the label a -fno-safety warning reads as a hard error to humans and CI log
+ * scrapers even though the exit code is 0. */
+static void test_cli_diagnostic_severity_labels(void) {
+	printf("\n--- CLI Diagnostic Severity Labels ---\n");
+
+#ifdef _WIN32
+	passed += 4;
+	total += 4;
+	printf("[PASS] cli severity labels skipped on Windows (x4)\n");
+#else
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_sev_");
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX];
+	char stderr_path[PATH_MAX], stdout_path[PATH_MAX];
+
+	CHECK(dir != NULL, "create temp dir for severity-label regression");
+	if (!dir) return;
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_sev", dir);
+	snprintf(src_path, sizeof(src_path), "%s/jump.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/jump.o", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/jump.stderr", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/jump.stdout", dir);
+
+	if (build_test_prism_binary(prism_bin, "build prism binary for severity-label regression")) {
+		FILE *f = fopen(src_path, "w");
+		CHECK(f != NULL, "create severity-label source");
+		if (f) {
+			/* goto skips over an initialized declaration */
+			fputs("int main(void) {\n"
+			      "  goto L;\n"
+			      "  int x = 1;\n"
+			      "L: return 0;\n"
+			      "}\n",
+			      f);
+			fclose(f);
+
+			char sbuf[2048];
+
+			/* -fno-safety: downgraded to a warning. exit 0, object made,
+			 * stderr says "warning:" and not "error:". */
+			char *wargv[] = {prism_bin, "-fno-safety", "-c", "-o", obj_path, src_path,
+					 NULL};
+			int wst = run_exec_argv_capture(wargv, stdout_path, stderr_path);
+			CHECK_EQ(wst, 0, "severity: -fno-safety goto-over-init exits 0");
+			FILE *we = fopen(stderr_path, "r");
+			sbuf[0] = '\0';
+			if (we) {
+				size_t n = fread(sbuf, 1, sizeof(sbuf) - 1, we);
+				sbuf[n] = '\0';
+				fclose(we);
+			}
+			CHECK(strstr(sbuf, "warning:") != NULL,
+			      "severity: -fno-safety diagnostic carries 'warning:' label");
+			CHECK(strstr(sbuf, "error:") == NULL,
+			      "severity: -fno-safety diagnostic does not say 'error:'");
+
+			/* default (safety on): hard error. nonzero exit, stderr "error:". */
+			remove(obj_path);
+			char *eargv[] = {prism_bin, "-c", "-o", obj_path, src_path, NULL};
+			int est = run_exec_argv_capture(eargv, stdout_path, stderr_path);
+			CHECK(est != 0, "severity: default goto-over-init is a hard error (nonzero exit)");
+			FILE *ee = fopen(stderr_path, "r");
+			sbuf[0] = '\0';
+			if (ee) {
+				size_t n = fread(sbuf, 1, sizeof(sbuf) - 1, ee);
+				sbuf[n] = '\0';
+				fclose(ee);
+			}
+			CHECK(strstr(sbuf, "error:") != NULL,
+			      "severity: default diagnostic carries 'error:' label");
+		}
+	}
+
+	remove(stdout_path);
+	remove(stderr_path);
+	remove(obj_path);
+	remove(src_path);
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
 static void test_compile_matrix_smoke(void) {
 	printf("\n--- Compile Matrix Smoke ---\n");
 
@@ -9242,6 +9326,7 @@ void run_api_tests_2(void) {
 	test_cli_unknown_flag_fails_cleanly();
 	test_cli_paths_with_spaces();
 	test_cli_no_zeroinit_suppresses_bypass_warning();
+	test_cli_diagnostic_severity_labels();
 	test_compile_matrix_smoke();
 	test_compile_matrix_feature_corpus();
 	test_preprocess_spawn_failure_cleans_stderr_temp();
