@@ -9192,6 +9192,36 @@ static void test_p1_typedef_shadow_chain_smoke(void) {
 	prism_free(&r);
 }
 
+static void test_p1_binding_timeline_scope_stress(void) {
+	size_t cap = 256 * 1024;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "p1 timeline stress: malloc");
+	if (!code) return;
+	int pos = snprintf(code, cap, "typedef int x;\n");
+	for (int i = 0; i < 768 && pos > 0 && (size_t)pos < cap; i++)
+		pos += snprintf(code + pos,
+				cap - (size_t)pos,
+				"int f%d(int q){ int x; { struct x { int m; }; int x; "
+				"int a[2]; a[0]=q; q=a[x]; } return x+q; }\n",
+				i);
+	if (pos > 0 && (size_t)pos < cap)
+		pos += snprintf(code + pos, cap - (size_t)pos,
+				"int tail(void){ x value; return value; }\n");
+	CHECK(pos > 0 && (size_t)pos < cap, "p1 timeline stress: source fits");
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	PrismResult r = prism_transpile_source(code, "p1_timeline_stress.c", f);
+	free(code);
+	CHECK_EQ(r.status, PRISM_OK, "p1 timeline stress: disjoint scopes transpile");
+	if (r.output) {
+		CHECK(strstr(r.output, "x value = {0}") != NULL,
+		      "p1 timeline stress: file typedef restored after shadow chain");
+		CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+		      "p1 timeline stress: bounds chain remains visible in each scope");
+	}
+	prism_free(&r);
+}
+
 /* --- Raw-source / tokenizer specification gaps (library transpile_source path) --- */
 
 static void test_gap_transpile_source_digraph_defer(void) {
@@ -10305,6 +10335,7 @@ void run_parse_tests(void) {
 	test_p1_skip_stmt_do_if_trail_snapshot_limit();
 	test_p1_skip_deep_braceless_if_else_ok();
 	test_p1_typedef_shadow_chain_smoke();
+	test_p1_binding_timeline_scope_stress();
 	test_stmtexpr_c23_attr_ctrl_paren_zeroinit();
 	test_parser_abuse_product_matrix();
 	test_parser_abuse_v2_matrix();

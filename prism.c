@@ -7134,7 +7134,6 @@ static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t si
 	Token *id_list_open = tok_match(rparen);
 	if (!id_list_open || !is_knr_params(tok_next(id_list_open), lbrace)) return;
 	TD_SCOPE_SAVE();
-	td_scope_open = scope_tree[sid].open_tok_idx;
 	td_scope_close = scope_tree[sid].close_tok_idx;
 	for (Token *stmt = tok_next(rparen); stmt && stmt != lbrace && stmt->kind != TK_EOF;) {
 		stmt = skip_prep_dirs(stmt);
@@ -7268,7 +7267,6 @@ static void p1_scan_init_shadows(Token *open,
 	if (!init_tok) return;
 	if (init_tok->tag & TT_TYPEDEF) {
 		TD_SCOPE_SAVE();
-		td_scope_open = tok_idx(open);
 		td_scope_close = scope_close_idx;
 		parse_typedef_declaration(init_tok, brace_depth);
 		for (Token *tw = init_tok;
@@ -7292,7 +7290,6 @@ static void p1_scan_init_shadows(Token *open,
 		return;
 	bool saw_static = init_tok->tag & TT_STORAGE;
 	TD_SCOPE_SAVE();
-	td_scope_open = tok_idx(open);
 	td_scope_close = scope_close_idx;
 	TypeSpecResult type = parse_type_specifier(init_tok);
 	if (type.saw_type) {
@@ -9142,7 +9139,6 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		}
 		// Phase 1C: register parameter shadows at the function body scope
 		if (sid < scope_tree_count) {
-			td_scope_open = scope_tree[sid].open_tok_idx;
 			td_scope_close = scope_tree[sid].close_tok_idx;
 		}
 		Token *prev_tok = tok_walk_back(tok_idx(tok) - 1, WB_SKIP_NOISE);
@@ -9179,7 +9175,6 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	s->scope_stack[s->scope_depth] = sid;
 	if (sid < scope_tree_count && scope_tree[sid].is_init) s->p1d_init_brace_depth++;
 	if (sid < scope_tree_count) {
-		td_scope_open = scope_tree[sid].open_tok_idx;
 		td_scope_close = scope_tree[sid].close_tok_idx;
 	}
 
@@ -9222,10 +9217,8 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 	{
 		uint16_t cur_sid = s->scope_stack[s->scope_depth];
 		if (cur_sid > 0 && cur_sid < scope_tree_count) {
-			td_scope_open = scope_tree[cur_sid].open_tok_idx;
 			td_scope_close = scope_tree[cur_sid].close_tok_idx;
 		} else {
-			td_scope_open = 0;
 			td_scope_close = UINT32_MAX;
 		}
 	}
@@ -9262,7 +9255,6 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 	ps->p1d_switch_end = arena_alloc_uninit(&ctx->main_arena, 64 * sizeof(uint32_t));
 	ps->p1d_braceless_next_sid = scope_tree_count;
 	ps->skip_cache = arena_alloc(&ctx->main_arena, token_count * sizeof(uint32_t));
-	td_scope_open = 0;
 	td_scope_close = UINT32_MAX;
 	p1_raw_block_count = 0;
 
@@ -9398,7 +9390,6 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok)) {
 					Token *open = tok_match(prev_tok);
 					TD_SCOPE_SAVE();
-					td_scope_open = tok_idx(open);
 					td_scope_close = tok_idx(prev_tok);
 					p1_register_param_shadows(open, prev_tok, 0, 1, false);
 					TD_SCOPE_RESTORE();
@@ -9602,17 +9593,14 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (match_ch(ps->tok, '{') && tok_match(ps->tok)) {
 					Token *close = tok_match(ps->tok);
 					TD_SCOPE_SAVE();
-					td_scope_open = tok_idx(ps->tok);
 					td_scope_close = tok_idx(close);
 					for (Token *m = tok_next(ps->tok);
 					     m && m != close && m->kind != TK_EOF;) {
 						if (is_enum_kw(m)) {
-							uint32_t so = td_scope_open, sc = td_scope_close;
-							td_scope_open = _tds_o;
+							uint32_t sc = td_scope_close;
 							td_scope_close = _tds_c;
 							p1d_register_enum_at(
 							    m, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
-							td_scope_open = so;
 							td_scope_close = sc;
 						}
 						if (m->flags & TF_OPEN && tok_match(m)) {
@@ -10640,7 +10628,6 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	// output is call site. MSVC gets `unsigned __int64` (matches LLP64 size_t on
 	// x64).
 	if (FEAT(F_BOUNDS_CHECK)) {
-		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
 		c_parse_mark_unevaluated_brackets();
 		if (!already_has_bchk && is_msvc_cached) {
 			OUT_LIT("\n"
