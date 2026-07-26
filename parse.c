@@ -4320,6 +4320,21 @@ static PParseFunctionReturn pparse_function_return(PParseToken *tok) {
 			tok = pparse_next(tok);
 			continue;
 		}
+		/* `raw` is an initialization-suppression SPECIFIER, not part of the
+		 * return type — skip it exactly as storage-class specifiers are
+		 * skipped above.  Without this, `raw static int f(void){ defer ...;
+		 * return g(); }` captured a return type starting at `raw`, so the
+		 * synthesized defer return temporary was re-emitted as
+		 * `static int __prism_ret_0 = (g());` — a static initialized by a
+		 * function call, which is not valid C.  Found by the generative raw
+		 * product's raw-on-function-definition axis. */
+		if ((tok->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(tok)) {
+			PParseToken *after = pparse_skip_noise(pparse_next(tok));
+			if (pparse_is_raw_declaration_context(tok, after)) {
+				tok = after;
+				continue;
+			}
+		}
 		PParseToken *next = pparse_skip_noise(tok);
 		if (next == tok) break;
 		tok = next;

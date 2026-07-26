@@ -1728,6 +1728,78 @@ static void cm_gen_raw_product(void) {
 		prism_free(&rs);
 	}
 
+	/* O4: `raw` on a FUNCTION DEFINITION.  Every placement above ends in `;`,
+	 * so the product structurally could not generate this — and the A/B
+	 * coverage diff showed the try_strip_raw arms in emit_type_range and
+	 * emit_ret_type_tokens had no other reader once test.raw.c was retired.
+	 * Same differential oracle: with every `raw` deleted and zeroinit off, the
+	 * emission must be identical. */
+	{
+		static const struct {
+			const char *open, *close, *ret, *decls;
+		} fns[] = {
+		    {"int ", "(void)", "1", ""},
+		    {"int *", "(void)", "rp_a", "static int rp_a[4];"},
+		    {"int (*", "(void))[4]", "&rp_a", "static int rp_a[4];"},
+		    {"void ", "(void)", "", ""},
+		    {"rp_t ", "(void)", "(rp_t){0}", "typedef struct { int x; } rp_t;"},
+		};
+		static const char *bodies[] = {
+		    "", "rp_h();", "defer rp_h();", "defer { rp_h(); } rp_h();",
+		    "int lv; (void)lv;", "raw int lv; (void)lv;",
+		};
+		/* Leading specifier prefixes, paired with the SAME prefix minus its
+		 * `raw` tokens.  A function is not an object, so `raw` on a function
+		 * definition must be a pure no-op — that is the property, and it is
+		 * checked at identical features.  (Comparing against zeroinit-off, as
+		 * the declaration tiers do, would be wrong here: it would also
+		 * suppress zero-init of the body's own locals.) */
+		static const struct {
+			const char *with, *without;
+		} pre[] = {
+		    {"raw ", ""},
+		    {"raw raw ", ""},
+		    {"__attribute__((unused)) raw ", "__attribute__((unused)) "},
+		    {"raw static ", "static "},
+		    {"static raw ", "static "},
+		    {"raw inline ", "inline "},
+		    {"[[maybe_unused]] raw ", "[[maybe_unused]] "},
+		};
+		for (size_t f = 0; f < sizeof(fns) / sizeof(fns[0]); f++)
+			for (size_t b = 0; b < sizeof(bodies) / sizeof(bodies[0]); b++)
+				for (size_t q = 0; q < sizeof(pre) / sizeof(pre[0]); q++) {
+					char fsrc[1024], fref[1024];
+					const char *fmt = "void rp_h(void);\n%s\n%s%srp_fn%s { %s %s%s%s }\n";
+					snprintf(fsrc, sizeof(fsrc), fmt, fns[f].decls, pre[q].with,
+						 fns[f].open, fns[f].close, bodies[b],
+						 fns[f].ret[0] ? "return " : "", fns[f].ret,
+						 fns[f].ret[0] ? ";" : "");
+					snprintf(fref, sizeof(fref), fmt, fns[f].decls, pre[q].without,
+						 fns[f].open, fns[f].close, bodies[b],
+						 fns[f].ret[0] ? "return " : "", fns[f].ret,
+						 fns[f].ret[0] ? ";" : "");
+					st.cells++;
+					PrismResult ra = cm_tx(fsrc);
+					PrismResult rb = cm_tx(fref);
+					if (cm_ok(&ra) != cm_ok(&rb))
+						cm_note(&st,
+							"raw-fn accept/reject disagreement f=%zu b=%zu q=%zu",
+							f, b, q);
+					else if (cm_ok(&ra)) {
+						if (!ra.output || cm_kw(ra.output, "raw"))
+							cm_note(&st, "raw-fn token survives f=%zu b=%zu q=%zu",
+								f, b, q);
+						else if (!rb.output ||
+							 !cx_norm_equal(ra.output, rb.output))
+							cm_note(&st,
+								"raw on a function definition is not a no-op f=%zu b=%zu q=%zu",
+								f, b, q);
+					}
+					prism_free(&ra);
+					prism_free(&rb);
+				}
+	}
+
 	char name[320];
 	snprintf(name, sizeof(name), "completeness[gen/raw-product]: %ld cells, %ld bad, %ld gated-out%s%s",
 		 st.cells, st.bad, gated, st.bad ? " -- " : "", st.bad ? st.first : "");
@@ -1739,7 +1811,6 @@ static void cm_gen_raw_product(void) {
  * disambiguation torture).  Each program returns 0 iff its arithmetic held, so
  * the oracle is the program's own exit status — not a substring of the output.
  */
-#ifndef _WIN32
 /*
  * defer x complex return type x return-expression shape.
  *
@@ -1840,6 +1911,7 @@ static void cm_gen_defer_ret_shape(void) {
 	cm_report("gen/defer-ret-shape", &st);
 }
 
+#ifndef _WIN32
 /*
  * Raw string literals — R"delim(...)delim" — the tokenizer feature that shares
  * a prefix with the `raw` keyword and nothing else (absorbs test.raw.c's
