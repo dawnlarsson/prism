@@ -1279,6 +1279,44 @@ static void test_bounds_check_declarator_contexts(void) {
 		prism_free(&r);
 	}
 
+	// Bug 3b: an ordinary local pointer shadows a file-scope tracked array.
+	// The array registry must honor the C identifier binding or it will wrap
+	// `g[i]` using sizeof(pointer)/sizeof(pointer[0]) from the wrong object.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "int f(int i){int n=g[i]; {int *g=0; n+=g[i];} return n+g[i];}\n",
+		    "bc_reg_local_ptr_shadow.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-local-ptr-shadow: transpiles");
+		if (r.output) {
+			int hits = 0;
+			const char *p = r.output;
+			while ((p = strstr(p, "g[__prism_bchk"))) { hits++; p++; }
+			CHECK(hits == 2,
+			      "bc-reg-local-ptr-shadow: pointer blocks inner use, outer resumes");
+		}
+		prism_free(&r);
+	}
+
+	// Bug 3c: a block-scope incomplete extern declaration hides the complete
+	// file-scope type for sizeof purposes. Reusing the outer bounds would emit
+	// sizeof(g) where the visible `g` has incomplete type and break compilation.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "int f(int i){extern int g[]; return g[i];}\n",
+		    "bc_reg_incomplete_extern_shadow.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-incomplete-extern-shadow: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "g[__prism_bchk") == NULL,
+			      "bc-reg-incomplete-extern-shadow: incomplete type blocks outer bounds");
+		prism_free(&r);
+	}
+
 	// Bug 4: nested prototype inside a function body.
 	// `extern int f(int g[30]);` inside a body — the declarator `g[30]`
 	// would otherwise be wrapped (VLA-mismatch warning + potential trap).

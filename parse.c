@@ -1992,6 +1992,10 @@ static Token *tokenize(File *file) {
 				t->ch0 = (uint8_t)norm[0];
 			}
 			classify_punct(t);
+			/* Array-bracket grammar context is cached in parse_data after
+			 * tokenization. The pool survives library-mode resets, so clear
+			 * this one reused punctuation word at creation. */
+			if (t->ch0 == '[') t->parse_data = 0;
 			p += abs_len;
 			continue;
 		}
@@ -2697,6 +2701,30 @@ typedef struct {
 	bool is_const : 1;
 } DeclResult;
 
+/* Canonical object shape derived from a C type-specifier + declarator pair.
+ * Consumers decide policy (zero-init, diagnostics, emission); parse.c owns
+ * the language question of what object/function shape was declared. */
+typedef struct {
+	bool effective_vla : 1;
+	bool is_aggregate : 1;
+	bool is_union_type : 1;
+	bool is_func_type : 1;
+} CDeclShape;
+
+typedef enum {
+	C_FUNC_RETURN_NONE,
+	C_FUNC_RETURN_VOID,
+	C_FUNC_RETURN_VALUE,
+} CFunctionReturnKind;
+
+typedef struct {
+	Token *type_start;
+	Token *type_end;
+	Token *suffix_start;
+	Token *suffix_end;
+	CFunctionReturnKind kind;
+} CFunctionReturn;
+
 typedef enum {
 	TDK_TYPEDEF,
 	TDK_SHADOW,
@@ -2804,6 +2832,11 @@ static PRISM_THREAD_LOCAL uint32_t td_scope_close = UINT32_MAX;
 static PRISM_THREAD_LOCAL bool
     p1_typedef_annotated; // true after p1_annotate_typedefs(); enables O(1) is_known_typedef
 static PRISM_THREAD_LOCAL HashMap c_function_symbols;
+typedef enum {
+	CFS_NONE = 0,
+	CFS_FUNCTION = 1,
+	CFS_AGGREGATE_RETURN = 2,
+} CFunctionSymbolKind;
 /* Nonzero once any `raw {` brace was annotated this TU — gates scope walks. */
 static PRISM_THREAD_LOCAL uint32_t p1_raw_block_count;
 
@@ -2825,15 +2858,15 @@ static inline PRISM_PURE uint32_t token_name_hash(Token *tok) {
 	return tok->parse_data;
 }
 
-static inline PRISM_PURE void *c_function_symbol(Token *tok) {
-	if (!tok || !c_function_symbols.buckets) return NULL;
-	return hashmap_get_hashed(
+static inline PRISM_PURE CFunctionSymbolKind c_function_symbol(Token *tok) {
+	if (!tok || !c_function_symbols.buckets) return CFS_NONE;
+	return (CFunctionSymbolKind)(intptr_t)hashmap_get_hashed(
 	    &c_function_symbols, tok_loc(tok), tok->len, token_name_hash(tok));
 }
 
-static inline void c_function_symbol_put(Token *tok, void *kind) {
+static inline void c_function_symbol_put(Token *tok, CFunctionSymbolKind kind) {
 	hashmap_put_hashed(
-	    &c_function_symbols, tok_loc(tok), tok->len, kind, token_name_hash(tok));
+	    &c_function_symbols, tok_loc(tok), tok->len, (void *)(intptr_t)kind, token_name_hash(tok));
 }
 
 static inline void c_function_symbols_reset(void) {
@@ -2977,7 +3010,7 @@ typedef struct {
 	uint8_t array_rank;
 	bool array_dim_complete : 1;
 	bool is_vla_var : 1;
-	bool is_param : 1;
+	bool blocks_outer : 1;
 } BoundsArrayEntry;
 
 typedef struct {
@@ -3137,7 +3170,7 @@ static PRISM_PURE BoundsArrayEntry *ba_lookup_timeline(void *val, uint32_t cur) 
 }
 
 static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t array_rank,
-				     bool dim_complete, bool is_vla_var, bool is_param) {
+				     bool dim_complete, bool is_vla_var, bool blocks_outer) {
 	uint32_t hash = fast_hash(name, len);
 	int existing = hashmap_index_hashed(&bounds_array_table.name_map, name, len, hash);
 	if (existing >= 0) {
@@ -3147,7 +3180,7 @@ static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t 
 			prev->array_rank = array_rank;
 			prev->array_dim_complete = dim_complete;
 			prev->is_vla_var = is_vla_var;
-			prev->is_param = is_param;
+			prev->blocks_outer = blocks_outer;
 			return;
 		}
 	}
@@ -3169,7 +3202,7 @@ static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t 
 	e->array_rank = array_rank;
 	e->array_dim_complete = dim_complete;
 	e->is_vla_var = is_vla_var;
-	e->is_param = is_param;
+	e->blocks_outer = blocks_outer;
 	hashmap_put_hashed(
 	    &bounds_array_table.name_map, name, len, (void *)(intptr_t)(new_index + 1), hash);
 	bounds_array_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
@@ -3326,6 +3359,59 @@ static inline TypedefEntry *c_register_vla_var(Token *tok, int scope_depth) {
 	return c_register_binding(tok, scope_depth, TDK_VLA_VAR);
 }
 
+enum {
+	C_BIND_FUNC = 1u << 0,
+	C_BIND_CONST = 1u << 1,
+	C_BIND_VOLATILE = 1u << 2,
+	C_BIND_VOLATILE_MEMBER = 1u << 3,
+	C_BIND_ATOMIC = 1u << 4,
+	C_BIND_AGGREGATE = 1u << 5,
+};
+
+static inline void c_binding_apply_traits(TypedefEntry *entry, unsigned traits) {
+	if (!entry) return;
+	if (traits & C_BIND_FUNC) entry->is_func = true;
+	if (traits & C_BIND_CONST) entry->is_const = true;
+	if (traits & C_BIND_VOLATILE) entry->is_volatile = true;
+	if (traits & C_BIND_VOLATILE_MEMBER) entry->has_volatile_member = true;
+	if (traits & C_BIND_ATOMIC) entry->is_atomic = true;
+	if (traits & C_BIND_AGGREGATE) entry->is_aggregate = true;
+}
+
+/* Register or update an ordinary identifier without exposing table insertion
+ * order to consumers. Multiple traits intentionally collapse to one lookup. */
+static TypedefEntry *c_register_shadow_traits(Token *tok, int scope_depth, unsigned traits) {
+	TypedefEntry *entry = c_register_shadow(tok, scope_depth);
+	c_binding_apply_traits(entry, traits);
+	return entry;
+}
+
+static TypedefEntry *c_register_vla_binding(Token *tok, int scope_depth, bool is_param) {
+	TypedefEntry *entry = c_register_vla_var(tok, scope_depth);
+	if (entry && is_param) entry->is_param = true;
+	return entry;
+}
+
+static TypedefEntry *c_register_struct_tag(Token *tok,
+					   int scope_depth,
+					   bool has_vla,
+					   bool is_aggregate,
+					   bool has_volatile_member) {
+	int before = typedef_table.count;
+	typedef_add_entry(tok_loc(tok), tok->len, scope_depth, TDK_STRUCT_TAG, has_vla, false);
+	TypedefEntry *entry = NULL;
+	if (typedef_table.count > before) {
+		entry = &typedef_table.entries[typedef_table.count - 1];
+		entry->token_index = tok_idx(tok);
+	} else {
+		entry = c_binding_entry(tok, false);
+	}
+	c_binding_apply_traits(entry,
+			       (is_aggregate ? C_BIND_AGGREGATE : 0) |
+				   (has_volatile_member ? C_BIND_VOLATILE_MEMBER : 0));
+	return entry;
+}
+
 static inline bool is_soft_keyword_identifier(Token *tok);
 
 static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
@@ -3387,6 +3473,28 @@ static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 	return tag_fallback;
 }
 
+typedef enum {
+	C_BINDING_NONE,
+	C_BINDING_TYPE,
+	C_BINDING_VALUE,
+} CIdentifierBindingKind;
+
+static PRISM_PURE CIdentifierBindingKind c_identifier_binding_kind(Token *tok) {
+	TypedefEntry *entry = typedef_lookup(tok);
+	if (!entry) return C_BINDING_NONE;
+	return entry->is_shadow || entry->is_enum_const || entry->is_vla_var ? C_BINDING_VALUE
+									   : C_BINDING_TYPE;
+}
+
+static inline PRISM_PURE bool c_token_has_binding(Token *tok) {
+	return c_identifier_binding_kind(tok) != C_BINDING_NONE;
+}
+
+static PRISM_PURE bool c_token_is_const_object(Token *tok) {
+	TypedefEntry *entry = typedef_lookup(tok);
+	return entry && entry->is_shadow && entry->is_const;
+}
+
 // Enforces ISO C11 §6.2.3 namespace separation: tag names live in a
 static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
@@ -3430,7 +3538,7 @@ static inline PRISM_PURE int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
 	if (!e) {
 		BoundsArrayEntry *be = bounds_array_lookup(tok);
-		if (!be || be->is_param) return 0;
+		if (!be || be->blocks_outer) return 0;
 		return TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
 	}
 	if (e->is_enum_const) return TDF_ENUM_CONST;
@@ -3442,7 +3550,7 @@ static inline PRISM_PURE int typedef_flags(Token *tok) {
 		 * file-scope array of the same name. */
 		if (!(fl & TDF_ARRAY) && !e->is_param) {
 			BoundsArrayEntry *be = bounds_array_lookup(tok);
-			if (be && !be->is_param) fl |= TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
+			if (be && !be->blocks_outer) fl |= TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
 		}
 		return fl;
 	}
@@ -3556,6 +3664,85 @@ static PRISM_PURE uint8_t array_rank_for_tok(Token *t) {
 	return 0;
 }
 
+typedef struct {
+	uint8_t rank;
+	bool tracked : 1;
+	bool dim_complete : 1;
+} CArrayBindingInfo;
+
+/* Resolve the two parser-owned binding stores as one semantic array query.
+ * Ordinary bindings take precedence when they explicitly block array use. */
+static PRISM_PURE CArrayBindingInfo c_array_binding_info(Token *tok) {
+	CArrayBindingInfo info = {.dim_complete = true};
+	if (!is_identifier_like(tok)) return info;
+	TypedefEntry *binding = typedef_lookup(tok);
+	if (binding && (binding->is_param || binding->is_enum_const)) return info;
+	BoundsArrayEntry *array = bounds_array_lookup(tok);
+	if (array) {
+		info.rank = array->array_rank;
+		info.tracked = !array->blocks_outer;
+		info.dim_complete = array->array_dim_complete;
+		return info;
+	}
+	if (binding && (binding->is_array || binding->is_vla_var)) {
+		info.rank = binding->array_rank;
+		info.tracked = true;
+		info.dim_complete = binding->array_dim_complete;
+	}
+	return info;
+}
+
+static PRISM_PURE bool c_array_binding_dim_complete(Token *tok) {
+	CArrayBindingInfo info = c_array_binding_info(tok);
+	return info.tracked && info.dim_complete;
+}
+
+static void c_register_array_binding(Token *tok,
+				     uint8_t rank,
+				     bool dim_complete,
+				     bool is_vla,
+				     bool blocks_outer) {
+	bounds_array_add(
+	    tok_loc(tok), tok->len, tok_idx(tok), rank, dim_complete, is_vla, blocks_outer);
+}
+
+static void c_register_array_shadow(Token *tok) {
+	c_register_array_binding(tok, 0, false, false, true);
+}
+
+static void c_mark_shadow_array(Token *tok, uint8_t rank, bool dim_complete) {
+	TypedefEntry *entry = c_shadow_entry(tok);
+	if (!entry) return;
+	entry->is_array = true;
+	entry->array_rank = rank;
+	entry->array_dim_complete = dim_complete;
+}
+
+/* VLA registration changes the ordinary binding kind. Preserve array facts
+ * recorded earlier in the declaration without relying on table tail order. */
+static void c_register_vla_preserving_array(Token *tok, int scope_depth) {
+	CArrayBindingInfo saved = {.dim_complete = true};
+	BoundsArrayEntry *array = bounds_array_entry_for_token(tok);
+	if (array) {
+		saved.rank = array->array_rank;
+		saved.tracked = !array->blocks_outer;
+		saved.dim_complete = array->array_dim_complete;
+	} else {
+		TypedefEntry *binding = c_binding_entry(tok, false);
+		if (binding && binding->is_shadow && binding->is_array) {
+			saved.rank = binding->array_rank;
+			saved.tracked = true;
+			saved.dim_complete = binding->array_dim_complete;
+		}
+	}
+	TypedefEntry *vla = c_register_vla_var(tok, scope_depth);
+	if (!saved.tracked || !vla) return;
+	vla->is_array = true;
+	vla->array_rank = saved.rank;
+	vla->array_dim_complete = saved.dim_complete;
+	c_register_array_binding(tok, saved.rank, saved.dim_complete, true, false);
+}
+
 static PRISM_PURE bool is_type_keyword(Token *tok) {
 	if (tok->tag & TT_TYPE) return true;
 	if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD) return false;
@@ -3577,6 +3764,33 @@ static inline bool soft_keyword_decl_name_boundary(Token *tok) {
 static inline PRISM_PURE bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || is_soft_keyword_identifier(tok) || (tok->flags & TF_RAW) ||
 	       (tok->tag & (TT_DEFER | TT_ORELSE));
+}
+
+static inline bool c_token_is_label_name(Token *tok) {
+	Token *colon = tok ? skip_noise(tok_next(tok)) : NULL;
+	return tok && is_identifier_like(tok) && colon && match_ch(colon, ':') &&
+	       !(tok_next(colon) && match_ch(tok_next(colon), ':')) && !(tok->tag & (TT_CASE | TT_DEFAULT));
+}
+
+static bool c_is_strict_bare_function_call(Token *start, Token *end) {
+	Token *tok = skip_prep_dirs_until(start, end);
+	if (!tok || tok == end || !is_valid_varname(tok) || is_type_keyword(tok)) return false;
+	Token *function = tok;
+	tok = skip_prep_dirs_until(tok_next(function), end);
+	if (!tok || tok == end || !match_ch(tok, '(') || !(tok->flags & TF_OPEN)) return false;
+	Token *close = tok_match(tok);
+	return close && skip_prep_dirs_until(tok_next(close), end) == end &&
+	       c_function_symbol(function) != CFS_NONE;
+}
+
+static bool c_type_range_has_nonempty_array_dim(Token *start, Token *end) {
+	for (Token *tok = start; tok && tok != end; tok = tok_next(tok)) {
+		if (match_ch(tok, '[') && (tok->flags & TF_OPEN)) {
+			Token *next = tok_next(tok);
+			if (next && !match_ch(next, ']')) return true;
+		}
+	}
+	return false;
 }
 
 static inline PRISM_PURE bool is_expr_ending(Token *t) {
@@ -3775,6 +3989,663 @@ static Token *tok_walk_back(uint32_t start_idx, unsigned flags) {
 	next:;
 	}
 	return NULL;
+}
+
+static bool c_function_decl_returns_aggregate(Token *function_name) {
+	bool saw_aggregate = false, saw_pointer = false, saw_enum = false;
+	for (Token *t = tok_walk_back(tok_idx(function_name), WB_PAST_NOISE); t;
+	     t = tok_walk_back(tok_idx(t), WB_PAST_NOISE)) {
+		if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}') || match_ch(t, ')')) break;
+		if (match_ch(t, '*')) {
+			saw_pointer = true;
+			continue;
+		}
+		if (t->tag & TT_SUE) {
+			if (is_enum_kw(t))
+				saw_enum = true;
+			else
+				saw_aggregate = true;
+			continue;
+		}
+		if (typedef_flags(t) & TDF_AGGREGATE) {
+			saw_aggregate = true;
+			continue;
+		}
+		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEOF | TT_ATTR)) continue;
+		if (is_known_typedef(t)) continue;
+		if (t->kind == TK_IDENT || t->kind == TK_PUNCT) break;
+	}
+	return saw_aggregate && !saw_pointer && !saw_enum;
+}
+
+static bool c_expr_is_aggregate_value(Token *start, Token *end) {
+	if (!start || start == end) return false;
+	Token *t = start, *limit = end;
+	while (match_ch(t, '(') && tok_match(t) && tok_next(tok_match(t)) == limit) {
+		limit = tok_match(t);
+		t = tok_next(t);
+		if (!t || t == limit) return false;
+	}
+	if (t->kind == TK_IDENT && tok_next(t) == limit) {
+		TypedefEntry *entry = typedef_lookup(t);
+		return entry && entry->is_shadow && entry->is_aggregate && !entry->is_array;
+	}
+	if (t->kind == TK_IDENT) {
+		Token *open = tok_next(t);
+		if (open && match_ch(open, '(') && tok_match(open) && tok_next(tok_match(open)) == limit)
+			return c_function_symbol(t) == CFS_AGGREGATE_RETURN;
+	}
+	if (match_ch(t, '(')) {
+		Token *inner = skip_noise(tok_next(t));
+		if (!inner) return false;
+		if (inner->tag & TT_SUE) return !is_enum_kw(inner);
+		if (typedef_flags(inner) & TDF_AGGREGATE) return true;
+	}
+	return false;
+}
+
+static Token *c_skip_function_attrs_and_cc(Token *tok) {
+	while (tok && tok->kind != TK_EOF) {
+		Token *next = skip_noise(tok);
+		if (next != tok) {
+			tok = next;
+			continue;
+		}
+		if (tok->flags & TF_MS_CC) {
+			tok = tok_next(tok);
+			continue;
+		}
+		break;
+	}
+	return tok;
+}
+
+/* Pointer stars and their qualifiers are return-type material. Function
+ * attributes are intentionally not skipped here: they terminate that range. */
+static Token *c_skip_return_pointers(Token *tok, bool *is_void) {
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->kind == TK_PREP_DIR) {
+			tok = tok_next(tok);
+			continue;
+		}
+		if (match_ch(tok, '*')) {
+			tok = tok_next(tok);
+			if (is_void) *is_void = false;
+			continue;
+		}
+		if ((tok->tag & TT_QUALIFIER) && !(tok->tag & TT_ATTR) &&
+		    !is_soft_keyword_identifier(tok)) {
+			tok = tok_next(tok);
+			if (is_void) *is_void = false;
+			continue;
+		}
+		break;
+	}
+	return tok;
+}
+
+static Token *c_return_type_end_before_attrs(Token *start, Token *parsed_end) {
+	Token *t = start;
+	while (t && t != parsed_end && t->kind != TK_EOF) {
+		if ((t->tag & TT_ATTR) || is_c23_attr(t) || (t->flags & TF_MS_CC)) {
+			Token *p = t;
+			while (p && p != parsed_end) {
+				if (p->tag & TT_ATTR) {
+					Token *next = tok_next(p);
+					p = next && next != parsed_end && match_ch(next, '(') && tok_match(next)
+						? tok_next(tok_match(next))
+						: next;
+					continue;
+				}
+				if (is_c23_attr(p) && tok_match(p)) {
+					p = tok_next(tok_match(p));
+					continue;
+				}
+				if (p->flags & TF_MS_CC) {
+					p = tok_next(p);
+					continue;
+				}
+				return parsed_end;
+			}
+			return t;
+		}
+		t = (t->flags & TF_OPEN) && tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+	}
+	return parsed_end;
+}
+
+static CFunctionReturn c_parse_function_return(Token *tok) {
+	CFunctionReturn result = {0};
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->tag & (TT_SKIP_DECL | TT_INLINE)) {
+			tok = tok_next(tok);
+			continue;
+		}
+		Token *next = skip_noise(tok);
+		if (next == tok) break;
+		tok = next;
+	}
+	if (!tok || tok->kind == TK_EOF) return result;
+	Token *type_start = tok;
+	TypeSpecResult type = parse_type_specifier(tok);
+	if (!type.saw_type) return result;
+	bool is_void = type.has_void;
+	Token *trimmed = c_return_type_end_before_attrs(type_start, type.end);
+	if (is_void) {
+		for (Token *t = type_start; t && t != trimmed && t->kind != TK_EOF; t = tok_next(t)) {
+			if (equal(t, "void") || is_void_typedef(t) || (t->tag & TT_TYPEOF)) break;
+			if ((t->tag & TT_TYPE) && !equal(t, "void")) {
+				is_void = false;
+				break;
+			}
+		}
+	}
+	if (type.is_struct) {
+		for (Token *t = type_start; t && t != trimmed && t->kind != TK_EOF; t = tok_next(t))
+			if (match_ch(t, '{')) return result;
+	}
+
+	tok = c_skip_return_pointers(trimmed, &is_void);
+	Token *ret_end = tok;
+	tok = c_skip_function_attrs_and_cc(tok);
+	if (tok && is_valid_varname(tok) && tok_next(tok) && match_ch(tok_next(tok), '(')) {
+		result.kind = is_void ? C_FUNC_RETURN_VOID : C_FUNC_RETURN_VALUE;
+		if (!is_void) {
+			result.type_start = type_start;
+			result.type_end = ret_end;
+		}
+		return result;
+	}
+
+	if (!tok || !match_ch(tok, '(')) return result;
+	Token *outer_open = tok;
+	Token *inner = c_skip_return_pointers(tok_next(tok), &is_void);
+	inner = c_skip_function_attrs_and_cc(inner);
+	while (inner && match_ch(inner, '(')) {
+		inner = c_skip_return_pointers(tok_next(inner), NULL);
+		inner = c_skip_function_attrs_and_cc(inner);
+	}
+	if (!inner || !is_valid_varname(inner) || !tok_next(inner)) return result;
+	if (match_ch(tok_next(inner), '(')) {
+		Token *after_params = skip_balanced_group(tok_next(inner));
+		if (after_params && match_ch(after_params, ')')) {
+			Token *decl_end = skip_balanced_group(outer_open);
+			while (decl_end && (decl_end->flags & TF_OPEN) && !match_ch(decl_end, '{') &&
+			       !match_ch(decl_end, '(') && !(decl_end->flags & TF_C23_ATTR))
+				decl_end = skip_balanced_group(decl_end);
+			result.kind = is_void ? C_FUNC_RETURN_VOID : C_FUNC_RETURN_VALUE;
+			if (!is_void) {
+				result.type_start = type_start;
+				result.type_end = inner;
+				result.suffix_start = after_params;
+				result.suffix_end = decl_end;
+			}
+			return result;
+		}
+	} else if (tok_next(inner) == tok_match(outer_open)) {
+		Token *params = tok_next(tok_next(inner));
+		if (params && match_ch(params, '(')) {
+			result.kind = is_void ? C_FUNC_RETURN_VOID : C_FUNC_RETURN_VALUE;
+			if (!is_void) {
+				result.type_start = type_start;
+				result.type_end = inner;
+			}
+		}
+	}
+	return result;
+}
+
+/* Reusable classification for an array bracket's surrounding C grammar.
+ * The result lives in the otherwise-unused parse_data word of an ordinary
+ * '[' token. Stream-splice tokens retain their jump target and simply take
+ * the uncached path. */
+enum {
+	C_BRACKET_COMPOUND_LITERAL = 1u << 0,
+	C_BRACKET_DESIGNATOR = 1u << 1,
+	C_BRACKET_GNU_RANGE = 1u << 2,
+	C_BRACKET_ALIGNOF_TYPE = 1u << 3,
+	C_BRACKET_GENERIC_ASSOC_TYPE = 1u << 4,
+	C_BRACKET_CONTEXT_KNOWN = 1u << 31,
+};
+
+static bool c_bracket_in_compound_literal_type(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!close) return false;
+	Token *t = tok_next(close);
+	while (t && t->kind != TK_EOF) {
+		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		if ((t->flags & TF_C23_ATTR) && tok_match(t)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		break;
+	}
+	if (!t || !match_ch(t, ')')) return false;
+	Token *after = skip_noise(tok_next(t));
+	return after && match_ch(after, '{');
+}
+
+static bool c_bracket_in_offsetof_member(Token *open_bracket) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth == 0 && match_ch(t, '(')) {
+				Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+				if (!before) return false;
+				return (before->kind == TK_IDENT || before->kind == TK_KEYWORD) &&
+				       ((before->len == 8 &&
+					 prism_memeq_static(tok_loc(before), "offsetof", 8)) ||
+					(before->len == 18 &&
+					 prism_memeq_static(tok_loc(before), "__builtin_offsetof", 18)));
+			}
+			if (depth > 0) depth--;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
+	}
+	return false;
+}
+
+static bool c_bracket_has_leading_member_designator(Token *member_name) {
+	Token *name = member_name;
+	while (name && is_identifier_like(name)) {
+		Token *member = tok_walk_back(tok_idx(name), WB_PAST_NOISE);
+		if (!member || !(member->tag & TT_MEMBER) || !match_ch(member, '.')) return false;
+		Token *left = tok_walk_back(tok_idx(member), WB_PAST_NOISE);
+		if (!left || match_ch(left, '{') || match_ch(left, ',')) return true;
+		if (!is_identifier_like(left)) return false;
+		name = left;
+	}
+	return false;
+}
+
+static bool c_bracket_is_designator_index(Token *open_bracket) {
+	Token *prev = tok_walk_back(tok_idx(open_bracket), WB_PAST_NOISE);
+	if (!prev) return false;
+	if (match_ch(prev, '{') || match_ch(prev, ',') || match_ch(prev, ']')) return true;
+	if (!is_identifier_like(prev)) return false;
+	Token *before = tok_walk_back(tok_idx(prev), WB_PAST_NOISE);
+	if (before && (before->tag & TT_MEMBER))
+		return c_bracket_has_leading_member_designator(prev) ||
+		       c_bracket_in_offsetof_member(open_bracket);
+	return before && match_ch(before, ',') && c_bracket_in_offsetof_member(open_bracket);
+}
+
+static bool c_bracket_contains_gnu_range(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!close) return false;
+	for (Token *t = tok_next(open_bracket); t && t != close; t = tok_next(t)) {
+		if (t->kind == TK_PUNCT && t->len == 3 && t->ch0 == '.' && tok_loc(t)[1] == '.' &&
+		    tok_loc(t)[2] == '.')
+			return true;
+		if ((t->flags & TF_OPEN) && tok_match(t)) t = tok_match(t);
+	}
+	return false;
+}
+
+static bool c_bracket_in_alignof_type_operand(Token *open_bracket) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth == 0 && match_ch(t, '(')) {
+				Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+				if (!before) return false;
+				if ((before->kind == TK_IDENT || before->kind == TK_KEYWORD) &&
+				    ((before->len == 8 &&
+				      prism_memeq_static(tok_loc(before), "_Alignof", 8)) ||
+				     (before->len == 7 &&
+				      prism_memeq_static(tok_loc(before), "alignof", 7))))
+					return true;
+				if ((before->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) ||
+				    ((before->tag & TT_TYPE) && equal(before, "_Atomic")))
+					continue;
+				return false;
+			}
+			if (depth > 0) depth--;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
+	}
+	return false;
+}
+
+static bool c_bracket_in_generic_association_type(Token *open_bracket) {
+	Token *gen_open = NULL;
+	for (uint32_t i = tok_idx(open_bracket); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (!(t->flags & TF_OPEN) || !match_ch(t, '(') || !tok_match(t) ||
+		    tok_idx(tok_match(t)) <= tok_idx(open_bracket))
+			continue;
+		Token *before = tok_walk_back(tok_idx(t), WB_ATTR_NOISE);
+		if (before && (before->tag & TT_GENERIC)) {
+			gen_open = t;
+			break;
+		}
+	}
+	if (!gen_open || !tok_match(gen_open)) return false;
+	Token *gen_close = tok_match(gen_open);
+	int depth = 0, commas = 0;
+	for (Token *t = tok_next(gen_open); t && t != open_bracket; t = tok_next(t)) {
+		if (t->flags & TF_OPEN)
+			depth++;
+		else if (t->flags & TF_CLOSE) {
+			if (depth > 0) depth--;
+		} else if (depth == 0 && match_ch(t, ','))
+			commas++;
+	}
+	if (commas < 1) return false;
+	depth = 0;
+	for (Token *t = open_bracket; t && t != gen_close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN)
+			depth++;
+		else if (t->flags & TF_CLOSE) {
+			if (depth > 0) depth--;
+		} else if (depth == 0 && match_ch(t, ':'))
+			return true;
+		else if (depth == 0 && match_ch(t, ','))
+			return false;
+	}
+	return false;
+}
+
+static uint32_t c_array_bracket_context(Token *open_bracket) {
+	if (!(open_bracket->flags & TF_LINK_JUMP) &&
+	    (open_bracket->parse_data & C_BRACKET_CONTEXT_KNOWN))
+		return open_bracket->parse_data;
+	uint32_t bits = 0;
+	if (c_bracket_in_compound_literal_type(open_bracket)) bits |= C_BRACKET_COMPOUND_LITERAL;
+	if (c_bracket_is_designator_index(open_bracket)) {
+		bits |= C_BRACKET_DESIGNATOR;
+		if (c_bracket_contains_gnu_range(open_bracket)) bits |= C_BRACKET_GNU_RANGE;
+	}
+	if (c_bracket_in_alignof_type_operand(open_bracket)) bits |= C_BRACKET_ALIGNOF_TYPE;
+	if (c_bracket_in_generic_association_type(open_bracket)) bits |= C_BRACKET_GENERIC_ASSOC_TYPE;
+	bits |= C_BRACKET_CONTEXT_KNOWN;
+	if (!(open_bracket->flags & TF_LINK_JUMP)) open_bracket->parse_data = bits;
+	return bits;
+}
+
+static bool c_expr_maybe_nonconstant(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			t = tok_match(t);
+			continue;
+		}
+		if (t->kind != TK_IDENT) continue;
+		if (is_type_keyword(t) ||
+		    (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR | TT_STORAGE |
+			       TT_ALIGNAS | TT_BITINT)))
+			continue;
+		if (typedef_lookup(t) || is_known_enum_const(t)) continue;
+		return true;
+	}
+	return false;
+}
+
+static Token *c_last_comma_operand(Token *open_paren, Token *close_paren) {
+	Token *segment = tok_next(open_paren);
+	for (Token *t = segment; t && t != close_paren; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) segment = tok_next(t);
+	}
+	return segment;
+}
+
+static inline bool c_is_value_name_token(Token *t) {
+	/* Soft type spellings (`_Float32`, `bool`, …) remain valid declarator
+	 * names after an established type. */
+	return t && is_valid_varname(t) &&
+	       (!(t->tag & TT_TYPE) || is_soft_keyword_identifier(t)) && !is_known_typedef(t);
+}
+
+static inline bool c_is_unevaluated_operand_intro(Token *t) {
+	return (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF) ||
+	       (t->kind == TK_IDENT && t->len == 18 &&
+		prism_memeq_static(tok_loc(t), "__builtin_offsetof", 18));
+}
+
+static void c_tag_brackets_in_range(Token *open, Token *close) {
+	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; t = tok_next(t))
+		if (match_ch(t, '[') && (t->flags & TF_OPEN)) tok_ann(t) |= P1_UNEVAL_BRACKET;
+}
+
+static void c_tag_postfix_chain_unevaluated(Token *t) {
+	while (t && t->kind != TK_EOF) {
+		if ((match_ch(t, '[') || match_ch(t, '(')) && (t->flags & TF_OPEN) && tok_match(t)) {
+			if (match_ch(t, '[')) tok_ann(t) |= P1_UNEVAL_BRACKET;
+			Token *close = tok_match(t);
+			c_tag_brackets_in_range(t, close);
+			t = tok_next(close);
+			continue;
+		}
+		if (match_ch(t, '.') || equal(t, "->")) {
+			t = tok_next(t);
+			if (c_is_value_name_token(t)) t = tok_next(t);
+			continue;
+		}
+		if (equal(t, "++") || equal(t, "--")) {
+			t = tok_next(t);
+			continue;
+		}
+		break;
+	}
+}
+
+/* Mark every subscript whose value is suppressed by core C semantics. Bounds
+ * instrumentation consumes this language annotation without re-parsing
+ * sizeof/alignof/typeof/offsetof/_Generic/static_assert operands. */
+static void c_parse_mark_unevaluated_brackets(void) {
+	int file_scope_braces = 0;
+	bool file_scope_initializer = false;
+	for (uint32_t i = 1; i < token_count; i++) {
+		Token *t = &token_pool[i];
+		if ((t->flags & TF_OPEN) && match_ch(t, '{'))
+			file_scope_braces++;
+		else if ((t->flags & TF_CLOSE) && match_ch(t, '}')) {
+			if (file_scope_braces) file_scope_braces--;
+		} else if (file_scope_braces == 0) {
+			if (match_ch(t, '='))
+				file_scope_initializer = true;
+			else if (match_ch(t, ';'))
+				file_scope_initializer = false;
+		}
+		if (file_scope_initializer && (t->flags & TF_OPEN) && match_ch(t, '['))
+			tok_ann(t) |= P1_UNEVAL_BRACKET;
+
+		if (t->flags & TF_STATIC_ASSERT) {
+			Token *open = tok_next(t);
+			if (open && match_ch(open, '(') && (open->flags & TF_OPEN) && tok_match(open)) {
+				Token *close = tok_match(open);
+				c_tag_brackets_in_range(open, close);
+				i = tok_idx(close);
+			}
+			continue;
+		}
+		if (t->tag & TT_GENERIC) {
+			Token *open = tok_next(t);
+			if (open && match_ch(open, '(') && (open->flags & TF_OPEN) && tok_match(open)) {
+				Token *close = tok_match(open);
+				int depth = 0;
+				Token *u;
+				for (u = tok_next(open); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+					if (match_ch(u, '[') && (u->flags & TF_OPEN))
+						tok_ann(u) |= P1_UNEVAL_BRACKET;
+					if (u->flags & TF_OPEN)
+						depth++;
+					else if (u->flags & TF_CLOSE)
+						depth--;
+					else if (depth == 0 && match_ch(u, ','))
+						break;
+				}
+				i = tok_idx(u && u != close ? u : close);
+			}
+			continue;
+		}
+		if (!c_is_unevaluated_operand_intro(t)) continue;
+		Token *next = tok_next(t);
+		if (!next) continue;
+		if (match_ch(next, '(') && (next->flags & TF_OPEN)) {
+			Token *close = tok_match(next);
+			if (close) {
+				c_tag_brackets_in_range(next, close);
+				c_tag_postfix_chain_unevaluated(tok_next(close));
+				i = tok_idx(close);
+			}
+			continue;
+		}
+		Token *operand = next;
+		while (operand && operand->kind != TK_EOF) {
+			if (match_set(operand, CH('+') | CH('-') | CH('!') | CH('&') | CH('*')) ||
+			    match_ch(operand, '~') || equal(operand, "++") || equal(operand, "--")) {
+				operand = tok_next(operand);
+				continue;
+			}
+			break;
+		}
+		if (!c_is_value_name_token(operand)) continue;
+		c_tag_postfix_chain_unevaluated(tok_next(operand));
+	}
+}
+
+static bool c_bounds_is_tracked_array(Token *tok) {
+	return c_is_value_name_token(tok) && c_array_binding_info(tok).tracked;
+}
+
+static bool c_bounds_expr_base_is_pointer(Token *tok) {
+	if (!c_is_value_name_token(tok)) return false;
+	TypedefEntry *binding = typedef_lookup(tok);
+	return binding && !binding->is_struct_tag && binding->is_ptr;
+}
+
+static Token *c_bounds_peel_paren_ident(Token *last) {
+	if (!match_ch(last, ')') || !tok_match(last)) return last;
+	Token *open = tok_match(last);
+	if (tok_idx(open) >= 1) {
+		Token *before = &token_pool[tok_idx(open) - 1];
+		if (c_is_value_name_token(before) || before->kind == TK_NUM || match_ch(before, ')') ||
+		    match_ch(before, ']'))
+			return last;
+	}
+	Token *inner = tok_next(open);
+	return c_is_value_name_token(inner) && tok_next(inner) == last ? inner : last;
+}
+
+static Token *c_bounds_find_tracked_array(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
+			Token *prev = &token_pool[tok_idx(t) - 1];
+			if (c_is_unevaluated_operand_intro(prev) && tok_match(t)) {
+				t = tok_match(t);
+				continue;
+			}
+		}
+		if (!c_is_value_name_token(t) || is_known_typedef(t)) continue;
+		if (tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER)) continue;
+		if (c_bounds_is_tracked_array(t)) return t;
+	}
+	return NULL;
+}
+
+static bool c_bounds_paren_derives_array(Token *open) {
+	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) return false;
+	Token *close = tok_match(open);
+	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
+			Token *prev = &token_pool[tok_idx(t) - 1];
+			if (c_is_unevaluated_operand_intro(prev) && tok_match(t)) {
+				t = tok_match(t);
+				continue;
+			}
+		}
+		if (match_ch(t, '&') && !(t->flags & TF_OPEN)) {
+			Token *next = tok_next(t);
+			if (next && next != close && c_is_value_name_token(next) &&
+			    c_bounds_is_tracked_array(next))
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool c_bounds_paren_has_array_arithmetic(Token *open) {
+	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) return false;
+	Token *scan_end = tok_match(open);
+	Token *lhs = tok_next(open);
+	if (!lhs || lhs == scan_end) return false;
+	while (match_ch(lhs, '(') && (lhs->flags & TF_OPEN) && tok_match(lhs)) {
+		Token *inner_close = tok_match(lhs);
+		if (tok_next(inner_close) != scan_end) break;
+		lhs = tok_next(lhs);
+		scan_end = inner_close;
+		if (!lhs || lhs == scan_end) return false;
+	}
+	bool has_addsub = false;
+	for (Token *t = lhs; t && t != scan_end && t->kind != TK_EOF; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
+		if ((match_ch(t, '+') || match_ch(t, '-')) && !(t->flags & TF_OPEN)) {
+			has_addsub = true;
+			break;
+		}
+	}
+	return has_addsub && c_bounds_find_tracked_array(lhs, scan_end) != NULL;
+}
+
+static bool c_token_is_in_unevaluated_operand(Token *tok) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(tok); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			Token *prev = i >= 2 ? &token_pool[i - 2] : NULL;
+			if (!prev) return false;
+			if (c_is_unevaluated_operand_intro(prev) || (prev->tag & TT_GENERIC) ||
+			    (prev->flags & TF_STATIC_ASSERT))
+				return true;
+			return prev->kind == TK_IDENT &&
+			       ((prev->len == 8 && prism_memeq_static(tok_loc(prev), "_Alignof", 8)) ||
+				(prev->len == 7 && prism_memeq_static(tok_loc(prev), "alignof", 7)));
+		}
+		if (depth != 0) continue;
+		if (c_is_unevaluated_operand_intro(t) || (t->tag & TT_GENERIC) ||
+		    (t->flags & TF_STATIC_ASSERT))
+			return true;
+		if (t->kind == TK_IDENT &&
+		    ((t->len == 8 && prism_memeq_static(tok_loc(t), "_Alignof", 8)) ||
+		     (t->len == 7 && prism_memeq_static(tok_loc(t), "alignof", 7))))
+			return true;
+		if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}') || match_ch(t, ','))
+			return false;
+	}
+	return false;
 }
 
 
@@ -5057,6 +5928,439 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	}
 }
 
+/* A declaration whose base type is a function type is not an object even
+ * when the spelling arrives through typeof. Keep this recognition beside
+ * the typedef/function registries instead of making transform passes infer it. */
+static bool c_typeof_is_function_type(Token *type_start,
+				      const TypeSpecResult *type,
+				      const DeclResult *decl) {
+	if (decl->is_pointer || decl->is_array || decl->is_func_ptr) return false;
+	for (Token *t = type_start; t && t != type->end; t = tok_next(t))
+		if (is_func_typedef(t)) return true;
+	if (!type->has_typeof) return false;
+
+	for (Token *t = type_start; t && t != type->end; t = tok_next(t)) {
+		if (!(t->tag & TT_TYPEOF)) continue;
+		Token *open = tok_next(t);
+		if (!open || !match_ch(open, '(') || !tok_match(open)) break;
+		Token *inner = tok_next(open);
+		Token *close = tok_match(open);
+		while (inner && inner != close && match_ch(inner, '(') && tok_match(inner)) {
+			Token *inner_close = tok_match(inner);
+			if (inner_close && tok_next(inner_close) == close) {
+				inner = tok_next(inner);
+				close = inner_close;
+			} else
+				break;
+		}
+		if (!inner || inner == close) break;
+
+		if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) {
+			for (Token *s = inner; s && s != close; s = tok_next(s)) {
+				if ((s->tag & TT_TYPEOF) && tok_next(s) && match_ch(tok_next(s), '(') &&
+				    tok_match(tok_next(s))) {
+					s = tok_match(tok_next(s));
+					continue;
+				}
+				if ((s->tag & (TT_BITINT | TT_ALIGNAS)) && tok_next(s) &&
+				    match_ch(tok_next(s), '(') && tok_match(tok_next(s))) {
+					s = tok_match(tok_next(s));
+					continue;
+				}
+				if ((s->tag & TT_TYPE) && equal(s, "_Atomic") && tok_next(s) &&
+				    match_ch(tok_next(s), '(') && tok_match(tok_next(s))) {
+					s = tok_match(tok_next(s));
+					continue;
+				}
+				if ((s->tag & TT_ATTR) && tok_next(s) && match_ch(tok_next(s), '(') &&
+				    tok_match(tok_next(s))) {
+					s = tok_match(tok_next(s));
+					continue;
+				}
+				if (is_c23_attr(s) && tok_match(s)) {
+					s = tok_match(s);
+					continue;
+				}
+				if (match_ch(s, '[') && tok_match(s)) {
+					s = tok_match(s);
+					continue;
+				}
+				if (match_ch(s, '(')) {
+					Token *after = skip_noise(tok_next(s));
+					if (after && match_ch(after, '*')) return false;
+					return true;
+				}
+			}
+			break;
+		}
+
+		if (tok_next(inner) != close || !is_valid_varname(inner)) break;
+		TypedefEntry *binding = typedef_lookup(inner);
+		if (binding && binding->is_shadow) return binding->is_func;
+		return c_function_symbol(inner) != CFS_NONE;
+	}
+	return false;
+}
+
+static CDeclShape
+c_classify_decl_shape(Token *type_start, const TypeSpecResult *type, const DeclResult *decl) {
+	return (CDeclShape){
+	    .effective_vla = (decl->is_vla && (!decl->paren_pointer || decl->paren_array)) ||
+			     (type->is_vla && !decl->is_pointer),
+	    .is_aggregate = (decl->is_array && (!decl->paren_pointer || decl->paren_array)) ||
+			    ((type->is_struct || type->is_typedef || type->is_array) &&
+			     !decl->is_pointer),
+	    .is_union_type = type->is_union && !decl->is_pointer,
+	    .is_func_type = decl->is_func_decl || c_typeof_is_function_type(type_start, type, decl),
+	};
+}
+
+static bool c_decl_has_explicit_const(Token *type_start,
+				      const TypeSpecResult *type,
+				      const DeclResult *decl) {
+	if ((type->has_const && !decl->is_func_ptr && !decl->is_pointer) || decl->is_const)
+		return true;
+	if (decl->is_func_ptr || decl->is_pointer) return false;
+	for (Token *t = type_start; t && t != type->end; t = tok_next(t))
+		if (is_const_typedef(t)) return true;
+	return false;
+}
+
+static Token *c_sue_definition_body(Token *sue_kw) {
+	Token *body = find_struct_body_brace(sue_kw);
+	if (body) return body;
+
+	Token *tag = skip_noise(tok_next(sue_kw));
+	while (tag && (tag->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(tag))
+		tag = skip_noise(tok_next(tag));
+	if (!tag || !is_valid_varname(tag)) return NULL;
+
+	TypedefEntry *entry = tag_lookup(tag);
+	if (!entry || !entry->is_struct_tag || entry->token_index >= token_count) return NULL;
+	Token *definition_tag = &token_pool[entry->token_index];
+	Token *definition_kw = tok_walk_back(tok_idx(definition_tag), WB_PAST_NOISE);
+	if (!definition_kw || !(definition_kw->tag & TT_SUE) || is_enum_kw(definition_kw)) return NULL;
+	return find_struct_body_brace(definition_kw);
+}
+
+static Token *c_typedef_type_start(TypedefEntry *entry) {
+	if (!entry || entry->token_index >= token_count) return NULL;
+	uint32_t i = entry->token_index;
+	while (i > 0) {
+		Token *prev = &token_pool[i - 1];
+		if ((prev->flags & TF_CLOSE) && tok_match(prev)) {
+			i = tok_idx(tok_match(prev));
+			continue;
+		}
+		if (match_ch(prev, ';')) return NULL;
+		if (prev->tag & TT_TYPEDEF) return skip_noise(tok_next(prev));
+		i--;
+	}
+	return NULL;
+}
+
+static bool c_array_dim_is_empty_or_zero(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!open_bracket || !close) return false;
+	Token *t = skip_noise(tok_next(open_bracket));
+	if (!t || t == close) return true;
+	return t->kind == TK_NUM && t->len == 1 && t->ch0 == '0' &&
+	       skip_noise(tok_next(t)) == close;
+}
+
+static bool c_sue_body_brace_zero_unsafe(Token *brace, int depth);
+
+static bool c_type_brace_zero_unsafe(Token *type_start, Token *type_end, int depth) {
+	if (!type_start || depth > 16) return false;
+	uint32_t range_lo = tok_idx(type_start);
+	uint32_t range_hi = type_end ? tok_idx(type_end) : UINT32_MAX;
+	for (Token *t = type_start; t && t != type_end;) {
+		if (!(t->tag & TT_SUE) || is_enum_kw(t)) {
+			t = tok_next(t);
+			continue;
+		}
+		Token *body = find_struct_body_brace(t);
+		if (!body) body = c_sue_definition_body(t);
+		if (body && c_sue_body_brace_zero_unsafe(body, depth + 1)) return true;
+		if (body && tok_match(body)) {
+			uint32_t bi = tok_idx(body);
+			if (bi >= range_lo && bi < range_hi) {
+				Token *after = tok_next(tok_match(body));
+				if (!after || tok_idx(after) >= range_hi) break;
+				t = after;
+				continue;
+			}
+		}
+		t = tok_next(t);
+	}
+	for (Token *t = type_start; t && t != type_end;) {
+		if ((t->flags & TF_OPEN) && match_ch(t, '{') && tok_match(t)) {
+			uint32_t bi = tok_idx(t);
+			if (bi >= range_lo && bi < range_hi) {
+				Token *after = tok_next(tok_match(t));
+				if (!after || tok_idx(after) >= range_hi) break;
+				t = after;
+				continue;
+			}
+		}
+		if (!is_identifier_like(t) || !is_known_typedef(t)) {
+			t = tok_next(t);
+			continue;
+		}
+		TypedefEntry *entry = typedef_lookup(t);
+		if (!entry || entry->is_shadow || entry->is_ptr) {
+			t = tok_next(t);
+			continue;
+		}
+		if (entry->token_index < token_count && t == &token_pool[entry->token_index]) {
+			t = tok_next(t);
+			continue;
+		}
+		Token *alias = c_typedef_type_start(entry);
+		if (alias && entry->token_index < token_count) {
+			Token *name = &token_pool[entry->token_index];
+			if (c_type_brace_zero_unsafe(alias, name, depth + 1)) return true;
+		}
+		t = tok_next(t);
+	}
+	return false;
+}
+
+static bool c_sue_body_brace_zero_unsafe(Token *brace, int depth) {
+	if (!brace || !tok_match(brace) || depth > 16) return false;
+	if (tok_ann(brace) & P1_ZUNSAFE_KNOWN) return (tok_ann(brace) & P1_ZUNSAFE) != 0;
+
+	Token *end = tok_match(brace);
+	bool saw_any = false, needs_full = false;
+	for (Token *t = tok_next(brace); t && t != end;) {
+		if (t->kind == TK_PREP_DIR) {
+			t = tok_next(t);
+			continue;
+		}
+		if ((t->flags & TF_OPEN) && match_ch(t, '{') && tok_match(t)) {
+			needs_full = saw_any = true;
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		if ((match_ch(t, '[') && !(t->flags & TF_C23_ATTR)) || (t->tag & TT_SUE))
+			needs_full = true;
+		saw_any = true;
+		t = tok_next(t);
+	}
+	if (!saw_any) {
+		brace->ann |= (uint16_t)(P1_ZUNSAFE_KNOWN | P1_ZUNSAFE);
+		return true;
+	}
+	if (!needs_full) {
+		brace->ann |= (uint16_t)P1_ZUNSAFE_KNOWN;
+		return false;
+	}
+
+	bool saw_sized = false, saw_empty_or_zero = false;
+	saw_any = false;
+	for (Token *stmt = skip_noise(tok_next(brace)); stmt && stmt != end;) {
+		if (stmt->kind == TK_PREP_DIR) {
+			stmt = skip_noise(tok_next(stmt));
+			continue;
+		}
+		if ((stmt->flags & TF_STATIC_ASSERT) || (stmt->tag & TT_SKIP_DECL)) {
+			Token *n = skip_noise(tok_next(stmt));
+			stmt = n && match_ch(n, '(') && tok_match(n)
+				   ? skip_noise(tok_next(tok_match(n)))
+				   : skip_noise(tok_next(stmt));
+			continue;
+		}
+		TypeSpecResult member_type = parse_type_specifier(stmt);
+		if (!member_type.saw_type || !member_type.end) {
+			Token *next = stmt;
+			while (next && next != end && !match_ch(next, ';'))
+				next = (next->flags & TF_OPEN) && tok_match(next)
+					   ? tok_next(tok_match(next))
+					   : tok_next(next);
+			stmt = next && match_ch(next, ';') ? skip_noise(tok_next(next)) : end;
+			continue;
+		}
+
+		Token *decl_start = skip_noise(member_type.end);
+		bool member_empty_type = c_type_brace_zero_unsafe(stmt, member_type.end, depth + 1);
+		bool saw_decl = false;
+		while (decl_start && decl_start != end && !match_ch(decl_start, ';')) {
+			if (match_ch(decl_start, ':')) {
+				saw_any = saw_sized = true;
+				break;
+			}
+			DeclResult member = c_parse_declarator(decl_start);
+			if (!member.end) break;
+			saw_decl = saw_any = true;
+			bool zero_arr = false;
+			if (member.is_array && !member.is_pointer) {
+				for (Token *b = decl_start; b && b != member.end; b = tok_next(b)) {
+					if (match_ch(b, '[') && !(b->flags & TF_C23_ATTR) &&
+					    c_array_dim_is_empty_or_zero(b)) {
+						zero_arr = true;
+						break;
+					}
+					if ((b->flags & TF_OPEN) && tok_match(b) && !match_ch(b, '['))
+						b = tok_match(b);
+				}
+			}
+			if (member.is_pointer || member.is_func_ptr)
+				saw_sized = true;
+			else if (zero_arr || member_empty_type)
+				saw_empty_or_zero = true;
+			else
+				saw_sized = true;
+
+			Token *next = member.end;
+			while (next && next != end && !match_ch(next, ',') && !match_ch(next, ';'))
+				next = (next->flags & TF_OPEN) && tok_match(next)
+					   ? tok_next(tok_match(next))
+					   : tok_next(next);
+			if (next && match_ch(next, ',')) {
+				decl_start = skip_noise(tok_next(next));
+				continue;
+			}
+			decl_start = next;
+			break;
+		}
+		if (!saw_decl && member_empty_type) saw_any = saw_empty_or_zero = true;
+		Token *next_stmt = decl_start;
+		while (next_stmt && next_stmt != end && !match_ch(next_stmt, ';'))
+			next_stmt = (next_stmt->flags & TF_OPEN) && tok_match(next_stmt)
+					? tok_next(tok_match(next_stmt))
+					: tok_next(next_stmt);
+		stmt = next_stmt && match_ch(next_stmt, ';') ? skip_noise(tok_next(next_stmt)) : end;
+	}
+	bool unsafe = !saw_any || !saw_sized || saw_empty_or_zero;
+	brace->ann |= (uint16_t)P1_ZUNSAFE_KNOWN;
+	if (unsafe) brace->ann |= (uint16_t)P1_ZUNSAFE;
+	return unsafe;
+}
+
+static bool c_type_has_const_subobject(Token *type_start, Token *type_end, int depth);
+
+static bool c_aggregate_has_const_subobject(Token *brace, int depth) {
+	if (!brace || !tok_match(brace) || depth > 32) return false;
+	Token *end = tok_match(brace);
+	for (Token *stmt = skip_noise(tok_next(brace)); stmt && stmt != end;) {
+		if (stmt->kind == TK_PREP_DIR) {
+			stmt = skip_noise(tok_next(stmt));
+			continue;
+		}
+		TypeSpecResult member_type = parse_type_specifier(stmt);
+		bool saw_declarator = false;
+		if (member_type.saw_type && member_type.end) {
+			Token *decl_start = skip_noise(member_type.end);
+			while (decl_start && decl_start != end && !match_ch(decl_start, ';')) {
+				DeclResult member = c_parse_declarator(decl_start);
+				if (!member.end || !member.var_name) break;
+				saw_declarator = true;
+				if (c_decl_has_explicit_const(stmt, &member_type, &member)) return true;
+				if (!member.is_pointer && !member.is_func_ptr &&
+				    c_type_has_const_subobject(stmt, member_type.end, depth + 1))
+					return true;
+
+				Token *next = member.end;
+				while (next && next != end && !match_ch(next, ',') && !match_ch(next, ';'))
+					next = (next->flags & TF_OPEN) && tok_match(next)
+						   ? tok_next(tok_match(next))
+						   : tok_next(next);
+				if (next && match_ch(next, ',')) {
+					decl_start = skip_noise(tok_next(next));
+					continue;
+				}
+				break;
+			}
+			if (!saw_declarator &&
+			    c_type_has_const_subobject(stmt, member_type.end, depth + 1))
+				return true;
+		}
+		Token *next_stmt = stmt;
+		while (next_stmt && next_stmt != end && !match_ch(next_stmt, ';'))
+			next_stmt = (next_stmt->flags & TF_OPEN) && tok_match(next_stmt)
+					? tok_next(tok_match(next_stmt))
+					: tok_next(next_stmt);
+		stmt = next_stmt && next_stmt != end ? skip_noise(tok_next(next_stmt)) : end;
+	}
+	return false;
+}
+
+static bool c_type_has_const_subobject(Token *type_start, Token *type_end, int depth) {
+	if (!type_start || depth > 32) return false;
+	for (Token *t = type_start; t && t != type_end; t = tok_next(t)) {
+		if ((t->tag & TT_SUE) && !is_enum_kw(t)) {
+			Token *body = c_sue_definition_body(t);
+			if (body && c_aggregate_has_const_subobject(body, depth + 1)) return true;
+			continue;
+		}
+		if (!is_known_typedef(t)) continue;
+		TypedefEntry *entry = typedef_lookup(t);
+		if (!entry || !entry->is_aggregate || entry->is_ptr) continue;
+		Token *alias_type = c_typedef_type_start(entry);
+		if (!alias_type) continue;
+		if (entry->token_index < token_count && t == &token_pool[entry->token_index]) continue;
+		TypeSpecResult alias = parse_type_specifier(alias_type);
+		if (alias.saw_type && alias.end &&
+		    c_type_has_const_subobject(alias_type, alias.end, depth + 1))
+			return true;
+	}
+	return false;
+}
+
+static bool c_type_spec_is_anonymous_sue(Token *type_start, const TypeSpecResult *type) {
+	if (!type->is_struct || type->is_enum) return false;
+	for (Token *t = type_start; t && t != type->end; t = tok_next(t)) {
+		if (!(t->tag & TT_SUE)) continue;
+		Token *after = skip_noise(tok_next(t));
+		return after && match_ch(after, '{');
+	}
+	return false;
+}
+
+static bool c_range_has_attribute(Token *start, Token *end, uint32_t extra_tag) {
+	for (Token *t = start; t && t != end; t = tok_next(t)) {
+		if ((t->tag & (TT_ATTR | extra_tag)) || is_c23_attr(t)) return true;
+		if ((t->flags & TF_OPEN) && tok_match(t)) t = tok_match(t);
+	}
+	return false;
+}
+
+static bool c_is_const_literal_initializer(Token *eq) {
+	Token *t = tok_next(eq);
+	if (!t) return false;
+	if (t->kind == TK_STR) {
+		Token *next = tok_next(t);
+		while (next && next->kind == TK_STR) next = tok_next(next);
+		return next && match_ch(next, ';');
+	}
+	if (!match_ch(t, '{') || !tok_match(t)) return false;
+	Token *close = tok_match(t);
+	bool prev_was_dot = false;
+	for (t = tok_next(t); t && t != close; t = tok_next(t)) {
+		if (t->kind == TK_NUM || t->kind == TK_STR) {
+			prev_was_dot = false;
+			continue;
+		}
+		if (t->kind == TK_PUNCT) {
+			char c = t->ch0;
+			if (c == ',' || c == '{' || c == '}' || c == '[' || c == ']' ||
+			    (c == '=' && t->len == 1) || (c == '.' && t->len == 1) ||
+			    ((c == '+' || c == '-') && t->len == 1)) {
+				prev_was_dot = c == '.';
+				continue;
+			}
+			return false;
+		}
+		if (t->kind == TK_IDENT &&
+		    (prev_was_dot || is_known_enum_const(t) || equal(t, "true") || equal(t, "false"))) {
+			prev_was_dot = false;
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 static PRISM_THREAD_LOCAL int *sos_do_if_save = NULL;
 static PRISM_THREAD_LOCAL int *sos_do_tn_save = NULL;
 static PRISM_THREAD_LOCAL int *sos_do_snap_start = NULL;
@@ -5291,6 +6595,30 @@ typedef struct {
 #define scope_tree ((ScopeInfo *)ctx->p1_scope_tree)
 #define scope_tree_count (ctx->p1_scope_count)
 #define scope_tree_cap (ctx->p1_scope_cap)
+
+/* Parameter declarations are discovered while walking an already-built scope
+ * tree. Keep exact-token lookup, optional shadow creation, scope selection,
+ * and array-to-pointer decay in the parser rather than its consumers. */
+static void c_register_parameter_binding(Token *tok,
+					 int scope_depth,
+					 uint16_t scope_id,
+					 bool create,
+					 unsigned traits) {
+	TypedefEntry *entry = c_binding_entry(tok, false);
+	if (!entry && create) {
+		TD_SCOPE_SAVE();
+		if (scope_id > 0 && scope_id < scope_tree_count) {
+			td_scope_open = scope_tree[scope_id].open_tok_idx;
+			td_scope_close = scope_tree[scope_id].close_tok_idx;
+		}
+		entry = c_register_shadow(tok, scope_depth);
+		TD_SCOPE_RESTORE();
+	}
+	if (!entry) return;
+	entry->is_param = true;
+	entry->is_array = false;
+	c_binding_apply_traits(entry, traits);
+}
 
 static bool c_is_objc_ivar_brace(uint32_t brace_idx) {
 	for (uint32_t i = brace_idx - 1; i > 0; i--) {
@@ -6115,6 +7443,54 @@ static inline Token *p1_skip_decl_raw(Token *t, bool *saw_raw) {
 
 static inline bool is_assignment_operator_token(Token *tok) {
 	return (tok->tag & TT_ASSIGN) && tok_loc(tok)[tok->len - 1] == '=';
+}
+
+typedef struct {
+	Token *last_comma;
+	Token *last_assignment;
+	Token *segment_assignment;
+} CExprTopLevel;
+
+/* One balanced scan answers both questions needed by bare-expression
+ * lowering. An assignment before the last comma belongs to an earlier comma
+ * operand, so reset it when the active segment changes. */
+static CExprTopLevel c_scan_expr_top_level(Token *start, Token *end) {
+	CExprTopLevel result = {0};
+	int depth = 0;
+	for (Token *t = start; t && t != end; t = tok_next(t)) {
+		if (t->flags & TF_OPEN)
+			depth++;
+		else if (t->flags & TF_CLOSE)
+			depth--;
+		else if (depth == 0 && match_ch(t, ',')) {
+			result.last_comma = t;
+			result.segment_assignment = NULL;
+		} else if (depth == 0 && is_assignment_operator_token(t)) {
+			result.last_assignment = t;
+			result.segment_assignment = t;
+		}
+	}
+	return result;
+}
+
+static void c_for_each_enum_constant(Token *brace, void (*visit)(Token *, void *), void *user_data) {
+	Token *end = tok_match(brace);
+	if (!end) return;
+	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF;) {
+		if (t->kind != TK_IDENT && t->kind != TK_KEYWORD) {
+			t = tok_next(t);
+			continue;
+		}
+		visit(t, user_data);
+		while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
+			if ((t->flags & TF_OPEN) && tok_match(t)) {
+				t = tok_next(tok_match(t));
+				continue;
+			}
+			t = tok_next(t);
+		}
+		if (t && match_ch(t, ',')) t = tok_next(t);
+	}
 }
 
 static bool raw_after_subscript_open_bracket(Token *raw_kw) {

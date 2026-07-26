@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.1.5
-**Status:** Implemented: every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (14,538+ platform-inclusive checks; 14,277/14,277 in the audited Darwin/Clang run, 14,346/14,346 on Arch/GCC, and 14,283/14,283 on Arch/Clang; self-host stage1==stage2; zero failures on release and `PRISM_DEBUG` builds).
+**Status:** Implemented: every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (14,538+ platform-inclusive checks; 14,281/14,281 in the audited Darwin/Clang run, 14,350/14,350 on Arch/GCC, and 14,287/14,287 on Arch/Clang; self-host stage1==stage2; zero failures on release and `PRISM_DEBUG` builds).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -953,17 +953,17 @@ The helper is an inline function (not a macro) so `idx` is evaluated exactly onc
 A subscript `X[Y]` is wrapped when all of the following hold:
 
 1. `FEAT(F_BOUNDS_CHECK)` is on
-2. `X` (the token immediately preceding `[`, i.e. `last_emitted`) is `TK_IDENT`
-3. `X` is a known local array variable: `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
+2. After peeling supported parenthesized/postfix forms, `X` resolves to an identifier-like value token
+3. `c_array_binding_info(X)` resolves `X` as a tracked array by merging the dedicated bounds registry with ordinary typedef/VLA bindings. Parameters, enum constants, and scoped `blocks_outer` entries for non-array or incomplete declarations take precedence over an older outer array
 4. `X` is not a typedef name (`!is_known_typedef(X)`)
 5. The `[` token does not carry `P1_DECL_BRACKET` (declarator brackets, tagged in Phase 1 by `decl_array_dims`, are never wrapped)
-6. The `[` token does not carry `P1_UNEVAL_BRACKET`, tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand, the controlling expression of `_Generic`, the predicate of `_Static_assert` / `static_assert`, **and every `[` inside a file-scope (static-storage) initializer**. The first four are unevaluated operands; the last case is required because C99 §6.7.8p4 / C11 §6.7.9p4 / C23 §6.7.11p4 mandate that initializers for objects of static storage duration be constant expressions, and wrapping a subscript in `__prism_bchk(...)` turns it into a non-constant function call ("initializer element is not constant"). In `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
+6. The `[` token does not carry `P1_UNEVAL_BRACKET`, tagged by `c_parse_mark_unevaluated_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand, the controlling expression of `_Generic`, the predicate of `_Static_assert` / `static_assert`, **and every `[` inside a file-scope (static-storage) initializer**. The first four are unevaluated operands; the last case is required because C99 §6.7.8p4 / C11 §6.7.9p4 / C23 §6.7.11p4 mandate that initializers for objects of static storage duration be constant expressions, and wrapping a subscript in `__prism_bchk(...)` turns it into a non-constant function call ("initializer element is not constant"). In `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
 7. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
 8. The token immediately before `X` is not a `.` or `->` member operator (`!(prev_tag & TT_MEMBER)`): `s.arr[i]` and `p->arr[i]` name a struct field, whose size is unrelated to any same-named local
 9. The token immediately before `X` is not a unary `&` (address-of): C permits one-past-end addresses, so `&arr[len]` is legal and must not trap. Binary `&` (bitwise AND) is distinguished from unary `&` by peeking one token further back for a value-producing token (identifier, number, string, `)`, `]`).
 10. The bracket is balanced (`tok_match(tok)` succeeds)
 
-Array variables are registered into the typedef table with `is_array = true` by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on, so the feature is strictly zero-cost for users who leave it off.
+Array variables are registered in a dedicated parser-owned bounds table by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on. A name that cannot itself be tracked but hides an outer array gets a scoped blocker entry, so a local pointer, qualified/typedef pointer, pointer-to-array, `raw` declaration, or incomplete block-scope declaration cannot inherit stale outer bounds. The feature remains zero-cost for users who leave it off.
 
 #### What gets checked
 
@@ -982,7 +982,7 @@ Array variables are registered into the typedef table with `is_array = true` by 
 | `&arr[i]` (unary address-of) | No | One-past-end address is legal C |
 | `p[i]` where `p` is a pointer parameter/local | No | Not tracked as an array |
 | `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
-| `gArr[i]` at file scope | No | File-scope arrays are not registered (v1 limitation) |
+| `gArr[i]` for a complete file-scope array | Yes | Complete file-scope arrays are registered; incomplete outer dimensions are not |
 | `arr[i]` inside `raw { ... }` | N/A: `raw` suppresses Prism transformations at parse time | |
 | `idx[arr]`, `len[b]`, `2[arr]`, or any form where a **tracked** local array name appears **bare** (not itself subscripted) inside the subscript (index) and the left-hand base is not that array | **Compile error** | Commutative / hidden-array subscripts cannot be checked with the v1 `last_emitted` model; must be rewritten (e.g. `arr[idx]`) or use `-fno-bounds-check` for that expression. **Rationale:** ISO C 6.5.2.1: `E1[E2]` is defined in terms of `*((E1)+(E2))`; silently wrapping only `arr[i]` would miss `idx[(1 ? a : b)]`-style bypasses. A tracked array name that is itself subscripted in the index (`ptr[arr[0].field]`) is not a bypass: the inner subscript gets its own recursive bounds check. |
 | `*(arr + i)`, `*(&arr[0] + i)`, `*(*(m + i) + j)` and other pointer-arithmetic dereferences whose `(...)` operand contains a tracked array name and a top-level `+` / `-` | **Compile error** (warning under `-fno-safety`) | Pointer-arithmetic dereferences are semantically equivalent to subscripts (ISO C 6.5.2.1) but bypass the v1 subscript matcher. Detection is in `try_bounds_check_deref_add`: it requires unary `*` (discriminated from binary `*` by inspecting the previous token, peeking inside `(...)` for type keywords on `)` to distinguish casts from values), a balanced `(...)` body containing a top-level `+` or `-`, and a tracked array name inside (`bounds_find_array_ident`). The error message is "pointer-arithmetic dereference with tracked array base cannot be verified (rewrite as array[index])". The rewrite to `arr[i]` is recommended; `-fno-bounds-check` for the TU or `-fno-safety` (downgrade to warning + raw emit) are escape hatches. |
@@ -998,15 +998,15 @@ The bounds helper takes `idx` by value, so any side effects in the index (`arr[i
 
 - **Flag:** `F_BOUNDS_CHECK = 256` (parse.c) and `PrismFeatures.bounds_check` (prism.c)
 - **CLI:** `-fbounds-check` / `-fno-bounds-check`
-- **Declarator tagging:** `decl_array_dims` sets `P1_DECL_BRACKET = 1 << 9` on every declarator `[`
-- **Unevaluated-operand tagging:** `p1_mark_uneval_brackets` sets `P1_UNEVAL_BRACKET = 1 << 10` on every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `__typeof` / `offsetof` / `__builtin_offsetof` operand, the `_Generic` controlling expression, the `_Static_assert` / `static_assert` predicate, and any file-scope (static-storage) initializer. Runs once per TU, gated on `F_BOUNDS_CHECK`. File-scope initializers are detected by tracking curly-brace depth: every `=` at depth 0 opens an initializer that stays open until the matching `;`, tagging every `[` in between regardless of nesting depth. Recognition for the other cases uses `TF_SIZEOF` (sizeof/alignof/_Alignof/offsetof), `TT_TYPEOF` (typeof family), `TT_GENERIC`, lexeme match on `_Static_assert` / `static_assert` / `__builtin_offsetof`.
-- **Shadow registration:** Phase 1D declarator loop registers plain local array variables via `typedef_add_shadow(..., is_array=true)` when the feature is on
+- **Declarator tagging:** `c_parse_declarator` identifies array dimensions; Phase 1 records `P1_DECL_BRACKET = 1 << 9` on every declarator `[`
+- **Unevaluated-operand tagging:** `c_parse_mark_unevaluated_brackets` sets `P1_UNEVAL_BRACKET = 1 << 10` on every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `__typeof` / `offsetof` / `__builtin_offsetof` operand, the `_Generic` controlling expression, the `_Static_assert` / `static_assert` predicate, and any file-scope (static-storage) initializer. Runs once per TU, gated on `F_BOUNDS_CHECK`. File-scope initializers are detected by tracking curly-brace depth: every `=` at depth 0 opens an initializer that stays open until the matching `;`, tagging every `[` in between regardless of nesting depth. Recognition for the other cases uses `TF_SIZEOF` (sizeof/alignof/_Alignof/offsetof), `TT_TYPEOF` (typeof family), `TT_GENERIC`, lexeme match on `_Static_assert` / `static_assert` / `__builtin_offsetof`.
+- **Binding registration:** Phase 1D calls parser APIs to register complete array bindings, preserve VLA rank/completeness, and install scoped blockers for declarations that hide an outer array. `prism.c` does not access either binding table or its entry representation
 - **Preamble helper:** emitted in `transpile_tokens` after `emit_system_includes`
 - **Emission hook:** `try_bounds_check_subscript` is called from the main Pass 2 emit loop and from `walk_balanced` (covering function-call arguments, declaration initializers, and other balanced groups). `try_bounds_check_deref_add` is hooked at the same three slow-path sites *and* in the untagged-token fast path of `transpile_tokens`, because `*` carries no `TT` tag and would otherwise bypass the slow-path dispatch.
 
 #### Interaction with other features
 
-- **`raw`:** `raw` blocks suppress typedef-table registration at parse time, so `raw`-declared arrays are not tracked and their subscripts are not wrapped.
+- **`raw`:** `raw` blocks suppress Prism transformations. A `raw` declaration is not tracked as a new array, but it still installs a scoped blocker when its name hides an outer tracked array.
 - **`orelse` in subscripts:** An expression subscript whose index uses `orelse` (`arr[x orelse 0]`) is transformed to a ternary **inside** `__prism_bchk(...)` when the base is a tracked array. Pass 2 tries `try_bounds_check_subscript` before `try_bracket_orelse` in the main emit loop, `emit_statements`, and `walk_balanced`; the bounds hook lowers `P1_OE_BRACKET` indexes via `emit_token_range_orelse`. Non-array / declarator / uneval brackets still fall through to `try_bracket_orelse` alone.
 - **`-fzeroinit`:** Orthogonal. Array declarators with zero-init emit an initializer plus `__builtin_memset` as usual; declarator brackets remain tagged `P1_DECL_BRACKET` and are never wrapped.
 
@@ -1301,7 +1301,7 @@ Linux x86_64, macOS x86_64/arm64, Windows build-only, Linux arm64, Linux riscv64
 | File | Description |
 |---|---|
 | `prism.c` | Prism extension analysis, CFG verification, Pass 2 code generation, library API, CLI |
-| `parse.c` | Reusable C front end: tokenizer, token/hash metadata, arena allocator, HashMap, diagnostics, parser lifecycle (`c_parse_begin`, `c_parse_finalize`, `c_parse_reset`), scope tree and function-symbol queries, binding registration/resolution, type/declarator parsing (`parse_type_specifier`, `c_parse_declarator`, `parse_typedef_declaration`, `parse_enum_constants`), statement skipping, VLA/qualifier analysis, and balanced/backward token walkers |
+| `parse.c` | Reusable C front end: tokenizer, token/hash metadata, arena allocator, HashMap, diagnostics, parser lifecycle (`c_parse_begin`, `c_parse_finalize`, `c_parse_reset`), scope tree and function-symbol queries, opaque binding/array registration and resolution, type/declarator/function-return parsing, declaration and aggregate-shape classification, expression/bracket/unevaluated-context analysis, VLA/qualifier analysis, enum iteration, statement skipping, and balanced/backward token walkers |
 | `windows.c` | Native Windows shim (used from `parse.c` for platform-specific I/O) |
 
 `prism.c` includes `parse.c` via `#include`. Single compilation unit: no separate linking step.

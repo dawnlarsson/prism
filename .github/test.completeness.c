@@ -3502,13 +3502,21 @@ static void cm_gen_dim_orelse_uneval(void) {
 }
 
 /* Param / local name that hides a file-scope array must not wrap against the
- * outer sizeof — array params, pointer params, and K&R. */
+ * outer sizeof — array/scalar/pointer params, K&R, pointer declarator shapes,
+ * typedef pointers, and incomplete block-scope declarations. */
 static void cm_gen_bounds_param_shadow(void) {
 	static const char *no_wrap[] = {
 		"int g[10]; int f(int g[20]){return g[5];}",
 		"int g[5]={0}; int f(g) int g[10]; {return g[3];}",
 		"int g[10]; void f(int *g){ (void)g[3]; }",
 		"int g[10]; void f(int g){ (void)sizeof(g); }",
+		"int g[10]; void f(int i){ int *g=0; (void)g[i]; }",
+		"int g[10]; void f(int i){ const int *g=0; (void)g[i]; }",
+		"int g[10]; void f(int i){ volatile int *g=0; (void)g[i]; }",
+		"typedef int *P; int g[10]; void f(int i){ P g=0; (void)g[i]; }",
+		"int g[10]; void f(int i){ int (*g)[10]=0; (void)(*g)[i]; }",
+		"int g[10]; void f(int i){ extern int g[]; (void)g[i]; }",
+		"int g[10]; void f(int i){ raw int *g=0; (void)g[i]; }",
 	};
 	static const char *must_wrap[] = {
 		"int g[10]; void f(void){ (void)g[3]; }",
