@@ -170,7 +170,7 @@ static int ins_count_kw(const char *out, const char *kw) {
 	return n;
 }
 
-/* Token boundaries via prism's own tokenizer (offsets into src).
+/* PParseToken boundaries via prism's own tokenizer (offsets into src).
  *
  * LIFETIME INVARIANT: prism never frees tokenized source buffers — the
  * persistent per-thread maps (typedef table, ...) keep name pointers into
@@ -184,12 +184,12 @@ static int ins_boundaries(const char *src, int *bounds) {
 	if (!buf) return -1;
 	memcpy(buf, src, len);
 	memset(buf + len, 0, 8);
-	Token *tok = tokenize_buffer((char *)"ins_bounds.c", buf);
+	PParseToken *tok = pparse_tokenize_buffer((char *)"ins_bounds.c", buf);
 	if (!tok) return -1;
 	int n = 0;
 	long prev_end = -1;
-	for (Token *t = tok; t && t->kind != TK_EOF && n < INS_MAX_BOUNDS - 2; t = tok_next(t)) {
-		long start = tok_loc(t) - buf;
+	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF && n < INS_MAX_BOUNDS - 2; t = pparse_next(t)) {
+		long start = pparse_loc(t) - buf;
 		long end = start + t->len;
 		if (start != prev_end) bounds[n++] = (int)start;
 		bounds[n++] = (int)end;
@@ -204,21 +204,21 @@ typedef struct {
 } InsStats;
 
 static void ins_sweep(const char *src, const char *kw, InsStats *st) {
-	/* Direct tokenize_buffer calls need the per-thread prologue that
+	/* Direct pparse_tokenize_buffer calls need the per-thread prologue that
 	 * prism_transpile_source would otherwise run for us. */
-	prism_ctx_init();
+	pparse_ctx_init();
 	error_recovery_init();
-	if (setjmp(ctx->error_jmp) != 0) {
+	if (setjmp(pparse_ctx->error_jmp) != 0) {
 		st->base_fail++; /* corpus TU failed to tokenize */
-		ctx->error_jmp_set = false;
+		pparse_ctx->error_jmp_set = false;
 		return;
 	}
 	apply_features(prism_defaults());
-	ensure_keyword_cache();
+	pparse_ensure_keyword_cache();
 
 	int bounds[INS_MAX_BOUNDS];
 	int nb = ins_boundaries(src, bounds);
-	ctx->error_jmp_set = false;
+	pparse_ctx->error_jmp_set = false;
 	if (nb < 0) {
 		st->base_fail++;
 		return;

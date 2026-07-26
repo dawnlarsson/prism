@@ -574,21 +574,10 @@ static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
 	out_buf_pos += len;
 }
 
-#if PRISM_MEM_OUT_LIT_STATIC
-/* Compile-time string: exact load/store via prism_memcpy_static, no size ladder. */
-#define OUT_LIT(s)                                                                                           \
-	do {                                                                                                 \
-		enum { _prism_lit_n = (int)sizeof(s) - 1 };                                                  \
-		if (pparse_PRISM_UNLIKELY(out_buf_pos + _prism_lit_n >= OUT_BUF_SIZE))                               \
-			out_str_slow((s), _prism_lit_n);                                                     \
-		else {                                                                                       \
-			prism_memcpy_static(out_buf + out_buf_pos, (s), sizeof(s) - 1);                       \
-			out_buf_pos += _prism_lit_n;                                                         \
-		}                                                                                            \
-	} while (0)
-#else
+/* Compile-time string literal: exact-width inline store, no size ladder.
+ * (Was gated on PRISM_MEM_OUT_LIT_STATIC, part of the removed mem.c kit; the
+ * out_str fallback is what every build actually used.) */
 #define OUT_LIT(s) out_str((s), (int)sizeof(s) - 1)
-#endif
 
 // Check if the effective compiler is MSVC, falling back to PRISM_DEFAULT_CC
 static inline bool target_is_msvc(void) {
@@ -3022,7 +3011,32 @@ static inline void emit_type_with_pragma_prelude(
 	int saved_oe = pparse_ctx->bracket_oe_count, saved_dim = pparse_ctx->bracket_dim_count;
 	pparse_ctx->bracket_oe_count = 0;
 	pparse_ctx->bracket_dim_count = 0;
-	if (pragma_start != type_start) emit_range(pragma_start, raw_tok ? raw_tok : type_start);
+	/* The prelude emits everything before the type range (attributes, #pragma
+	 * noise).  `raw_tok` bounds it only when the raw token actually PRECEDES
+	 * the type range — `__attribute__((x)) raw int v;`.  When raw sits inside
+	 * the specifiers — `__attribute__((x)) const raw int v;` — those
+	 * specifiers belong to emit_type_range, and using raw_tok as the bound
+	 * emitted them twice: `const const int v;`, invalid C that Phase 1
+	 * accepted.  (Found by the generative raw product's raw-vs-zeroinit-off
+	 * equivalence oracle; `static`/`extern` were unaffected because they take
+	 * the has-storage verbatim path.)
+	 *
+	 * Order is decided by a bounded walk, not by comparing token addresses or
+	 * pparse_idx: the stream is not contiguous across PPARSE_TF_LINK_JUMP
+	 * hops, so index comparison silently misorders tokens from different pool
+	 * segments. */
+	PParseToken *prelude_end = type_start;
+	if (raw_tok) {
+		int budget = 64;
+		for (PParseToken *p = pragma_start; p && p != type_start && budget-- > 0;
+		     p = pparse_next(p)) {
+			if (p == raw_tok) {
+				prelude_end = raw_tok;
+				break;
+			}
+		}
+	}
+	if (pragma_start != prelude_end) emit_range(pragma_start, prelude_end);
 	emit_type_range(type_start, type_end, false, is_split);
 	pparse_ctx->bracket_oe_count = saved_oe;
 	pparse_ctx->bracket_dim_count = saved_dim;
@@ -3850,6 +3864,187 @@ scan_decl_orelse(PParseToken *decl_end, PParseToken *type_start, PParseTypeSpec 
 	return info;
 }
 
+/* ── statement expressions in constant-expression contexts ─────────────
+ * A GNU statement expression is legal in EVERY integer-constant-expression
+ * context, and Clang/GCC fold it when its value is constant. Zero-init's
+ * __builtin_memset is a *statement*, so injecting one destroys that
+ * constness and the backend rejects what was legal C:
+ *
+ *     struct S { int x[({ int vla[n]; (void)vla; 1; })]; };
+ *       -> error: fields must have a constant size
+ *
+ * In such a context the inner declaration generates no code — the compiler
+ * folds the expression — so the zero-init has no runtime meaning and is
+ * dropped rather than rejected, leaving the user's legal C legal. If the
+ * expression does not fold, the program is ill-formed with or without us.
+ *
+ * Only the memset recipe is affected: shapes that lower to an *initializer*
+ * (= 0 / = {0}) still fold. Contexts that permit a VLA (an automatic array
+ * dimension, a sizeof operand) are deliberately NOT treated as ICE contexts
+ * and keep their zero-init.
+ *
+ * These walks run only for a declaration that would otherwise get a memset,
+ * so they are off the hot path. */
+
+/* Innermost enclosing open delimiter for `from`, or NULL at file scope. */
+static PParseToken *p1_enclosing_open(PParseToken *from) {
+	if (!from) return NULL;
+	int depth = 0;
+	for (uint32_t i = pparse_idx(from); i > 0; i--) {
+		PParseToken *t = &pparse_token_pool[i - 1];
+		if (t->kind == PPARSE_TK_PREP_DIR) continue;
+		if (t->flags & PPARSE_TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & PPARSE_TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			return t;
+		}
+	}
+	return NULL;
+}
+
+/* Is `brace` the body of a struct / union / enum rather than a block? */
+static bool p1_brace_is_sue_body(PParseToken *brace) {
+	if (!brace || !pparse_match_ch(brace, '{')) return false;
+	int depth = 0;
+	for (uint32_t i = pparse_idx(brace); i > 0; i--) {
+		PParseToken *t = &pparse_token_pool[i - 1];
+		if (t->kind == PPARSE_TK_PREP_DIR) continue;
+		if (t->flags & PPARSE_TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & PPARSE_TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			return false; /* reached the enclosing group first */
+		}
+		if (depth > 0) continue;
+		if (t->tag & PPARSE_TT_SUE) return true;
+		/* A tag name, attributes, or a C23 `enum E : T` underlying type may
+		 * sit between the keyword and the brace; anything that ends a
+		 * declaration means this brace is not an SUE body. */
+		if (pparse_match_ch(t, ';') || pparse_match_ch(t, '}') || pparse_match_ch(t, '{') ||
+		    pparse_match_ch(t, ')') || pparse_match_ch(t, ','))
+			return false;
+	}
+	return false;
+}
+
+/* Scan back from `from` to the enclosing declaration boundary; true when that
+ * declaration carries static / extern / _Thread_local storage (whose array
+ * dimensions and initializers must both be constant). */
+static bool p1_decl_boundary_has_storage(PParseToken *from) {
+	if (!from) return false;
+	int depth = 0;
+	for (uint32_t i = pparse_idx(from); i > 0; i--) {
+		PParseToken *t = &pparse_token_pool[i - 1];
+		if (t->kind == PPARSE_TK_PREP_DIR) continue;
+		if (t->flags & PPARSE_TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & PPARSE_TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			break; /* left the declaration */
+		}
+		if (depth > 0) continue;
+		if (t->tag & PPARSE_TT_STORAGE) return true;
+		if (pparse_match_ch(t, ';') || pparse_match_ch(t, '{') || pparse_match_ch(t, '}') ||
+		    pparse_match_ch(t, ','))
+			break;
+	}
+	return false;
+}
+
+/* Does this `[` denote a dimension/index that must be an ICE? Automatic array
+ * dimensions and sizeof operands may be VLAs, so they are excluded. */
+static bool p1_bracket_requires_ice(PParseToken *lb) {
+	if (!lb) return false;
+
+	/* Designated initializer index: `[ … ] =` */
+	PParseToken *close = pparse_pair(lb);
+	if (close) {
+		PParseToken *nx = pparse_next(close);
+		while (nx && nx->kind == PPARSE_TK_PREP_DIR) nx = pparse_next(nx);
+		if (nx && pparse_match_ch(nx, '=')) return true;
+	}
+
+	PParseToken *outer = p1_enclosing_open(lb);
+	/* A file-scope declaration's dimension cannot be a VLA. */
+	if (!outer) return true;
+	/* A struct/union member's dimension cannot be a VLA. */
+	if (pparse_match_ch(outer, '{') && p1_brace_is_sue_body(outer)) return true;
+	/* `(int[ … ]){…}` — a compound literal cannot have VLA type. */
+	if (pparse_match_ch(outer, '(') && close) {
+		PParseToken *after = pparse_next(pparse_pair(outer) ? pparse_pair(outer) : outer);
+		while (after && after->kind == PPARSE_TK_PREP_DIR) after = pparse_next(after);
+		if (after && pparse_match_ch(after, '{')) return true;
+	}
+
+	/* Otherwise: a static / extern / _Thread_local declaration's dimension
+	 * cannot be a VLA either. */
+	return p1_decl_boundary_has_storage(lb);
+}
+
+/* True when this declaration sits inside a statement expression that occupies
+ * an integer-constant-expression context.
+ *
+ * `sid` is the declaration's scope, or PPARSE_SID_UNKNOWN. The scope tree
+ * already records which scopes are statement expressions, so the common answer
+ * ("not in one") costs a parent walk of the lexical nesting depth. Only a
+ * declaration genuinely inside a stmt-expr pays for the lexical context scan.
+ * Deriving this by walking tokens backward instead made the check O(tokens)
+ * per declaration and quadratic over a TU. */
+#define PPARSE_SID_UNKNOWN ((uint16_t)0xFFFF)
+
+/* Classify the context a statement expression occupies.
+ * 1 = must be an ICE, 0 = need not be, -1 = inconclusive (this stmt-expr is
+ * nested in another, so only an outer context can decide). */
+static int p1_stmt_expr_ctx_class(PParseToken *open) {
+	PParseToken *ctx = p1_enclosing_open(open);
+	if (!ctx) return 1; /* file-scope initializer */
+	if (pparse_match_ch(ctx, '[')) return p1_bracket_requires_ice(ctx) ? 1 : 0;
+	/* Bitfield width / enum constant value / member dimension. */
+	if (pparse_match_ch(ctx, '{')) {
+		if (p1_brace_is_sue_body(ctx)) return 1;
+		/* Body of an enclosing statement expression: undecidable here.
+		 * `({ int v[n]; ({ int w[n]; 1; }); })` in a member dimension must
+		 * suppress BOTH declarations. */
+		PParseToken *outer = p1_enclosing_open(ctx);
+		if (outer && pparse_is_stmt_expr_open(outer)) return -1;
+	}
+	/* Initializer of a static / extern / _Thread_local object. */
+	return p1_decl_boundary_has_storage(open) ? 1 : 0;
+}
+
+static bool p1_decl_in_ice_stmt_expr(PParseToken *type_start, uint16_t sid) {
+	if (!type_start || sid == PPARSE_SID_UNKNOWN) return false;
+	for (uint16_t s = sid; s != 0 && s < pparse_scope_tree_count;
+	     s = pparse_scope_tree[s].parent_id) {
+		if (!pparse_scope_tree[s].is_stmt_expr) continue;
+		uint32_t bi = pparse_scope_tree[s].open_tok_idx;
+		if (bi == 0) continue;
+		/* `({` — the '(' is physically the token before the body '{'. */
+		PParseToken *paren = &pparse_token_pool[bi - 1];
+		if (!pparse_is_stmt_expr_open(paren)) continue;
+		int cls = p1_stmt_expr_ctx_class(paren);
+		if (cls >= 0) return cls == 1;
+		/* Inconclusive: let an enclosing stmt-expr scope decide. */
+	}
+	return false;
+}
+
 static bool decl_shape_needs_memset(const PParseDeclShape *s,
 				    PParseTypeSpec *type,
 				    PParseDecl *decl,
@@ -3875,11 +4070,18 @@ static uint8_t compute_decl_zero_kind(const PParseDeclShape *s,
 				      PParseDecl *decl,
 				      bool has_init,
 				      bool is_raw,
-				      bool storage_static) {
+				      bool storage_static,
+				      uint16_t sid) {
 	if (!pparse_feat(PPARSE_F_ZEROINIT) || has_init || is_raw || storage_static || type->has_static ||
 	    type->has_extern || s->is_func_type)
 		return P1Z_NONE;
-	if (decl_shape_needs_memset(s, type, decl, has_init, is_raw, storage_static)) return P1Z_MEMSET;
+	if (decl_shape_needs_memset(s, type, decl, has_init, is_raw, storage_static)) {
+		/* A memset inside a stmt-expr in an ICE context would make the
+		 * expression non-constant and the backend would reject it. The
+		 * declaration generates no code there, so drop the zero-init. */
+		if (p1_decl_in_ice_stmt_expr(type_start, sid)) return P1Z_NONE;
+		return P1Z_MEMSET;
+	}
 	if (s->effective_vla) return P1Z_NONE;
 	/* Empty / zero-size-only / sole-FAM aggregates reject `= {0}` on clang/gcc.
 	 * register cannot take the address for memset; const rejects write-via-memset
@@ -3887,6 +4089,8 @@ static uint8_t compute_decl_zero_kind(const PParseDeclShape *s,
 	if (s->is_aggregate && type_start &&
 	    pparse_type_brace_zero_unsafe(type_start, type->end, 0)) {
 		if (type->has_register) return P1Z_NONE;
+		/* Same ICE-context rule as the shape-driven memset above. */
+		if (p1_decl_in_ice_stmt_expr(type_start, sid)) return P1Z_NONE;
 		return P1Z_MEMSET;
 	}
 	if (s->is_aggregate || type->has_typeof || s->is_union_type || (type->has_atomic && s->is_aggregate))
@@ -3914,7 +4118,7 @@ static P1FuncEntry *p1_record_local_decl(uint16_t sid,
 	e->decl.body_close_idx = body_close_idx;
 	e->decl.shape = decl_shape_to_bits(shape);
 	e->decl.zero_kind =
-	    compute_decl_zero_kind(shape, type_start, type, decl, has_init, is_raw, storage_static);
+	    compute_decl_zero_kind(shape, type_start, type, decl, has_init, is_raw, storage_static, sid);
 	return e;
 }
 
@@ -4318,8 +4522,11 @@ static PParseToken *process_declarators(PParseToken *tok,
 		} else {
 			/* No P1K_DECL: file scope, func type, or aggregate member. */
 			shape = pparse_classify_decl_shape(type_start, type, &decl);
-			zero_kind = compute_decl_zero_kind(
-			    &shape, type_start, type, &decl, decl.has_init, decl_is_raw, type->has_static);
+			/* No P1K_DECL recipe means no recorded scope; a stmt-expr
+			 * ICE context cannot arise on this path. */
+			zero_kind = compute_decl_zero_kind(&shape, type_start, type, &decl,
+							   decl.has_init, decl_is_raw,
+							   type->has_static, PPARSE_SID_UNKNOWN);
 #ifdef PRISM_DEBUG
 			if (current_func_idx >= 0 && decl.var_name && !shape.is_func_type &&
 			    !p1_token_in_nested_function(decl.var_name))
@@ -12515,7 +12722,7 @@ static PRISM_COLD void print_help(void) {
 	       "  -fno-zeroinit          Disable zero-initialization\n"
 	       "  -fno-orelse            Disable orelse keyword\n"
 	       "  -fno-line-directives   Disable #line directives\n"
-	       "  -fno-safety            Safety checks warn instead of pparse_error\n"
+	       "  -fno-safety            Safety checks warn instead of error\n"
 	       "  -fflatten-headers      Flatten headers into single output\n"
 	       "  -fno-flatten-headers   Disable header flattening\n"
 	       "  -fno-auto-unreachable  Disable __builtin_unreachable after "

@@ -63,7 +63,167 @@
 
 #define PPARSE_TOMBSTONE ((char *)1)
 
-#include "mem.c"
+/* ── memory policy (was mem.c) ──────────────────────────────────────────
+ *
+ * Every Prism memory operation names whether its byte count is a runtime
+ * decision or a compile-time constant:
+ *
+ *   prism_*_runtime   unbounded runtime size; lowers to compiler builtins.
+ *   prism_*_static    n must be a compile-time constant; PRISM_MEM_*_EXACT
+ *                     gives exact-width inline load/store with no size ladder.
+ *
+ * Vague soft names (prism_eq / prism_copy / prism_zero) are intentionally not
+ * the API — call sites pick the tier explicitly.
+ *
+ * This used to be mem.c, which also carried an opt-in "bounded" tier: no-libc
+ * unrolled byte ladders behind -DPRISM_MEM_KIT=1.  A coverage audit found that
+ * tier was 285 of its 297 instrumented lines dead — compiled into every build
+ * and called by none of them — and that -DPRISM_MEM_KIT=1 had not compiled
+ * since PRISM_LIKELY was renamed to pparse_PRISM_LIKELY, because no build
+ * turns it on.  Untested, unbuildable, unreachable: removed.  What survives is
+ * what the default build actually used, and its codegen is unchanged.
+ */
+
+#ifndef PRISM_HAS_BUILTIN
+#ifdef __has_builtin
+#define PRISM_HAS_BUILTIN(x) __has_builtin(x)
+#else
+#define PRISM_HAS_BUILTIN(x) 0
+#endif
+#endif
+
+#ifndef PRISM_REQUIRE_CONST
+#if defined(__clang__) || defined(__GNUC__)
+#define PRISM_REQUIRE_CONST(n)                                                                               \
+	do {                                                                                                 \
+		_Static_assert(__builtin_constant_p(n), "prism_*_static requires a compile-time constant n"); \
+	} while (0)
+#else
+#define PRISM_REQUIRE_CONST(n) ((void)0)
+#endif
+#endif
+
+/* Exact-width copy/set for compile-time-constant n: inline load/store, never a
+ * runtime size ladder.  Falls back to an unrolled byte loop without the
+ * builtin — still no libc call. */
+#if PRISM_HAS_BUILTIN(__builtin_memcpy_inline)
+#define PRISM_MEM_COPY_EXACT(dst, src, n) __builtin_memcpy_inline((dst), (src), (n))
+#else
+#define PRISM_MEM_COPY_EXACT(dst, src, n)                                                                    \
+	do {                                                                                                 \
+		unsigned char *_d = (unsigned char *)(dst);                                                  \
+		const unsigned char *_s = (const unsigned char *)(src);                                      \
+		for (unsigned _i = 0; _i < (unsigned)(n); _i++) _d[_i] = _s[_i];                             \
+	} while (0)
+#endif
+
+#if PRISM_HAS_BUILTIN(__builtin_memset_inline)
+#define PRISM_MEM_SET_EXACT(dst, v, n) __builtin_memset_inline((dst), (v), (n))
+#else
+#define PRISM_MEM_SET_EXACT(dst, v, n)                                                                       \
+	do {                                                                                                 \
+		unsigned char *_d = (unsigned char *)(dst);                                                  \
+		unsigned char _b = (unsigned char)(v);                                                        \
+		for (unsigned _i = 0; _i < (unsigned)(n); _i++) _d[_i] = _b;                                 \
+	} while (0)
+#endif
+
+static inline PRISM_ALWAYS_INLINE void *prism__mem_ret(void *p) {
+	return p;
+}
+
+/* ── runtime tier (unbounded n; builtins OK) ───────────────────────── */
+
+static inline PRISM_ALWAYS_INLINE void *prism_memcpy_runtime(void *restrict dst, const void *restrict src,
+							     size_t n) {
+#if defined(__clang__) || defined(__GNUC__)
+	return __builtin_memcpy(dst, src, n);
+#else
+	unsigned char *d = (unsigned char *)dst;
+	const unsigned char *s = (const unsigned char *)src;
+	while (n--) *d++ = *s++;
+	return dst;
+#endif
+}
+
+static inline PRISM_ALWAYS_INLINE void *prism_memset_runtime(void *dst, int v, size_t n) {
+#if defined(__clang__) || defined(__GNUC__)
+	return __builtin_memset(dst, v, n);
+#else
+	unsigned char *d = (unsigned char *)dst;
+	unsigned char b = (unsigned char)v;
+	while (n--) *d++ = b;
+	return dst;
+#endif
+}
+
+static inline PRISM_ALWAYS_INLINE void *prism_memzero_runtime(void *dst, size_t n) {
+	return prism_memset_runtime(dst, 0, n);
+}
+
+static inline PRISM_ALWAYS_INLINE int prism_memcmp_runtime(const void *a, const void *b, size_t n) {
+#if defined(__clang__) || defined(__GNUC__)
+	return __builtin_memcmp(a, b, n);
+#else
+	const unsigned char *pa = (const unsigned char *)a;
+	const unsigned char *pb = (const unsigned char *)b;
+	while (n--) {
+		unsigned char av = *pa++, bv = *pb++;
+		if (av != bv) return (int)av - (int)bv;
+	}
+	return 0;
+#endif
+}
+
+static inline PRISM_ALWAYS_INLINE void *prism_memmove_runtime(void *dst, const void *src, size_t n) {
+#if defined(__clang__) || defined(__GNUC__)
+	return __builtin_memmove(dst, src, n);
+#else
+	unsigned char *d = (unsigned char *)dst;
+	const unsigned char *s = (const unsigned char *)src;
+	if (d == s || n == 0) return dst;
+	if ((uintptr_t)d < (uintptr_t)s) {
+		while (n--) *d++ = *s++;
+	} else {
+		d += n;
+		s += n;
+		while (n--) *--d = *--s;
+	}
+	return dst;
+#endif
+}
+
+/* ── static tier (compile-time-constant n) ─────────────────────────── */
+
+#define prism_memcpy_static(dst, src, n)                                                                     \
+	__extension__({                                                                                      \
+		PRISM_REQUIRE_CONST(n);                                                                      \
+		void *_prism_dst = (dst);                                                                    \
+		PRISM_MEM_COPY_EXACT(_prism_dst, (src), (n));                                                \
+		prism__mem_ret(_prism_dst);                                                                  \
+	})
+#define prism_memset_static(dst, v, n)                                                                       \
+	__extension__({                                                                                      \
+		PRISM_REQUIRE_CONST(n);                                                                      \
+		void *_prism_dst = (dst);                                                                    \
+		PRISM_MEM_SET_EXACT(_prism_dst, (v), (n));                                                   \
+		prism__mem_ret(_prism_dst);                                                                  \
+	})
+#define prism_memzero_static(dst, n)                                                                         \
+	__extension__({                                                                                      \
+		PRISM_REQUIRE_CONST(n);                                                                      \
+		void *_prism_dst = (dst);                                                                    \
+		PRISM_MEM_SET_EXACT(_prism_dst, 0, (n));                                                     \
+		prism__mem_ret(_prism_dst);                                                                  \
+	})
+#define prism_memcmp_static(a, b, n) prism_memcmp_runtime((a), (b), (size_t)(n))
+
+/* ── equality helpers that still name the tier ─────────────────────── */
+
+#define prism_memeq_static(a, b, n) (prism_memcmp_static((a), (b), (n)) == 0)
+#define prism_memeq_runtime(a, b, n) (prism_memcmp_runtime((a), (b), (n)) == 0)
+#define prism_memeq_runtime_sized(a, b, n) ((n) == 0 || prism_memcmp_runtime((a), (b), (n)) == 0)
+#define prism_memcpy_runtime_sized(dst, src, n) prism_memcpy_runtime((dst), (src), (n))
 
 #define PPARSE_ENTRY_MATCHES(ent, k, kl)                                                                            \
 	((ent)->key && (ent)->key != PPARSE_TOMBSTONE && (ent)->key_len == (kl) &&                                   \
@@ -1000,7 +1160,7 @@ static void pparse_warn_tok(PParseToken *tok, const char *fmt, ...) {
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_equal_n(PParseToken *tok, const char *op, uint32_t len) {
 	/* Operator/keyword spellings are short; caller proves len fits the bound. */
 	return tok->len == len && tok->ch0 == (uint8_t)op[0] &&
-	       (len <= 1 || prism_memeq_bounded(pparse_loc(tok) + 1, op + 1, (size_t)len - 1u));
+	       (len <= 1 || prism_memeq_runtime(pparse_loc(tok) + 1, op + 1, (size_t)len - 1u));
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_equal_1(PParseToken *tok, char c) {

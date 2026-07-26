@@ -10,7 +10,7 @@
  *   completeness       — closed certificate (products that must stay green)
  *   completeness_open  — correct oracles for still-open classes (hunt4+)
  *
- * Enable open: PRISM_COMPLETENESS_OPEN=1 or PRISM_SUITE_ONLY=completeness_open
+ * Both run unconditionally — no env gate.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +139,7 @@ static void cm_gen_runtime_orelse(void);
 static void cm_gen_runtime_bounds(void);
 static void cm_gen_runtime_zi(void);
 static void cm_gen_runtime_cross(void);
+static void cm_gen_ice_stmt_expr(void);
 #endif
 static void cm_gen_market7_deep(void);
 static void cm_gen_feature_pair(void);
@@ -1343,10 +1344,25 @@ static void cm_gen_feature_cube(void) {
 		"void f(void){ int x; int y; (void)x; (void)y; }",
 		"int *g(void); void f(void){ int *p = g() orelse g() orelse 0; (void)p; }",
 		"void f(void){ raw { int x; const int k[2]={1,2}; (void)x; (void)k; } }",
+		/* Absorbed from test.cert.c: the roadmap's flag-cube / cross-feature
+		 * slices.  They were 7 hand-written functions asserting exactly what
+		 * this product asserts; as rows they sweep all 128 masks instead of
+		 * the single mask each function pinned. */
+		"int main(void){ int seed=0; { defer (void)0; int v = (seed orelse 7); (void)v; } return 0; }",
+		"int main(void){ int z=0; defer (void)0; int y = (z orelse 3); defer (void)1; (void)y; return 0; }",
+		"int main(void){ int a = 0 orelse 1, b = 3; (void)a; (void)b; return 0; }",
+		"void f(int x){ defer { (void)0; } switch (x) { int y; case 0: y = 1; break; default: break; } }",
+		"int main(void){ int n = 3; int arr[n orelse 4]; (void)arr; return 0; }",
+		"static int get(void){ return 1; } int main(void){ defer { int t = get() orelse 0; (void)t; } return 0; }",
+		"int main(void){ const int k[2] = {1, 2}; (void)k; return 0; }",
+		"int main(void){ int n = 3; int a[n]; (void)a; return 0; }",
+		"int main(void){ defer (void)0; int z=0; int y = z orelse 1; int x[2]; "
+		"const int k[2]={1,2}; (void)y; (void)x; (void)k; return 0; }",
 	};
 	CmStats st = {0};
-	/* 2^6 = 64 feature masks × 6 snips = 384 cells */
-	for (unsigned mask = 0; mask < 64; mask++) {
+	/* 2^7 = 128 feature masks (warn_safety is the 7th, absorbed from the cert
+	 * suite's -fno-safety hooks) × snips. */
+	for (unsigned mask = 0; mask < 128; mask++) {
 		PrismFeatures f = prism_defaults();
 		f.defer = mask & 1;
 		f.orelse = (mask >> 1) & 1;
@@ -1354,6 +1370,7 @@ static void cm_gen_feature_cube(void) {
 		f.auto_static = (mask >> 3) & 1;
 		f.auto_unreachable = (mask >> 4) & 1;
 		f.zeroinit = (mask >> 5) & 1;
+		f.warn_safety = (mask >> 6) & 1;
 		for (size_t s = 0; s < sizeof(snips) / sizeof(snips[0]); s++) {
 			st.cells++;
 			PrismResult r = cm_txf(snips[s], f);
@@ -1387,6 +1404,574 @@ static void cm_gen_feature_cube(void) {
 	}
 	cm_report("gen/feature-cube", &st);
 }
+
+#ifndef _WIN32
+/* Compiling byte-identical output twice proves nothing and costs a process
+ * spawn, so the executed tiers dedupe on the emitted C.  Feature masks that
+ * are irrelevant to a given program collapse onto the same output, which is
+ * most of the cube. */
+static unsigned long cm_run_seen[512];
+static int cm_run_seen_n;
+
+static int cm_already_ran(const char *out) {
+	unsigned long h = 5381;
+	for (const unsigned char *p = (const unsigned char *)out; *p; p++) h = h * 33u + *p;
+	for (int i = 0; i < cm_run_seen_n; i++)
+		if (cm_run_seen[i] == h) return 1;
+	if (cm_run_seen_n < (int)(sizeof(cm_run_seen) / sizeof(cm_run_seen[0])))
+		cm_run_seen[cm_run_seen_n++] = h;
+	return 0;
+}
+
+/*
+ * Executed feature-cube slice (absorbs test.cert.c's compile-and-run oracles).
+ *
+ * The cube above is a static oracle: it checks that a disabled feature leaves
+ * no trace and an enabled one leaves no keyword.  It cannot see "lowered to C
+ * that does not compile" or "compiles but returns nonzero".  This tier runs the
+ * emitted C for a product of runnable programs × feature configurations, which
+ * is the only oracle in the tree that catches both.
+ */
+static void cm_gen_cert_compile_run(void) {
+	/* Runnable programs: each returns 0 iff its semantics held.  `needs` names
+	 * the features the program's EXPECTED RESULT depends on — reading an
+	 * uninitialized array only yields zeros with zeroinit on, and a
+	 * declaration jumped over by a switch label is a hard error unless safety
+	 * is downgraded.  Cells a config cannot satisfy are gated out and counted
+	 * separately, so a tier that skips everything cannot read as coverage. */
+#define CR_NEED_ZI 1u
+#define CR_NEED_NOSAFETY 2u
+	static const struct {
+		unsigned needs;
+		const char *code;
+	} progs[] = {
+	    {0,
+	     "int main(void){ int seed = 0; int hit = 0;\n"
+	     "  { defer hit = 1; int v = (seed orelse 7); if (v != 7) return 1; }\n"
+	     "  return hit ? 0 : 2; }\n"},
+	    {0,
+	     "int main(void){ int z = 0; int n = 0;\n"
+	     "  { defer n += 1; int y = (z orelse 3); defer n += 2; if (y != 3) return 1; }\n"
+	     "  return n == 3 ? 0 : 2; }\n"},
+	    {0, "int main(void){ int a = 0 orelse 1, b = 3; return (a == 1 && b == 3) ? 0 : 1; }\n"},
+	    {0,
+	     "int main(void){ int n = 3; int arr[n orelse 4]; arr[0] = 7;\n"
+	     "  return arr[0] == 7 ? 0 : 1; }\n"},
+	    {0,
+	     "static int get(void){ return 1; }\n"
+	     "int main(void){ int seen = 0; { defer { int t = get() orelse 0; seen = t; } }\n"
+	     "  return seen == 1 ? 0 : 1; }\n"},
+	    {0,
+	     "int main(void){ const int k[2] = {1, 2}; return (k[0] == 1 && k[1] == 2) ? 0 : 1; }\n"},
+	    {CR_NEED_ZI,
+	     "int main(void){ int x[3]; for (int i = 0; i < 3; i++) if (x[i]) return 1; return 0; }\n"},
+	    {CR_NEED_NOSAFETY,
+	     "void f(int x){ defer { (void)0; } switch (x) { int y; case 0: y = 1; (void)y; break;\n"
+	     "  default: break; } }\n"
+	     "int main(void){ f(0); f(1); return 0; }\n"},
+	};
+	/* Feature configurations the cert roadmap named as mandatory couplings. */
+	static const struct {
+		const char *tag;
+		int zeroinit, auto_static, bounds_check, warn_safety;
+	} cfg[] = {
+	    {"defaults", 1, 1, 1, 0},
+	    {"zi-off", 0, 1, 1, 0},
+	    {"as-off", 1, 0, 1, 0},
+	    {"bchk-off", 1, 1, 0, 0},
+	    {"nosafety", 1, 1, 1, 1},
+	    {"zi-off+nosafety", 0, 1, 1, 1},
+	};
+	CmStats st = {0};
+	long gated = 0, dedup = 0;
+	for (size_t c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+		PrismFeatures f = prism_defaults();
+		f.zeroinit = cfg[c].zeroinit;
+		f.auto_static = cfg[c].auto_static;
+		f.bounds_check = cfg[c].bounds_check;
+		f.warn_safety = cfg[c].warn_safety;
+		for (size_t p = 0; p < sizeof(progs) / sizeof(progs[0]); p++) {
+			unsigned need = progs[p].needs;
+			if (((need & CR_NEED_ZI) && !cfg[c].zeroinit) ||
+			    ((need & CR_NEED_NOSAFETY) && !cfg[c].warn_safety)) {
+				gated++;
+				continue;
+			}
+			st.cells++;
+			PrismResult r = cm_txf(progs[p].code, f);
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "cert-run reject cfg=%s prog=%zu", cfg[c].tag, p);
+				prism_free(&r);
+				continue;
+			}
+			if (cm_kw(r.output, "defer") || cm_kw(r.output, "orelse"))
+				cm_note(&st, "cert-run keyword leak cfg=%s prog=%zu", cfg[c].tag, p);
+			if (!cm_already_ran(r.output)) {
+				char cname[128], rname[128];
+				snprintf(cname, sizeof(cname),
+					 "cert-run[%s/%zu]: emitted C compiles", cfg[c].tag, p);
+				snprintf(rname, sizeof(rname),
+					 "cert-run[%s/%zu]: emitted C returns 0", cfg[c].tag, p);
+				check_transpiled_output_compiles_and_runs(r.output, cname, rname);
+			} else {
+				dedup++;
+			}
+			prism_free(&r);
+		}
+	}
+	char name[256];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/cert-compile-run]: %ld cells, %ld bad, %ld gated-out, "
+		 "%ld dedup%s%s",
+		 st.cells, st.bad, gated, dedup, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+#undef CR_NEED_ZI
+#undef CR_NEED_NOSAFETY
+}
+#endif /* !_WIN32 */
+
+/*
+ * `raw` keyword product (absorbs test.raw.c).
+ *
+ * SPEC Part II "The `raw` Keyword" is 3 constraints + 5 semantic clauses, and
+ * every one of them is a product.  No oracle here names an expected emission —
+ * that was test.raw.c's weakness (296 substring CHECKs that could not see a
+ * wrong-but-plausible lowering):
+ *
+ *   O1 TOKEN     accepted output contains no `raw` word           (Semantics 1)
+ *   O2 EQUIV     an all-`raw` declaration emits identically to the same
+ *                declaration with the `raw` tokens deleted and zeroinit OFF.
+ *                That IS the definition of "suppresses zero-initialization",
+ *                stated without naming a single memset       (Semantics 1,2,4)
+ *   O3 SPLIT     `T a, raw b;` suppresses exactly as much as `T a; raw T b;`
+ *                — per-declarator form and split form must agree on the number
+ *                of zeroing constructs emitted                    (Semantics 3)
+ *   O4 COMPILES  the emitted C is accepted by the backend compiler
+ *   O5 IDENT     `raw` bound as an ordinary identifier survives, and the
+ *                emitted program still computes the right answer at runtime
+ *                (the disambiguation torture, promoted from inspect to execute)
+ */
+
+#define RAW_PRE "struct RS { int a; int b[2]; }; typedef int rs_t;\n"
+
+/* Count emitted zeroing constructs (all three lowering strategies). */
+static int cm_zero_marks(const char *s) {
+	int n = 0;
+	for (const char *p = s; (p = strstr(p, "memset")) != NULL; p += 6) n++;
+	for (const char *p = s; (p = strstr(p, "= {0}")) != NULL; p += 5) n++;
+	for (const char *p = s; (p = strstr(p, "__prism_p_")) != NULL; p += 10) n++;
+	return n;
+}
+
+/* Delete every whole-word `raw` token (and one following space) from src. */
+static void cm_strip_raw(const char *src, char *out, size_t cap) {
+	size_t o = 0;
+	for (const char *p = src; *p && o + 1 < cap;) {
+		int lb = (p == src) || (!isalnum((unsigned char)p[-1]) && p[-1] != '_');
+		if (lb && strncmp(p, "raw", 3) == 0 && !isalnum((unsigned char)p[3]) && p[3] != '_') {
+			p += 3;
+			while (*p == ' ') p++;
+			continue;
+		}
+		out[o++] = *p++;
+	}
+	out[o] = '\0';
+}
+
+static void cm_gen_raw_product(void) {
+	/* Declaration shapes: type specifier + declarator.  `n` is a parameter,
+	 * so the VLA row is the only variably-modified cell and nothing else in
+	 * the TU is a zero-init candidate — which is what makes O2 exact. */
+	static const struct {
+		const char *ty, *decl;
+	} shapes[] = {
+	    {"int", "v"},        {"int", "v[4]"},      {"int", "v[2][3]"},
+	    {"int *", "v"},      {"char", "v[8]"},     {"long long", "v"},
+	    {"double", "v"},     {"struct RS", "v"},   {"struct RS", "v[2]"},
+	    {"rs_t", "v"},       {"rs_t", "v[3]"},     {"int", "v[n]"},
+	    {"unsigned", "v"},   {"int *", "v[2]"},    {"struct RS *", "v"},
+	};
+	/* Storage/qualifier prefixes that may sit alongside `raw`. */
+	static const char *stor[] = {"", "static ", "register ", "const "};
+	/* Placements: %1$s storage, %2$s type, %3$s declarator.  Every one of
+	 * these is a legal position per the SPEC grammar; ill-formed positions
+	 * (`int raw v;`) are deliberately absent — asserting a verdict there
+	 * would be a hand-written expectation, which is what this replaces. */
+	static const char *place[] = {
+	    "%sraw %s %s;",                              /* raw before type      */
+	    "raw %s%s %s;",                              /* raw before storage   */
+	    "raw raw %s%s %s;",                          /* consecutive absorb   */
+	    /* Consecutive raws with NOISE between them — comments and both
+	     * attribute spellings.  emit_noise_between_raws has a balanced-group
+	     * arm that only these reach (12 lines the A/B coverage diff showed
+	     * the deleted test.raw.c was the sole reader of). */
+	    "raw /*n*/ raw %s%s %s;",
+	    "raw __attribute__((unused)) raw %s%s %s;",
+	    "raw [[maybe_unused]] raw %s%s %s;",
+	    "__attribute__((unused)) %sraw %s %s;",      /* GNU attr + raw       */
+	    "[[maybe_unused]] %sraw %s %s;",             /* C23 attr + raw       */
+	};
+	/* Planting sites.  A one-site product is exactly the shape that misses
+	 * this project's signature bug class ("the context nobody enumerated"),
+	 * and the deleted test.raw.c pinned defects at file scope, in struct
+	 * bodies, in cast/return-type neighbourhoods and after labels.  The
+	 * differential oracle transfers to every site unchanged, so sites are a
+	 * table, not new logic. */
+	static const struct {
+		const char *name, *tmpl;
+		int allows_vm; /* variably-modified declarations legal here? */
+	} sites[] = {
+	    {"block", "void rawf(int n) { (void)n; %s (void)sizeof(v); }\n", 1},
+	    {"inner-block", "void rawf(int n) { (void)n; { %s (void)sizeof(v); } }\n", 1},
+	    {"file-scope", "%s\nvoid rawf(int n) { (void)n; (void)sizeof(v); }\n", 0},
+	    {"struct-body", "struct SM { %s };\nvoid rawf(int n) { (void)n; }\n", 0},
+	    {"switch-body",
+	     "void rawf(int n) { switch (n) { default: { %s (void)sizeof(v); } } }\n", 1},
+	    {"after-label",
+	     "void rawf(int n) { (void)n; goto L; L: { %s (void)sizeof(v); } }\n", 1},
+	    {"nonvoid-return",
+	     "int rawf(int n) { (void)n; %s (void)sizeof(v); return 0; }\n", 1},
+	    {"pp-adjacent",
+	     "#define RAWM 1\nvoid rawf(int n) { (void)n; %s (void)sizeof(v); (void)RAWM; }\n", 1},
+	    /* Return-type neighbourhood: emit_ret_type_tokens / emit_type_range
+	     * each carry a raw-strip arm nothing else reaches. */
+	    {"before-fn-def", "%s\nint rawg(void) { return 0; }\nvoid rawf(int n) { (void)n; }\n", 0},
+	    /* Statement-level braces after the declaration drive
+	     * emit_expr_to_semicolon's brace-depth tracking. */
+	    {"brace-init-neighbour",
+	     "void rawf(int n) { (void)n; %s (void)sizeof(v); int bi[2] = {1, 2}; (void)bi; }\n", 1},
+	};
+	CmStats st = {0};
+	long gated = 0;
+	char src[1400], stripped[1400], decl[256];
+	for (size_t si = 0; si < sizeof(sites) / sizeof(sites[0]); si++)
+	for (size_t pl = 0; pl < sizeof(place) / sizeof(place[0]); pl++)
+		for (size_t sh = 0; sh < sizeof(shapes) / sizeof(shapes[0]); sh++)
+			for (size_t so = 0; so < sizeof(stor) / sizeof(stor[0]); so++) {
+				/* register arrays and const-without-init are not the
+				 * subject under test; skip rather than pin a verdict. */
+				int is_reg = strcmp(stor[so], "register ") == 0;
+				int is_const = strcmp(stor[so], "const ") == 0;
+				int is_vla = strstr(shapes[sh].decl, "[n]") != NULL;
+				if ((is_reg || is_const) && strchr(shapes[sh].decl, '['))
+					{ gated++; continue; }
+				if (is_reg && is_vla) { gated++; continue; }
+				if (strcmp(place[pl], "raw %s%s %s;") == 0 && !stor[so][0])
+					{ gated++; continue; } /* duplicate of placement 0 */
+
+				if (!sites[si].allows_vm && is_vla) { gated++; continue; }
+				/* struct members take no storage class */
+				if (strcmp(sites[si].name, "struct-body") == 0 && stor[so][0] &&
+				    strcmp(stor[so], "const ") != 0) { gated++; continue; }
+				if (strcmp(sites[si].name, "file-scope") == 0 &&
+				    strcmp(stor[so], "register ") == 0) { gated++; continue; }
+
+				snprintf(decl, sizeof(decl), place[pl], stor[so], shapes[sh].ty,
+					 shapes[sh].decl);
+				char body[900];
+				snprintf(body, sizeof(body), sites[si].tmpl, decl);
+				snprintf(src, sizeof(src), RAW_PRE "%s", body);
+				st.cells++;
+
+				/* The oracle is SYMMETRIC: whatever prism decides about the
+				 * raw form, it must decide identically about the same source
+				 * with `raw` deleted and zeroinit off.  That keeps every site
+				 * honest without this suite guessing a verdict — a rejection
+				 * is only a finding when the two pipelines disagree. */
+				cm_strip_raw(src, stripped, sizeof(stripped));
+				PrismFeatures zoff = prism_defaults();
+				zoff.zeroinit = false;
+				PrismResult r = cm_tx(src);
+				PrismResult ref = cm_txf(stripped, zoff);
+				if (cm_ok(&r) != cm_ok(&ref)) {
+					cm_note(&st, "raw accept/reject disagreement [%s] %s",
+						sites[si].name, decl);
+				} else if (cm_ok(&r)) {
+					if (!r.output || cm_kw(r.output, "raw")) /* O1 */
+						cm_note(&st, "raw token survives [%s] %s",
+							sites[si].name, decl);
+					else if (!ref.output || !cx_norm_equal(r.output, ref.output))
+						cm_note(&st, /* O2 */
+							"raw != zeroinit-off equivalence [%s] %s",
+							sites[si].name, decl);
+				}
+				prism_free(&ref);
+				prism_free(&r);
+			}
+
+	/* O3: per-declarator `raw` suppresses exactly the declarators it marks. */
+	for (size_t sh = 0; sh < sizeof(shapes) / sizeof(shapes[0]); sh++) {
+		if (strstr(shapes[sh].decl, "[n]")) { gated++; continue; } /* VM split */
+		char mixed[1024], split[1024];
+		snprintf(mixed, sizeof(mixed),
+			 RAW_PRE "void rawf(int n) { (void)n; %s a, raw %s; "
+				 "(void)sizeof(a); (void)sizeof(v); }\n",
+			 shapes[sh].ty, shapes[sh].decl);
+		snprintf(split, sizeof(split),
+			 RAW_PRE "void rawf(int n) { (void)n; %s a; raw %s %s; "
+				 "(void)sizeof(a); (void)sizeof(v); }\n",
+			 shapes[sh].ty, shapes[sh].ty, shapes[sh].decl);
+		st.cells++;
+		PrismResult rm = cm_tx(mixed), rs = cm_tx(split);
+		if (!cm_ok(&rm) || !rm.output || !cm_ok(&rs) || !rs.output) {
+			/* A rejected split is a documented multi-declarator constraint,
+			 * not a raw defect — only flag a one-sided rejection. */
+			if (cm_ok(&rm) != cm_ok(&rs))
+				cm_note(&st, "raw split/mixed accept disagreement: %s %s",
+					shapes[sh].ty, shapes[sh].decl);
+		} else if (cm_zero_marks(rm.output) != cm_zero_marks(rs.output)) {
+			cm_note(&st, "raw per-declarator != split (%d vs %d): %s %s",
+				cm_zero_marks(rm.output), cm_zero_marks(rs.output),
+				shapes[sh].ty, shapes[sh].decl);
+		}
+		prism_free(&rm);
+		prism_free(&rs);
+	}
+
+	char name[320];
+	snprintf(name, sizeof(name), "completeness[gen/raw-product]: %ld cells, %ld bad, %ld gated-out%s%s",
+		 st.cells, st.bad, gated, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+}
+
+/*
+ * `raw` as an ordinary identifier, executed (absorbs test.raw.c's
+ * disambiguation torture).  Each program returns 0 iff its arithmetic held, so
+ * the oracle is the program's own exit status — not a substring of the output.
+ */
+#ifndef _WIN32
+/*
+ * defer x complex return type x return-expression shape.
+ *
+ * emit_ret_type synthesizes a `typedef` for a return type that has a suffix
+ * (an array- or function-returning function), so that the defer lowering can
+ * name the captured return value.  The A/B coverage diff after retiring
+ * test.raw.c / test.cert.c showed those synthesis lines had exactly one reader
+ * in the whole tree, and it was a single hand-written pin
+ * (test_raw_return_type_defer_leak).  A product is the durable form.
+ *
+ * Oracle: accept, no keyword survives, and the emitted C compiles — a bad
+ * typedef synthesis produces C the backend rejects, which is precisely what a
+ * substring assertion cannot see.
+ */
+#ifndef _WIN32
+static int cm_cc_accepts(const char *code);
+#endif
+
+static void cm_gen_defer_ret_shape(void) {
+	static const struct {
+		const char *proto_open, *proto_close, *ret_expr, *decls;
+	} rets[] = {
+	    {"int (*", "(void))[4]", "&drs_a", "static int drs_a[4];"},
+	    {"int (*", "(void))[2][3]", "&drs_b", "static int drs_b[2][3];"},
+	    {"void (*", "(void))(int)", "drs_f", "static void drs_f(int x){ (void)x; }"},
+	    {"int *", "(void)", "drs_a", "static int drs_a[4];"},
+	    {"int ", "(void)", "7", ""},
+	    {"drs_t ", "(void)", "(drs_t){0}", "typedef struct { int x; } drs_t;"},
+	    {"struct DRS ", "(void)", "(struct DRS){0}", "struct DRS { int x; };"},
+	    /* Inline struct definition in the return type: SPEC makes this a hard
+	     * error when a defer is present ("unresolvable return type"). Kept as
+	     * a row precisely so the relational invariant below covers it. */
+	    {"struct DRS2 { int x; } ", "(void)", "(struct DRS2){0}", ""},
+	};
+	static const char *exprs[] = {
+	    "%s", "(%s)", "((%s))", "drs_id(%s)", "(1 ? (%s) : (%s))",
+	};
+	/* Defer bodies. Index 0 is the no-defer control. */
+	static const char *defers[] = {
+	    "", "defer drs_h();", "defer { drs_h(); }", "defer drs_h(); defer drs_h();",
+	    "{ defer drs_h(); } defer drs_h();",
+	};
+#define DRS_NDEF ((int)(sizeof(defers) / sizeof(defers[0])))
+
+	CmStats st = {0};
+	char src[1200], expr[256];
+	for (size_t r = 0; r < sizeof(rets) / sizeof(rets[0]); r++)
+		for (size_t e = 0; e < sizeof(exprs) / sizeof(exprs[0]); e++) {
+			snprintf(expr, sizeof(expr), exprs[e], rets[r].ret_expr, rets[r].ret_expr);
+			int accept[DRS_NDEF], diag[DRS_NDEF];
+			for (int d = 0; d < DRS_NDEF; d++) {
+				snprintf(src, sizeof(src),
+					 "void drs_h(void);\n%s\n"
+					 "#define drs_id(x) (x)\n"
+					 "%sdrs_fn%s { %s return %s; }\n",
+					 rets[r].decls, rets[r].proto_open, rets[r].proto_close,
+					 defers[d], expr);
+				st.cells++;
+				PrismResult res = cm_tx(src);
+				accept[d] = cm_ok(&res) && res.output != NULL;
+				diag[d] = (!cm_ok(&res)) && res.error_msg && res.error_msg[0];
+				if (accept[d]) {
+					if (cm_kw(res.output, "defer"))
+						cm_note(&st, "defer-ret keyword leak r=%zu e=%zu d=%d",
+							r, e, d);
+#ifndef _WIN32
+					else if (!cm_cc_accepts(res.output))
+						cm_note(&st,
+							"defer-ret emitted C rejected by cc r=%zu e=%zu d=%d",
+							r, e, d);
+#endif
+				}
+				prism_free(&res);
+			}
+			/* THE INVARIANT (relational — no hand-written verdicts):
+			 * whether a defer can be lowered in this function is a property
+			 * of the RETURN TYPE, not of the defer body.  So every non-empty
+			 * defer body must reach the same accept/reject decision; and when
+			 * they reject, the no-defer control must accept (proving the
+			 * program is otherwise well-formed) and a diagnostic must be
+			 * present (never a silent drop). */
+			for (int d = 2; d < DRS_NDEF; d++)
+				if (accept[d] != accept[1])
+					cm_note(&st,
+						"defer-ret verdict depends on defer BODY r=%zu e=%zu "
+						"(d1=%d d%d=%d)",
+						r, e, accept[1], d, accept[d]);
+			if (!accept[1]) {
+				if (!accept[0])
+					cm_note(&st, "defer-ret control (no defer) rejected r=%zu e=%zu",
+						r, e);
+				if (!diag[1])
+					cm_note(&st, "defer-ret reject without diagnostic r=%zu e=%zu", r,
+						e);
+			}
+		}
+#undef DRS_NDEF
+	cm_report("gen/defer-ret-shape", &st);
+}
+
+/*
+ * Raw string literals — R"delim(...)delim" — the tokenizer feature that shares
+ * a prefix with the `raw` keyword and nothing else (absorbs test.raw.c's
+ * ~25 raw_string_* pins, including the 15/16-character delimiter boundary that
+ * probes a fixed tokenizer buffer bound).
+ *
+ * Oracle: the emitted program compares the raw literal against a conventionally
+ * escaped literal built independently by this generator, and returns 0 iff they
+ * are equal.  A tokenizer that mis-scans the delimiter either fails to compile
+ * or returns nonzero — no substring inspection involved.
+ */
+static void cm_gen_raw_string(void) {
+	/* Contents chosen to break naive scanners: embedded quotes, backslashes,
+	 * a false ')' + partial-delimiter ending, newlines, and the empty body. */
+	static const char *contents[] = {
+	    "",
+	    "x",
+	    "hello raw",
+	    "with \"quotes\" inside",
+	    "back\\slash and \\n literal",
+	    "parens ( ) inside",
+	    "false ending )D( still going",
+	    "C:\\path\\to\\file",
+	    "line1\nline2\nline3",
+	    "{\"json\": [1, 2, 3]}",
+	    "^[a-z]+\\d*$",
+	    ")",
+	    "))",
+	};
+	/* Delimiter lengths sweep the boundary: 0..16 (16 is the documented max). */
+	static const char *delims[] = {
+	    "", "D", "AB", "ABC", "ABCDEFGHIJKLMN",   /* 14 */
+	    "ABCDEFGHIJKLMNO",                        /* 15 */
+	    "ABCDEFGHIJKLMNOP",                       /* 16 */
+	    "1234567890ABCDEF",                       /* 16, digits+letters */
+	};
+	CmStats st = {0};
+	char raw_lit[512], esc_lit[512], src[1600];
+	for (size_t d = 0; d < sizeof(delims) / sizeof(delims[0]); d++)
+		for (size_t c = 0; c < sizeof(contents) / sizeof(contents[0]); c++) {
+			const char *body = contents[c];
+			/* A raw literal cannot contain its own ")delim" terminator. */
+			char term[32];
+			snprintf(term, sizeof(term), ")%s\"", delims[d]);
+			if (strstr(body, term)) continue;
+
+			snprintf(raw_lit, sizeof(raw_lit), "R\"%s(%s)%s\"", delims[d], body,
+				 delims[d]);
+			/* Conventional escaping of the same bytes, built here so the
+			 * comparison never consults the tokenizer under test. */
+			size_t o = 0;
+			esc_lit[o++] = '"';
+			for (const char *p = body; *p && o + 5 < sizeof(esc_lit); p++) {
+				if (*p == '"' || *p == '\\') {
+					esc_lit[o++] = '\\';
+					esc_lit[o++] = *p;
+				} else if (*p == '\n') {
+					esc_lit[o++] = '\\';
+					esc_lit[o++] = 'n';
+				} else {
+					esc_lit[o++] = *p;
+				}
+			}
+			esc_lit[o++] = '"';
+			esc_lit[o] = '\0';
+
+			snprintf(src, sizeof(src),
+				 "int rs_cmp(const char *a, const char *b){ while (*a && *a == *b)"
+				 " { a++; b++; } return *a - *b; }\n"
+				 "int main(void) { const char *r = %s; const char *e = %s;\n"
+				 "  return rs_cmp(r, e) == 0 ? 0 : 1; }\n",
+				 raw_lit, esc_lit);
+			st.cells++;
+			PrismResult r = cm_tx(src);
+			if (!cm_ok(&r) || !r.output) {
+				cm_note(&st, "raw-string reject d=%zu c=%zu", d, c);
+				prism_free(&r);
+				continue;
+			}
+#ifndef _WIN32
+			if (!cm_already_ran(r.output)) {
+				char cn[160], rn[160];
+				snprintf(cn, sizeof(cn), "raw-string[d%zu/c%zu]: emitted C compiles",
+					 d, c);
+				snprintf(rn, sizeof(rn),
+					 "raw-string[d%zu/c%zu]: raw literal == escaped literal", d, c);
+				check_transpiled_output_compiles_and_runs(r.output, cn, rn);
+			}
+#endif
+			prism_free(&r);
+		}
+	cm_report("gen/raw-string", &st);
+}
+
+static void cm_gen_raw_identifier(void) {
+	static const char *bodies[] = {
+	    "int raw = 5; raw += 2; return raw == 7 ? 0 : 1;",
+	    "int raw = 3; return raw * 2 == 6 ? 0 : 1;",
+	    "int raw = 6; return (raw & 4) == 4 ? 0 : 1;",
+	    "int raw = 1; return (raw || 0) ? 0 : 1;",
+	    "int raw = 0; raw++; ++raw; return raw == 2 ? 0 : 1;",
+	    "int raw[3] = {1,2,3}; return raw[2] == 3 ? 0 : 1;",
+	    "struct { int raw; } s; s.raw = 9; return s.raw == 9 ? 0 : 1;",
+	    "int raw = 4; return raw > 3 ? 0 : 1;",
+	    "int raw = 2, other = 3; return raw + other == 5 ? 0 : 1;",
+	    "int raw = 1; return raw ? 0 : 1;",
+	    "int raw = 8; return (int)sizeof(raw) == (int)sizeof(int) ? 0 : 1;",
+	    "int raw = 7; int *p = &raw; return *p == 7 ? 0 : 1;",
+	    "int raw = 5; switch (raw) { case 5: return 0; default: return 1; }",
+	    "int raw = 0; for (raw = 0; raw < 3; raw++) {} return raw == 3 ? 0 : 1;",
+	    "int raw = 2; return (raw << 1) == 4 ? 0 : 1;",
+	};
+	CmStats st = {0};
+	char src[512];
+	for (size_t b = 0; b < sizeof(bodies) / sizeof(bodies[0]); b++) {
+		snprintf(src, sizeof(src), "int main(void) { %s }\n", bodies[b]);
+		st.cells++;
+		PrismResult r = cm_tx(src);
+		if (!cm_ok(&r) || !r.output) {
+			cm_note(&st, "raw-ident reject b=%zu", b);
+			prism_free(&r);
+			continue;
+		}
+		char cname[160], rname[160];
+		snprintf(cname, sizeof(cname), "raw-ident[%zu]: emitted C compiles", b);
+		snprintf(rname, sizeof(rname), "raw-ident[%zu]: emitted C returns 0", b);
+		check_transpiled_output_compiles_and_runs(r.output, cname, rname);
+		prism_free(&r);
+	}
+	cm_report("gen/raw-identifier", &st);
+}
+#endif /* !_WIN32 */
 
 /*
  * Historical golf pins — unique emission shapes (absorbs test.golf.c).
@@ -1520,6 +2105,8 @@ void run_completeness_tests(void) {
 	cm_gen_zeroinit();
 	cm_gen_defer_cfg();
 	cm_gen_feature_cube();
+	cm_gen_raw_product();
+	cm_gen_defer_ret_shape();
 	cm_gen_golf_pins();
 	cm_gen_reject_alphabet();
 	cm_gen_soft_ident();
@@ -1612,6 +2199,7 @@ void run_completeness_tests(void) {
 	cm_gen_runtime_bounds();
 	cm_gen_runtime_zi();
 	cm_gen_runtime_cross();
+	cm_gen_ice_stmt_expr();
 #endif
 }
 
@@ -5426,6 +6014,33 @@ static void cm_gen_bounds_member_falsepos(void) {
 }
 
 #ifndef _WIN32
+/* ── compile oracle ───────────────────────────────────────────────────
+ * Every other static hunter in this file checks output with a SUBSTRING
+ * oracle (cm_has_bchk_wrap / cm_kw). That is structurally blind to the
+ * recurring "accepted, but lowered to illegal C" class — illegal VLAs,
+ * static VLAs, ternary-in-designator, memset-on-const, if(!array). Handing
+ * the output to the backend is the only oracle that sees it.
+ *
+ * Returns 1 = cc accepts, 0 = cc rejects, -1 = infrastructure failure
+ * (never conflate -1 with 0; a broken temp dir must not read as green).
+ *
+ * Uses run_command_status (posix_spawn + spawn mutex), never system(3):
+ * this suite runs on a pthread beside ~20 others and fork-based spawning
+ * from the multithreaded harness caused intermittent SIGBUS on macOS arm64.
+ * Uses -w rather than -Wno-everything, which is clang-only (GCC CI would
+ * reject the flag and turn the whole tier vacuous). */
+static int cm_cc_accepts(const char *code) {
+	char *path = create_temp_file(code);
+	if (!path) return -1;
+	char cmd[PATH_MAX + 96];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", path);
+	int rc = run_command_status(cmd);
+	unlink(path);
+	free(path);
+	if (rc < 0) return -1;
+	return rc == 0 ? 1 : 0;
+}
+
 /* Transpile → cc → run. Exit codes: child status, or -1000/-1001/-1002 on fail. */
 static int cm_exec(const char *src, PrismFeatures feat) {
 	PrismResult r = cm_txf(src, feat);
@@ -5696,19 +6311,136 @@ static void cm_gen_runtime_cross(void) {
 	}
 	cm_report("gen/runtime-cross", &st);
 }
+/* ── ICE-context × injected-statement compile oracle ──────────────────
+ * A GNU statement expression may appear in EVERY integer-constant-expression
+ * context, and Clang/GCC fold it when its value is constant. Any Prism
+ * transform that injects a *statement* into such a stmt-expr destroys that
+ * constness and turns legal C into C the backend rejects.
+ *
+ * Seed defect this tier found (zero-init's __builtin_memset path; now fixed):
+ *     void f(int n){ struct S { int x[({ int vla[n]; (void)vla; 1; })]; } obj; }
+ * compiles as plain C, but the emitted memset made the member a VLA-in-struct.
+ * test.zeroinit.c's test_struct_body_stmt_expr_features had LOCKED that shape
+ * with a strstr(output,"memset") oracle — the substring matched the *enclosing*
+ * object's memset while the output did not compile. Exactly the blind spot this
+ * tier exists to remove. compute_decl_zero_kind now drops the zero-init for a
+ * declaration inside a stmt-expr in an ICE context (p1_decl_in_ice_stmt_expr).
+ *
+ * Oracle is self-gating; no hand-derived expectations:
+ *     plain-C baseline compiles AND prism accepts  =>  output must compile
+ * A conservative Prism *reject* is always acceptable. */
+static void cm_gen_ice_stmt_expr(void) {
+	/* Declarations placed inside the statement expression. The zero-init
+	 * lowering differs per shape: memset (VLA/union/typeof-array/empty
+	 * aggregate) vs an initializer (scalar, fixed array). Only the
+	 * memset path emits a *call*, which is what breaks constant folding. */
+	static const char *payload[] = {
+		"int vla[n];",		     /* VLA           -> memset */
+		"union U{int a; long b;} u;", /* union         -> memset */
+		"typeof(int[4]) ta;",	     /* typeof array  -> memset */
+		"struct E1{} e1;",	     /* empty agg     -> memset */
+		"int fx[4];",		     /* array         -> = {0}  */
+		"int s;",		     /* scalar        -> = 0    */
+		"struct T{int a,b;} t;",
+		"_Atomic int ai;",
+		"int m[2][2];",
+		"const char *cs = \"lit\";", /* auto-static promotion */
+		"int q[4]; q[0]=1;",	     /* bounds-check wrap */
+		/* Nested statement expression: the inner declaration is just as
+		 * unable to carry a memset as the outer one. */
+		"int vo[n]; ({ int vi[n]; (void)vi; 0; });",
+		"union UO{int a; long b;} uo; ({ union UI{int a; long b;} ui; (void)ui; 0; });",
+	};
+	/* %s takes the statement expression; each template is a whole TU. */
+	static const char *ctx[] = {
+		"void f(int n){ struct S { int x[%s]; } obj; (void)obj; (void)n; }\n",
+		"void f(int n){ struct O { struct I { int y[%s]; } i; } o; (void)o; (void)n; }\n",
+		"void f(int n){ struct B { int b : %s; } bb; (void)bb; (void)n; }\n",
+		"void f(int n){ enum E { AA = %s }; (void)AA; (void)n; }\n",
+		"void f(int n){ static int arr[%s]; (void)arr; (void)n; }\n",
+		"void f(int n){ static int gv = %s; (void)gv; (void)n; }\n",
+		"void f(int n){ int a[4] = { [%s] = 7 }; (void)a; (void)n; }\n",
+		"void f(int n){ int *p = (int[%s]){0}; (void)p; (void)n; }\n",
+		"void f(int n){ _Static_assert(%s, \"m\"); (void)n; }\n",
+		"void f(int n){ int arr[%s]; (void)arr; (void)n; }\n",
+		"void f(int n){ unsigned long z = sizeof(int[%s]); (void)z; (void)n; }\n",
+	};
+	static const struct {
+		const char *name;
+		int bounds, zi, as_aur;
+	} cfg[] = {
+		{ "default", 0, 1, 0 },
+		{ "bounds", 1, 1, 0 },
+		{ "allon", 1, 1, 1 },
+		{ "nozi", 1, 0, 1 },
+	};
+
+	CmStats st = {0};
+	long skipped = 0, infra = 0;
+
+	for (size_t c = 0; c < sizeof(ctx) / sizeof(ctx[0]); c++) {
+		for (size_t p = 0; p < sizeof(payload) / sizeof(payload[0]); p++) {
+			char se[512], src[1024];
+			snprintf(se, sizeof(se), "({ %s 1; })", payload[p]);
+			snprintf(src, sizeof(src), ctx[c], se);
+
+			/* Gate: only cells whose plain-C baseline is legal can
+			 * accuse Prism of breaking legality. */
+			int base = cm_cc_accepts(src);
+			if (base < 0) { infra++; continue; }
+			if (base == 0) { skipped++; continue; }
+
+			for (size_t k = 0; k < sizeof(cfg) / sizeof(cfg[0]); k++) {
+				PrismFeatures f = prism_defaults();
+				f.bounds_check = cfg[k].bounds != 0;
+				f.zeroinit = cfg[k].zi != 0;
+				f.auto_static = cfg[k].as_aur != 0;
+				f.auto_unreachable = cfg[k].as_aur != 0;
+
+				st.cells++;
+				PrismResult r = cm_txf(src, f);
+				if (!cm_ok(&r) || !r.output) {
+					prism_free(&r); /* conservative reject: OK */
+					continue;
+				}
+				int got = cm_cc_accepts(r.output);
+				if (got < 0) infra++;
+				else if (got == 0)
+					cm_note(&st, "ctx=%zu payload=%zu cfg=%s: accepted but "
+						     "output is illegal C",
+						c, p, cfg[k].name);
+				prism_free(&r);
+			}
+		}
+	}
+
+	/* Report skips explicitly: stmt-expr-as-ICE is a fold-if-possible
+	 * extension, so a compiler that folds less would skip most cells. A
+	 * tier that silently skipped everything must not read as coverage. */
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/ice-stmt-expr]: %ld cells, %ld bad, %ld gated-out, "
+		 "%ld infra%s%s",
+		 st.cells, st.bad, skipped, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+}
+
 #undef CM_LOG_PRE
 #endif /* !_WIN32 */
 
+/* Formerly the env-gated `completeness_open` suite.  There is no staging area
+ * any more: a tier is either in the default run or it does not exist.  Red here
+ * means a product bug to fix, not a tier to gate off. */
 void run_completeness_open_tests(void) {
-	const char *only = getenv("PRISM_SUITE_ONLY");
-	int force = getenv("PRISM_COMPLETENESS_OPEN") != NULL;
-	int selected = only && strcmp(only, "completeness_open") == 0;
-	if (!force && !selected) {
-		printf("\n=== COMPLETENESS_OPEN skipped "
-		       "(set PRISM_COMPLETENESS_OPEN=1 or PRISM_SUITE_ONLY=completeness_open) ===\n");
-		return;
-	}
-	printf("\n=== COMPLETENESS_OPEN (T1′ generative open) ===\n");
-	/* Residual / aspirational cells — red means a product bug to fix. */
+	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");
+	/* The compile-and-run oracles live on this second suite thread rather
+	 * than inside run_completeness_tests: each cell spawns cc and then the
+	 * built binary, so they are latency-bound, not CPU-bound, and running
+	 * them beside the static product halves the suite's wall clock. */
 	cm_gen_goto_open();
+#ifndef _WIN32
+	cm_gen_cert_compile_run();
+	cm_gen_raw_identifier();
+	cm_gen_raw_string();
+#endif
 }

@@ -308,7 +308,6 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.windows.c"
 
 #include "test.safe.c"
-#include "test.raw.c"
 #include "test.parse.c"
 #include "test.defer.c"
 #include "test.orelse.c"
@@ -317,12 +316,12 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.api.c"
 #include "test.spec.c"
 #include "test.bounds.c"
-#include "test.cert.c"
 #include "test.machine.c"
 #include "test.alphabet.c"
 #include "test.insertion.c"
 #include "test.contexts.c"
 #include "test.completeness.c"
+#include "test.scale.c"
 #include "test.runtime.c"
 /* Generated defer/orelse torture tier — not committed (see .github/gen_torture.py).
  * Present only when the CI generator step has run; the suite builds without it. */
@@ -361,7 +360,6 @@ int main(void) {
 	TestSuite suites[] = {
 		{"windows",  run_windows_tests},
 		{"safe",     run_safe_tests},
-		{"raw",      run_raw_tests},
 		{"defer",    run_defer_tests},
 		{"zeroinit", run_zeroinit_tests},
 		{"parse",    run_parse_tests},
@@ -373,13 +371,13 @@ int main(void) {
 		{"api_4",    run_api_tests_4},
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
-		{"cert",     run_cert_tests},
 		{"machine",  run_machine_tests},
 		{"alphabet", run_alphabet_tests},
 		{"insertion", run_insertion_tests},
 		{"contexts", run_contexts_tests},
 		{"completeness", run_completeness_tests},
-		{"completeness_open", run_completeness_open_tests},
+		{"completeness_exec", run_completeness_open_tests},
+		{"scale",    run_scale_tests},
 		{"runtime",  run_runtime_tests},
 #ifdef HAVE_TORTURE
 		{"torture",  run_torture_tests},

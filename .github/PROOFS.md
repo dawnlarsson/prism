@@ -53,10 +53,10 @@ prism.c. Divergence between the two is a finding, whichever side is wrong.
 ### 2. `test.machine.c`: exhaustive machine equivalence (suite: `machine`)
 Drives the **real** `defer_walk` in-TU (same `scope_push_kind` / `defer_add`
 entry points Pass 2 uses, real tokens, real output buffer) over **every**
-abstract scope stack up to depth 4 (the full 14-symbol per-level alphabet of
+abstract scope stack up to depth 5 (the full 14-symbol per-level alphabet of
 scope kinds × loop/switch flags × defer counts) under every exit mode and
 every `DEFER_TO_DEPTH` stop depth (including the unreachable-defensive
-`stop == blocks+1`). 337,787 drives per run assert:
+`stop == blocks+1`). 5,101,371 drives per run assert:
 - emission order == `dm_expected` (model ≡ code),
 - P1–P5 hold on the raw emissions,
 - dry-run parity (`has_defers_for` == emission nonempty), the gate Pass 2
@@ -73,7 +73,9 @@ carried integers. Its behavior is therefore a finite-state transduction over
 the descriptor alphabet, and every distinct (mode × descriptor ×
 carried-state-class) transition occurs by depth 3. The transition-coverage
 certificate (locked at 94 pairs / 3 stop relations) is *saturated*: depth 5
-(5,101,371 drives, run in CI) adds **zero** new pairs. Bounded exhaustion at
+adds **zero** new pairs over depth 4 (337,787 drives) — which is why depth 5
+is the default: it *demonstrates* saturation instead of assuming it, for 2.2s.
+Bounded exhaustion at
 depth ≥ 4 therefore covers every transition of the machine, and correctness
 for unbounded depth follows by induction on the stack: each iteration's
 postcondition is the next one's precondition. A future depth-dependent branch
@@ -138,8 +140,8 @@ defer/orelse payload form through all of them:
   case/label family, attributes in every position, C23 auto/constexpr/bitint,
   bitfields, _Generic, K&R defs, …) × every payload;
 - **composed-2**: 14 expression→expression wrappers composed **pairwise**
-  (196 shapes) planted in 3 sites; `PRISM_CONTEXTS_DEEP=1` adds
-  **composed-3** triple composition (run in CI, ~33k cells);
+  (196 shapes) planted in 3 sites, plus **composed-3** triple composition
+  (~33k cells) — unconditional, 0.6s;
 - **feature-polarity**: every atomic cell re-swept under orelse-only and
   defer-only feature sets (SPEC's cross-feature invariant: disabling one
   extension must never suppress the other's checking).
@@ -156,7 +158,7 @@ trichotomy as the insertion suite. ~45k transpiles per full run.
 > cleanup paste (the pre-existing accept-test only checked a substring and
 > missed it, now a hard reject with the braced form required).
 
-### 5c. `test.completeness.c`: T1′ transform/annotation completeness (suites: `completeness`, `completeness_open`)
+### 5c. `test.completeness.c`: T1′ transform/annotation completeness (suites: `completeness`, `completeness_exec`)
 T2/T3 lock *classifier* and *defer-machine* totality; they do not exhaust
 **transform/annotation** products. This suite does not hand-pick cells: it
 locks small **axis alphabets** and sweeps their Cartesian products with
@@ -180,9 +182,12 @@ attr-multidecl / raw-suppress / linemarker / illformed / goto-if-init are
 closed green. Contexts atomic heads densified (~2250 cells); insertion
 corpus expanded.
 
-**`completeness_open`** is registered but skipped in the default full run —
-enable with `PRISM_COMPLETENESS_OPEN=1` or `PRISM_SUITE_ONLY=completeness_open`.
-Rule: hunt findings extend an *axis*, not a one-off smoke.
+**`completeness_exec`** carries the executed tiers — the compile-and-run
+oracles (`gen/cert-compile-run`, `gen/raw-identifier`) that hand the emitted C
+to the backend and run it. They sit on a second suite thread because they are
+latency-bound on process spawns, not CPU-bound. Rule: hunt findings extend an
+*axis*, not a one-off smoke; and every tier runs in every run — there are no
+environment gates anywhere in the suite.
 
 ### 6. `--prism-verify` / `PRISM_VERIFY=1`: translation validation (T2, per compile)
 After emitting, prism re-runs its **entire pipeline** on the emitted C. The
@@ -294,7 +299,6 @@ verify (computed goto, asm goto) rather than guessing.
 cc -O2 -o /tmp/prism prism.c && python3 .github/gen_torture.py > .github/test.torture.c
 /tmp/prism run .github/test.c                          # full suite (13k+ tests)
 PRISM_VERIFY=1 /tmp/prism run .github/test.c           # + translation validation
-PRISM_MACHINE_DEPTH=5 PRISM_SUITE_ONLY=machine /tmp/prism run .github/test.c   # deep machine
 cc -O2 -o /tmp/cbmc_cc .github/cbmc_defer.c && /tmp/cbmc_cc                    # model, exhaustive
 cbmc --unwind 40 --unwinding-assertions .github/cbmc_defer.c                   # model, symbolic
 cc -DPRISM_DEBUG -o /tmp/prism_dbg prism.c && /tmp/prism_dbg run .github/test.c  # debug gate

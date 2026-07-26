@@ -1569,6 +1569,19 @@ void test_const_typeof_atomic_struct_bug(void) {
 	    "    (void)s1; (void)s2;\n"
 	    "}\n",
 	    "const_typeof_atomic_struct.c", prism_defaults());
+	/* NOTE (characterization, not endorsement): this locks the CURRENT
+	 * behavior, which contradicts test_const_typeof_vla_bug above. That test
+	 * requires `const typeof(vla)` to be REJECTED, citing "memset on const is
+	 * UB"; this one accepts `const typeof(s1)` on an _Atomic aggregate and
+	 * asserts a cast-away-const memset is emitted. Modifying an object
+	 * *defined* with a const-qualified type is UB either way (C11 6.7.3p6).
+	 * Cause: reject_const_unavoidable_memset (prism.c) derives `unavoidable`
+	 * from THIS declaration's has_atomic / effective_vla. `typeof(s1)` hides
+	 * the atomicity inside s1's own type, so has_atomic is false here and the
+	 * reject is skipped, while the VLA shape sets effective_vla and rejects.
+	 * Only automatic storage reaches this path — static and file-scope const
+	 * objects are correctly left alone (already zero by C semantics), so
+	 * there is no .rodata write. Resolve the two tests together. */
 	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof _Atomic struct transpiles");
 	if (transpile_result.output) {
 		CHECK(strstr(transpile_result.output, "_Atomic struct S2_bug { int x, y; } s1; __builtin_memset(&s1, 0, sizeof(s1));") != NULL,
@@ -3911,8 +3924,21 @@ static void test_struct_body_stmt_expr_features(void) {
 		    "struct_se_zeroinit.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "struct-se-zeroinit: transpiles OK");
 		CHECK(r.output != NULL, "struct-se-zeroinit: output not NULL");
-		CHECK(strstr(r.output, "memset") != NULL,
-		      "struct-se-zeroinit: VLA inside struct stmt-expr must get memset");
+		/* The inner VLA must NOT be memset here. A statement expression in
+		 * a struct member's array dimension must fold to a constant; the
+		 * injected __builtin_memset is a statement, so it made the member a
+		 * VLA-in-struct and the backend rejected what was legal C
+		 * ("fields must have a constant size"). The declaration generates no
+		 * code in an ICE context, so the zero-init is dropped there.
+		 * The enclosing object `obj` is a real automatic object and IS still
+		 * zeroed — the previous strstr(output,"memset") oracle passed on
+		 * obj's memset alone and so could never have caught this.
+		 * Generative inventory: test.completeness.c gen/ice-stmt-expr. */
+		CHECK(strstr(r.output, "memset(&vla") == NULL &&
+			  strstr(r.output, "memset((void *)&vla") == NULL,
+		      "struct-se-zeroinit: VLA in an ICE stmt-expr must not be memset");
+		CHECK(strstr(r.output, "memset(&obj") != NULL,
+		      "struct-se-zeroinit: enclosing automatic object still zeroed");
 		prism_free(&r);
 	}
 

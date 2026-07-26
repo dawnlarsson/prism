@@ -4,7 +4,7 @@
  * What this proves (and how it composes with the other artifacts):
  *
  *   1. EQUIVALENCE  For every abstract scope stack up to depth DM_DEPTH
- *      (default 4) over the full 14-symbol per-level alphabet, and every
+ *      (5, the saturating depth) over the full 14-symbol per-level alphabet, and every
  *      exit mode (+ every stop depth for DEFER_TO_DEPTH), the emission
  *      sequence produced by prism.c's defer_walk equals dm_expected() —
  *      the semantics written independently from SPEC.md Part II.
@@ -25,16 +25,20 @@
  *
  * The harness drives the real machinery in-TU: it builds Pass-2 scope_stack
  * / defer_stack states with the same scope_push_kind/defer_add calls Pass 2
- * uses, points DeferEntry bodies at real tokens from tokenize_buffer, runs
+ * uses, points DeferEntry bodies at real tokens from pparse_tokenize_buffer, runs
  * defer_walk, and reads back out_buf.  No mocks.
  */
 
 #include "defer_model.h"
 
-#define DM_DEPTH_DEFAULT 4
+/* Depth 5 is the saturating depth: it adds zero new transition pairs over
+ * depth 4 (see the small-model lemma in PROOFS.md), so it is the smallest
+ * depth that *demonstrates* saturation rather than assuming it.  It costs
+ * 2.2s, so it runs unconditionally — no env knob, no CI-only tier. */
+#define DM_DEPTH_DEFAULT 5
 
-static Token *dm_marker_stmt[DM_MAX_IDS]; /* `mK` ident token   */
-static Token *dm_marker_end[DM_MAX_IDS];  /* the trailing `;`   */
+static PParseToken *dm_marker_stmt[DM_MAX_IDS]; /* `mK` ident token   */
+static PParseToken *dm_marker_end[DM_MAX_IDS];  /* the trailing `;`   */
 static char *dm_marker_buf;		  /* tokenizer source (must outlive tokens) */
 static FILE *dm_sink;			  /* out_fp flush safety */
 
@@ -52,18 +56,18 @@ static int dm_setup_markers(void) {
 	memcpy(dm_marker_buf, src, len);
 	memset(dm_marker_buf + len, 0, 8);
 
-	Token *tok = tokenize_buffer((char *)"dm_markers.c", dm_marker_buf);
+	PParseToken *tok = pparse_tokenize_buffer((char *)"dm_markers.c", dm_marker_buf);
 	if (!tok) return 0;
 
 	int found = 0;
-	for (Token *t = tok; t && t->kind != TK_EOF; t = tok_next(t)) {
-		if (t->kind != TK_IDENT || t->len < 2) continue;
-		char *p = tok_loc(t);
+	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF; t = pparse_next(t)) {
+		if (t->kind != PPARSE_TK_IDENT || t->len < 2) continue;
+		char *p = pparse_loc(t);
 		if (p[0] != 'm' || p[1] < '0' || p[1] > '9') continue;
 		int id = atoi(p + 1);
 		if (id < 0 || id >= DM_MAX_IDS) continue;
-		Token *e = t;
-		while (e && !match_ch(e, ';')) e = tok_next(e);
+		PParseToken *e = t;
+		while (e && !pparse_match_ch(e, ';')) e = pparse_next(e);
 		if (!e) return 0;
 		dm_marker_stmt[id] = t;
 		dm_marker_end[id] = e; /* exclusive bound, same as Pass 2 braceless defer */
@@ -120,7 +124,7 @@ static void dm_build_real(const DmScope *st, int n, int kind_override) {
 		ScopeKind k = dm_real_kind(st[i].sym);
 		if (st[i].sym == DM_TRANSPARENT && kind_override >= 0) k = (ScopeKind)kind_override;
 		scope_push_kind(k);
-		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
+		ScopeNode *s = &scope_stack[pparse_ctx->scope_depth - 1];
 		s->is_loop = (st[i].sym == DM_BLOCK_LOOP || st[i].sym == DM_CTRL_LOOP ||
 			      st[i].sym == DM_FOR_LOOP);
 		s->is_switch = (st[i].sym == DM_BLOCK_SWITCH || st[i].sym == DM_CTRL_SWITCH);
@@ -130,8 +134,8 @@ static void dm_build_real(const DmScope *st, int n, int kind_override) {
 }
 
 static void dm_teardown_real(void) {
-	ctx->scope_depth = 0;
-	ctx->block_depth = 0;
+	pparse_ctx->scope_depth = 0;
+	pparse_ctx->block_depth = 0;
 	defer_count = 0;
 	out_buf_pos = 0;
 }
@@ -278,15 +282,9 @@ static void dm_run_exhaustive(int max_depth) {
 		for (int c = 0; c < DM_NCHOICE; c++)
 			for (int e = 0; e < 2; e++) cov += dm_cov[m][c][e];
 	int rel = dm_cov_rel[0] + dm_cov_rel[1] + dm_cov_rel[2];
-	if (max_depth == DM_DEPTH_DEFAULT) {
-		snprintf(name, sizeof(name), "machine: transition coverage locked (%d pairs, %d rels)",
-			 cov, rel);
-		CHECK(cov == 94 && rel == 3, name);
-	} else {
-		snprintf(name, sizeof(name), "machine: transition coverage (depth override): %d pairs",
-			 cov);
-		CHECK(cov > 0, name);
-	}
+	snprintf(name, sizeof(name), "machine: transition coverage locked (%d pairs, %d rels)", cov,
+		 rel);
+	CHECK(cov == 94 && rel == 3, name);
 }
 
 /* GENERIC / TERNARY / INIT must be indistinguishable to the walk (the model
@@ -326,19 +324,19 @@ static void dm_run_shadow_tests(void) {
 	/* S1: shadow in window, CF mode -> error fires (longjmp).  Verified
 	 * finding: the shadow error path is longjmp-clean — defer_walk restores
 	 * in_defer_emit (line ~1319) BEFORE the shadow check (line ~1320), so
-	 * the guard is already false when error_tok jumps.  The repair in
+	 * the guard is already false when pparse_error_tok jumps.  The repair in
 	 * reset_transpiler_state (line ~510) covers the OTHER error source:
 	 * PRISM_DEBUG shells firing inside emit_deferred_range mid-walk.      */
 	{
 		DmScope st[1] = {{DM_BLOCK, 1}};
 		dm_build_real(st, 1, -1);
 		defer_shadow_count = 1;
-		VEC_ENSURE_REALLOC(defer_shadows, 1, defer_shadow_cap, 8);
+		pparse_VEC_ENSURE_REALLOC(defer_shadows, 1, defer_shadow_cap, 8);
 		defer_shadows[0] = (DeferShadow){shadow_name, (int)sizeof(shadow_name) - 1, 1,
 						 dm_marker_stmt[0], 0};
 		int caught = 0;
 		error_recovery_init();
-		if (setjmp(ctx->error_jmp) != 0) {
+		if (setjmp(pparse_ctx->error_jmp) != 0) {
 			caught = 1;
 		} else {
 			out_buf_pos = 0;
@@ -362,7 +360,7 @@ static void dm_run_shadow_tests(void) {
 						 dm_marker_stmt[0], 0};
 		int caught = 0;
 		error_recovery_init();
-		if (setjmp(ctx->error_jmp) != 0) {
+		if (setjmp(pparse_ctx->error_jmp) != 0) {
 			caught = 1;
 		} else {
 			out_buf_pos = 0;
@@ -385,7 +383,7 @@ static void dm_run_shadow_tests(void) {
 						 dm_marker_stmt[0], 0};
 		int caught = 0;
 		error_recovery_init();
-		if (setjmp(ctx->error_jmp) != 0) {
+		if (setjmp(pparse_ctx->error_jmp) != 0) {
 			caught = 1;
 		} else {
 			out_buf_pos = 0;
@@ -406,7 +404,7 @@ static void dm_run_shadow_tests(void) {
 						 dm_marker_stmt[0], 0};
 		int caught = 0;
 		error_recovery_init();
-		if (setjmp(ctx->error_jmp) != 0) {
+		if (setjmp(pparse_ctx->error_jmp) != 0) {
 			caught = 1;
 		} else {
 			bool has = defer_walk(DEFER_ALL, 0, true);
@@ -420,14 +418,14 @@ static void dm_run_shadow_tests(void) {
 }
 
 static void run_machine_tests(void) {
-	prism_ctx_init();
+	pparse_ctx_init();
 	error_recovery_init();
-	if (setjmp(ctx->error_jmp) != 0) {
-		CHECK(0, "machine: unexpected error_tok during setup");
+	if (setjmp(pparse_ctx->error_jmp) != 0) {
+		CHECK(0, "machine: unexpected pparse_error_tok during setup");
 		return;
 	}
 	apply_features(prism_defaults());
-	ensure_keyword_cache();
+	pparse_ensure_keyword_cache();
 
 	if (!dm_setup_markers()) {
 		CHECK(0, "machine: marker tokenization");
@@ -438,18 +436,11 @@ static void run_machine_tests(void) {
 	FILE *saved_fp = out_fp;
 	if (dm_sink) out_fp = dm_sink;
 
-	int max_depth = DM_DEPTH_DEFAULT;
-	const char *env = getenv("PRISM_MACHINE_DEPTH");
-	if (env && env[0]) {
-		int d = atoi(env);
-		if (d >= 1 && d <= 6) max_depth = d;
-	}
-
-	dm_run_exhaustive(max_depth);
+	dm_run_exhaustive(DM_DEPTH_DEFAULT);
 	dm_run_transparent_collapse();
 	dm_run_shadow_tests();
 
 	out_fp = saved_fp;
 	if (dm_sink) fclose(dm_sink);
-	ctx->error_jmp_set = false;
+	pparse_ctx->error_jmp_set = false;
 }

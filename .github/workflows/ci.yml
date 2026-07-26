@@ -58,9 +58,6 @@ jobs:
       - name: Run Test Suite
         run: prism run .github/test.c
 
-      - name: "Deep tiers: exhaustive machine (depth 5) + composed-3 contexts"
-        run: PRISM_MACHINE_DEPTH=5 PRISM_CONTEXTS_DEEP=1 prism run .github/test.c
-
       - name: "Translation validation (--prism-verify on real, non-self-referential targets)"
         run: |
           # Verify prism's own transpilation (large real program), and a

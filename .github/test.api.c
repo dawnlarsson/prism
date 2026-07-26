@@ -110,7 +110,7 @@ static void test_emit_decl_not_fused_after_stmt_boundary(void) {
 }
 
 /* Regression: decl-boundary newline must not fire inside anonymous aggregates
- * emitted through balanced walkers (typeof); see ctx->aggregate_member_nest. */
+ * emitted through balanced walkers (typeof); see pparse_ctx->aggregate_member_nest. */
 static void test_emit_aggregate_typeof_no_member_line_split(void) {
 	printf("\n--- Emit: typeof aggregate members not split by newline heuristic ---\n");
 
@@ -280,9 +280,9 @@ static void test_swar_comment_buffer_safety(void) {
 	big[4095] = '\0';
 	char *path = create_temp_file(big);
 	if (path) {
-		Token *tok = tokenize_file(path);
+		PParseToken *tok = pparse_tokenize_file(path);
 		CHECK(tok != NULL, "swar page boundary: tokenizes OK");
-		tokenizer_teardown(false);
+		pparse_tokenizer_teardown(false);
 		unlink(path);
 		free(path);
 	}
@@ -504,7 +504,7 @@ static void test_typeof_memset_size_t_counter(void) {
 
 // ── Thread Safety Tests ──
 
-// Test: prism_thread_cleanup() followed by prism_ctx_init() works on the same
+// Test: prism_thread_cleanup() followed by pparse_ctx_init() works on the same
 // thread — no dangling pointers, clean state, successful re-transpilation.
 static void test_thread_cleanup_reinit_cycle(void) {
 	printf("\n--- Thread Cleanup + Reinit Cycle ---\n");
@@ -518,11 +518,11 @@ static void test_thread_cleanup_reinit_cycle(void) {
 	CHECK(r1.output != NULL && r1.output_len > 0, "cycle: first output valid");
 	prism_free(&r1);
 
-	// Full cleanup — frees ctx, token pools, typedef hashmap, everything
+	// Full cleanup — frees pparse_ctx, token pools, typedef hashmap, everything
 	prism_thread_cleanup();
 
 	// Reinit on the same thread
-	prism_ctx_init();
+	pparse_ctx_init();
 
 	// Second transpile must work identically
 	PrismResult r2 = prism_transpile_source(src, "cycle2.c", features);
@@ -543,10 +543,10 @@ static void test_thread_cleanup_idempotent(void) {
 	prism_free(&r);
 
 	prism_thread_cleanup();
-	prism_thread_cleanup(); // second call on NULL ctx — must not crash
+	prism_thread_cleanup(); // second call on NULL pparse_ctx — must not crash
 
 	// Recover for the rest of the test suite
-	prism_ctx_init();
+	pparse_ctx_init();
 
 	r = prism_transpile_source("int f(void) { return 1; }\n", "idem2.c", features);
 	CHECK_EQ(r.status, PRISM_OK, "idempotent: transpile after double cleanup OK");
@@ -579,7 +579,7 @@ static void test_thread_cleanup_shadow_map_leak(void) {
 		CHECK_EQ(r.status, PRISM_OK, "shadow-map-leak: transpile OK");
 		prism_free(&r);
 		prism_thread_cleanup();
-		prism_ctx_init();
+		pparse_ctx_init();
 	}
 
 	// Final transpile to verify clean state
@@ -601,7 +601,7 @@ typedef struct {
 
 static void *thread_transpile_worker(void *arg) {
 	ThreadWork *w = (ThreadWork *)arg;
-	prism_ctx_init();
+	pparse_ctx_init();
 	for (int i = 0; i < w->iterations; i++) {
 		PrismResult r = prism_transpile_source(w->source, w->filename, w->features);
 		if (i < w->iterations - 1) {
@@ -3426,7 +3426,7 @@ static void test_c23_attr_label_defer(void) {
 	prism_free(&r);
 }
 
-/* error_tok longjmp from inside defer_walk left in_defer_emit stuck; on
+/* pparse_error_tok longjmp from inside defer_walk left in_defer_emit stuck; on
  * Windows (serial suites) the next goto-with-defer then opened braces but
  * emitted no cleanup. */
 static void test_defer_emit_flag_cleared_after_error(void) {
@@ -5457,10 +5457,10 @@ static void test_cli_run_prog_args_and_link_pragma(void) {
 #ifndef _WIN32
 	// Case 5: many `#pragma link` tokens trigger geometric realloc of
 	// cli->cc_args. Pre-fix, main() aliased the (then-small) cc_args
-	// buffer into ctx->extra_compiler_flags BEFORE compile_sources()
+	// buffer into pparse_ctx->extra_compiler_flags BEFORE compile_sources()
 	// invoked collect_link_pragmas() — which subsequently grew the
 	// buffer past its initial 16-slot cap, freeing the underlying
-	// allocation while ctx still pointed to it. The next preprocess
+	// allocation while pparse_ctx still pointed to it. The next preprocess
 	// run dereferenced freed memory and crashed with SIGSEGV.
 	//
 	// Repro: a single source with ≥ ~17 verbatim pragma tokens forces
@@ -5482,7 +5482,7 @@ static void test_cli_run_prog_args_and_link_pragma(void) {
 			fclose(mf);
 			char *argv[] = {prism_bin, "run", many_path, NULL};
 			int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
-			CHECK_EQ(st, 0, "runargs: many link pragmas don't dangle ctx alias");
+			CHECK_EQ(st, 0, "runargs: many link pragmas don't dangle pparse_ctx alias");
 			unlink(many_path);
 		}
 	}
@@ -7545,10 +7545,10 @@ static void test_signal_temps_ready_flag(void) {
 // in-file #define directives like _FILE_OFFSET_BITS.  The un-flatten path
 // reconstructs #include directives but never re-emits the user's #defines.
 // The backend compiler sees #include <stdio.h> without the ABI-altering macro.
-// When compiling multiple files, tokenizer_teardown(false) resets the arena
-// but does not clear ctx->source_defines / ctx->source_define_cap.  On the second
+// When compiling multiple files, pparse_tokenizer_teardown(false) resets the arena
+// but does not clear pparse_ctx->source_defines / pparse_ctx->source_define_cap.  On the second
 // file, collect_source_defines writes through a dangling pointer into reused arena
-// memory, which tokenize_buffer then overwrites with File structs.  The result is
+// memory, which pparse_tokenize_buffer then overwrites with File structs.  The result is
 // that emit_define_guarded dereferences garbage (e.g. the filename) as a macro name.
 static void test_multifile_arena_use_after_reset(void) {
 	const char *code_a = "#define BUG1_MAGIC_A 42\nint get_a(void) { return 42; }\n";
@@ -7563,12 +7563,12 @@ static void test_multifile_arena_use_after_reset(void) {
 	prism_free(&ra);
 	// Transpile file B — arena was reset at end of file A, but source_defines
 	// pointer and cap were not cleared.  collect_source_defines writes through
-	// the dangling pointer, then tokenize_buffer overwrites it.
+	// the dangling pointer, then pparse_tokenize_buffer overwrites it.
 	PrismResult rb = prism_transpile_file(path_b, feat);
 	if (rb.status == PRISM_OK && rb.output) {
 		CHECK(strstr(rb.output, "BUG1_MAGIC_B") != NULL,
 		      "multifile-arena-use-after-reset: second file's #define lost "
-		      "(source_defines corrupted by arena reuse after tokenizer_teardown)");
+		      "(source_defines corrupted by arena reuse after pparse_tokenizer_teardown)");
 	} else {
 		CHECK(0, "multifile-arena-use-after-reset: second file transpilation failed");
 	}
@@ -7822,7 +7822,7 @@ static void test_collect_source_defines_multi_continuation(void) {
 #ifdef __GNUC__
 static void test_auto_type_goto_bypass(void) {
 	/* __auto_type is not in the keyword map, so the tokenizer assigns
-	 * TK_IDENT with no tag.  Phase 1D never registers it as P1K_DECL.
+	 * PPARSE_TK_IDENT with no tag.  Phase 1D never registers it as P1K_DECL.
 	 * The CFG verifier fails to catch goto jumping over an __auto_type
 	 * declaration — a safety hole. */
 	const char *code =
@@ -8325,7 +8325,7 @@ static void test_collect_source_defines_disabled_include_abi_drop(void) {
 }
 
 // generic_member_rewrite_target and generic_decl_rewrite_target scan
-// from tok_next(open) which includes the controlling expression.  If the
+// from pparse_next(open) which includes the controlling expression.  If the
 // controlling expression is a function call like get_state(1), it matches
 // as "valid varname followed by (" and gets extracted as the target branch.
 static void test_generic_controlling_expr_mutilation(void) {
@@ -8704,7 +8704,7 @@ static void test_skip_one_stmt_deep_do_iterative(void) {
 }
 
 static void test_raw_attr_boundary_skip_noise(void) {
-	/* is_raw_strip_context checked tok_next(after_raw) directly,
+	/* is_raw_strip_context checked pparse_next(after_raw) directly,
 	 * not through skip_noise().  GNU/C23 attributes between variable name
 	 * and boundary punctuation (;/,) caused the check to fail, leaking
 	 * the 'raw' keyword into transpiler output. */
@@ -8722,7 +8722,7 @@ static void test_raw_attr_boundary_skip_noise(void) {
 
 static void test_typeof_paren_func_memset(void) {
 	/* typeof((func)) bypasses function-type detection because
-	 * the parenthesized name fails the tok_next(inner)==close check.
+	 * the parenthesized name fails the pparse_next(inner)==close check.
 	 * Prism emits memset on a function type → .text overwrite. */
 	PrismResult r = prism_transpile_source(
 		"void privileged_func(void);\n"

@@ -419,8 +419,9 @@ static void run_contexts_tests(void) {
 		cx_report("composed-2", &st);
 	}
 
-	/* TIER B-deep (CI): triple composition. */
-	if (getenv("PRISM_CONTEXTS_DEEP")) {
+	/* TIER B-deep: triple composition.  Unconditional — it costs 0.57s and a
+	 * tier nobody runs by default is a tier that rots. */
+	{
 		CxStats st = {0};
 		char e0[2048];
 		for (int w1 = 0; w1 < CX_NWRAP; w1++)
