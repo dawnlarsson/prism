@@ -443,47 +443,7 @@ static void test_bounds_check_runtime(void) {
 	    "int main(void){int a[10]; int *p=&a[10]; (void)p; return 77;}\n",
 	    77, "bc-run-addrof");
 
-	// Derived-pointer base forms are rejected under -fbounds-check (safe fallback).
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
-		    "(void)(&a[0])[i]; return 0;}\n",
-		    "bc_derived_ptr_addr0_reject.c", f);
-		CHECK(r.status != PRISM_OK, "bc-run-derived-ptr-addr0-oob: reject hidden lhs base");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
-		    "(void)(*(&a))[i]; return 0;}\n",
-		    "bc_derived_ptr_deref_reject.c", f);
-		CHECK(r.status != PRISM_OK, "bc-run-derived-ptr-deref-oob: reject hidden lhs base");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int m[2][2]={{1,2},{3,4}}; volatile int i=5,j=1;\n"
-		    "(void)(&m[0])[i][j]; return 0;}\n",
-		    "bc_derived_md_addr_reject.c", f);
-		CHECK(r.status != PRISM_OK, "bc-run-derived-md-addr-row-oob: reject hidden lhs base");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int m[2][2]={{1,2},{3,4}}; volatile int i=1,j=9;\n"
-		    "(void)(*(&m))[i][j]; return 0;}\n",
-		    "bc_derived_md_deref_reject.c", f);
-		CHECK(r.status != PRISM_OK, "bc-run-derived-md-deref-oob: reject hidden lhs base");
-		prism_free(&r);
-	}
+	/* Derived-pointer LHS rejects live in completeness gen/bounds-derived-lhs. */
 
 	// Pointer-arithmetic dereference equivalents are currently rejected under
 	// -fbounds-check (safe fallback) rather than wrapped.
@@ -622,90 +582,9 @@ static void test_bounds_check_false_match_guards(void) {
 
 static void test_bounds_check_unevaluated_operands(void) {
 	printf("\n--- bounds-check unevaluated operands ---\n");
-
-	// sizeof(arr[5]) — operand unevaluated; MUST NOT wrap (VLA would trap).
-	{
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[10]; return (int)sizeof(a[5]);}\n",
-		    "bc_sizeof.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof: transpiles");
-		if (r.output) {
-			CHECK(strstr(r.output, "sizeof(a[5])") != NULL,
-			      "bc-sizeof: subscript inside sizeof not wrapped");
-			CHECK(strstr(r.output, "sizeof(a[__prism_bchk") == NULL,
-			      "bc-sizeof: no wrap inside sizeof");
-		}
-		prism_free(&r);
-	}
-
-	// _Alignof(arr[0]) — not wrapped.
-	{
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[10]; return (int)_Alignof(a[0]);}\n",
-		    "bc_alignof.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-alignof: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "_Alignof(a[0])") != NULL,
-			      "bc-alignof: subscript inside _Alignof not wrapped");
-		prism_free(&r);
-	}
-
-	// typeof(arr[5]) — not wrapped.
-	{
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[10]; typeof(a[5]) x = 0; (void)x; return 0;}\n",
-		    "bc_typeof.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-typeof: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "typeof(a[5])") != NULL,
-			      "bc-typeof: subscript inside typeof not wrapped");
-		prism_free(&r);
-	}
-
-	// __builtin_offsetof — subscript names a struct field, NOT local.
-	{
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_source(
-		    "#include <stddef.h>\n"
-		    "struct S { int arr[5]; };\n"
-		    "int main(void){int arr[100]; (void)arr; "
-		    "return (int)__builtin_offsetof(struct S, arr[2]);}\n",
-		    "bc_offsetof.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-offsetof: transpiles");
-		if (r.output) {
-			CHECK(strstr(r.output, "__builtin_offsetof(struct S, arr[2])") != NULL,
-			      "bc-offsetof: subscript inside offsetof not wrapped");
-			CHECK(strstr(r.output, "offsetof(struct S, arr[__prism_bchk") == NULL,
-			      "bc-offsetof: no wrap inside offsetof");
-		}
-		prism_free(&r);
-	}
-
-	// _Generic controlling expression is unevaluated per C11 §6.5.1.1p3;
-	// subscripts there must not wrap (wrapping turns a pure type-select
-	// into a runtime trap for out-of-range values).
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[10]={0}; int i=50;\n"
-		    "return _Generic(a[i], int: 1, default: 0);}\n",
-		    "bc_generic_ctrl.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-generic-ctrl: transpiles");
-		if (r.output) {
-			CHECK(strstr(r.output, "_Generic(a[i]") != NULL,
-			      "bc-generic-ctrl: controlling subscript not wrapped");
-			CHECK(strstr(r.output, "_Generic(a[__prism_bchk") == NULL,
-			      "bc-generic-ctrl: no wrap inside _Generic controlling expr");
-		}
-		prism_free(&r);
-	}
-
-	// Nested subscript inside _Generic controlling expression — inner
-	// bracket is also unevaluated and must not wrap.
+	/* Core sizeof/_Alignof/typeof/offsetof/_Generic/SSD polarity lives in
+	 * completeness gen/bounds-uneval-product. Keep nested controlling
+	 * subscript as a residual pin (product covers flat a[i] only). */
 	{
 		PrismFeatures f = prism_defaults();
 		f.bounds_check = true;
@@ -717,22 +596,6 @@ static void test_bounds_check_unevaluated_operands(void) {
 		if (r.output)
 			CHECK(strstr(r.output, "__prism_bchk((__prism_bchk_size_t)") == NULL,
 			      "bc-generic-nested: nested controlling subscript not wrapped");
-		prism_free(&r);
-	}
-
-	// _Generic association expression IS evaluated when selected, so
-	// subscripts inside associations MUST still wrap.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[10]={0}; int i=3;\n"
-		    "return _Generic(1, int: a[i], default: 0);}\n",
-		    "bc_generic_assoc.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-generic-assoc: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
-			      "bc-generic-assoc: association subscript wrapped");
 		prism_free(&r);
 	}
 }
@@ -1052,165 +915,8 @@ static void test_bounds_check_dark_corners(void) {
 	}
 }
 
-// ISO C defines `idx[arr]` as strictly commutative with `arr[idx]`.
-// When the array side hides *inside* the brackets, the normal
-// array-on-the-left pattern match fails and the subscript would be
-// emitted raw — silently bypassing -fbounds-check. Prism must reject
-// this form with a hard error when bounds-check is enabled.
-static void test_bounds_check_commutative(void) {
-	printf("\n--- bounds-check commutative subscript (bypass guard) ---\n");
-
-	// Direct commutative: `len[buffer]` where buffer is a tracked array.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int len=5;\n"
-		    "len[b] = 0; return 0;}\n",
-		    "bc_comm_direct.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-direct: rejects idx[arr]");
-		prism_free(&r);
-	}
-
-	// Parenthesized index: `(idx)[arr]` — same commutative bypass as `idx[arr]`.
-	// Regression: peel-off-last_emitted could stop when `(` is preceded by a
-	// numeric literal (line break after `i=5`), skipping the guard.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=5;\n"
-		    "(i)[b] = 0; return 0;}\n",
-		    "bc_comm_paren_idx.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-paren-idx: rejects (idx)[arr]");
-		prism_free(&r);
-	}
-
-	// Literal index form: `2[buffer]`.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10];\n"
-		    "2[b] = 0; return 0;}\n",
-		    "bc_comm_lit.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-lit: rejects 2[arr]");
-		prism_free(&r);
-	}
-
-	// Paren-wrapped array inside: `len[(buffer)]`.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int len=5;\n"
-		    "len[(b)] = 0; return 0;}\n",
-		    "bc_comm_paren.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-paren: rejects idx[(arr)]");
-		prism_free(&r);
-	}
-
-	// Derived-pointer commutative form: `idx[&arr[0]]`.
-	// Semantically equivalent to `(&arr[0])[idx]` and must not bypass.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=5;\n"
-		    "i[(&b[0])] = 0; return 0;}\n",
-		    "bc_comm_addr0.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-addr0: rejects idx[&arr[0]]");
-		prism_free(&r);
-	}
-
-	// Hidden-address forms should be rejected too; they are equivalent bypasses.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=5;\n"
-		    "i[(0,&b[0])] = 0; return 0;}\n",
-		    "bc_comm_addr0_comma.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-addr0-comma: rejects idx[(0,&arr[0])]");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=5;\n"
-		    "i[(1?&b[0]:&b[0])] = 0; return 0;}\n",
-		    "bc_comm_addr0_cond.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-addr0-cond: rejects idx[(cond?&arr[0]:&arr[0])]");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=5;\n"
-		    "i[((int*)&b[0])] = 0; return 0;}\n",
-		    "bc_comm_addr0_cast.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-addr0-cast: rejects idx[((int*)&arr[0])]");
-		prism_free(&r);
-	}
-
-	// Struct member as index: `s.f[buffer]`.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "struct S { int f; };\n"
-		    "int main(void){int b[10]; struct S s={5};\n"
-		    "s.f[b] = 0; return 0;}\n",
-		    "bc_comm_member.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-member: rejects s.f[arr]");
-		prism_free(&r);
-	}
-
-	// Feature off: commutative form must pass through untouched.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = false;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int len=5;\n"
-		    "len[b] = 0; return 0;}\n",
-		    "bc_comm_off.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-comm-off: allowed without -fbounds-check");
-		if (r.output)
-			CHECK(strstr(r.output, "len[b]") != NULL,
-			      "bc-comm-off: emitted raw");
-		prism_free(&r);
-	}
-
-	// Normal form with parens must still wrap: `(arr)[idx]`.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int b[10]; int i=3;\n"
-		    "(b)[i] = 0; return 0;}\n",
-		    "bc_comm_normal_paren.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-comm-normal-paren: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "__prism_bchk") != NULL,
-			      "bc-comm-normal-paren: wrapped normally");
-		prism_free(&r);
-	}
-
-	// Non-array identifier inside brackets: `i[j]` where neither is a
-	// tracked array. Must not error — nothing to protect.
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int *p=0; int i=0;\n"
-		    "(void)i; (void)p; return 0;}\n",
-		    "bc_comm_noarr.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-comm-noarr: transpiles (no tracked array)");
-		prism_free(&r);
-	}
-}
+/* Commutative idx[arr] / idx[&arr[0]] rejects + OK wraps live in
+ * completeness gen/bounds-comm-reject. */
 
 // Regression tests for declarator-bracket class bugs (see prism.c
 // try_bounds_check_subscript declarator guard and param-shadow
@@ -1498,20 +1204,7 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
-	// Ternary LHS — `(c ? a : b)[i]` — peel `)` and find tracked array idents.
-	{
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_source(
-		    "int main(int argc,char**argv){(void)argv;\n"
-		    "int a[5]={0,1,2,3,4}, b[5]={9,8,7,6,5};\n"
-		    "return (argc>0 ? a : b)[2];}\n",
-		    "bc_ternary_lhs.c", f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-ternary-lhs: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, ")[__prism_bchk") != NULL,
-			      "bc-ternary-lhs: ternary LHS subscript wrapped");
-		prism_free(&r);
-	}
+	/* Ternary LHS wrap: completeness gen/bounds-lhs-peel. */
 
 	// GCC statement expression containing a subscript — should still wrap
 	// the inner subscript as a normal array access.
@@ -1991,25 +1684,7 @@ static void test_bounds_reported_issue_regressions(void) {
 		prism_free(&r);
 	}
 
-	/* idx[arr[0]] commutative guard */
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void) {\n"
-		    "    int arr[10];\n"
-		    "    int idx = 5;\n"
-		    "    arr[0] = 0;\n"
-		    "    int x = idx[arr[0]];\n"
-		    "    return x;\n"
-		    "}\n",
-		    "bc_rep_comm_nested.c", f);
-		CHECK(r.status != PRISM_OK, "bc-rep: idx[arr[0]] rejected");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "commutative") != NULL,
-			      "bc-rep: commutative diagnostic");
-		prism_free(&r);
-	}
+	/* idx[arr[0]] accept+inner-wrap: completeness gen/bounds-comm-reject. */
 
 	/* Comma operand idx[(0,arr)] */
 	{
@@ -2094,18 +1769,7 @@ static void test_bounds_reported_issue_regressions(void) {
 		prism_free(&r);
 	}
 
-	/* Ternary hides tracked arrays in index position — same policy as len[arr]: reject */
-	{
-		PrismResult r = prism_transpile_source(
-		    "void h(int idx) {\n"
-		    "    int arr1[10], arr2[10];\n"
-		    "    idx[ 1 ? arr1 : arr2 ] = 0;\n"
-		    "}\n",
-		    "bc_comm_tern.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "bc-rep: ternary index with array operands must be rejected (-fbounds-check)");
-		prism_free(&r);
-	}
+	/* Ternary index reject: completeness gen/bounds-comm-reject. */
 
 	/* typeof + C23 attribute on pointer — not an array dimension; no bogus bounds */
 	{
@@ -2263,65 +1927,8 @@ static void test_bounds_check_emit_statements_paths(void) {
 		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-deref-add: uneval accepted");
 		prism_free(&r);
 	}
-	/* Decl-init *(a+i) must reject like statement form. */
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5; int x=*(a+i); return x;}\n",
-		    "bc_decl_init_deref_add.c", f);
-		CHECK(r.status != PRISM_OK, "bc-decl-init-deref-add: rejected");
-		prism_free(&r);
-	}
-	/* (a+i)[0] must reject — not wrap index 0 against sizeof(a). */
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5; return (a+i)[0];}\n",
-		    "bc_offset_sub.c", f);
-		CHECK(r.status != PRISM_OK, "bc-offset-sub: (a+i)[0] rejected");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5; return 0[a+i];}\n",
-		    "bc_comm_arith.c", f);
-		CHECK(r.status != PRISM_OK, "bc-comm-arith: 0[a+i] rejected");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[2]={1,2}; volatile int i=5; return *(int*)(a+i);}\n",
-		    "bc_cast_deref.c", f);
-		CHECK(r.status != PRISM_OK, "bc-cast-deref: *(T*)(a+i) rejected");
-		prism_free(&r);
-	}
-	/* typeof/_Atomic type-specifier dims must run bounds (emit_type_range). */
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[3]={1,2,3}; volatile int i=1;\n"
-		    "  typeof(int[*(a+i)]) *p=0; return !!p;}\n",
-		    "bc_typeof_dim.c", f);
-		CHECK(r.status != PRISM_OK, "bc-typeof-dim: typeof(int[*(a+i)]) rejected");
-		prism_free(&r);
-	}
-	{
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_source(
-		    "int main(void){int a[3]={1,2,3}; volatile int i=1;\n"
-		    "  _Atomic(int[*(a+i)]) *p=0; return !!p;}\n",
-		    "bc_atomic_dim.c", f);
-		CHECK(r.status != PRISM_OK, "bc-atomic-dim: _Atomic(int[*(a+i)]) rejected");
-		prism_free(&r);
-	}
+	/* Decl-init / cast-deref / (a+i)[0] / 0[a+i] / typeof|_Atomic dim rejects:
+	 * completeness gen/bounds-deref-sites + gen/bounds-comm-reject. */
 }
 
 #ifndef _WIN32
@@ -2398,7 +2005,6 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_nested_subscript();
 	test_bounds_check_address_of();
 	test_bounds_check_dark_corners();
-	test_bounds_check_commutative();
 	test_bounds_reported_issue_regressions();
 	test_bounds_check_declarator_contexts();
 	test_bounds_check_extreme_edges();

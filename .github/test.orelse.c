@@ -4632,43 +4632,8 @@ static void test_orelse_funcptr_param_bracket_leak(void) {
 }
 
 // typedef-concealed array orelse escape
-static void test_typedef_array_orelse_escape(void) {
-	printf("\n--- typedef array orelse escape ---\n");
-
-	/* Typedef-concealed array must be rejected like a plain array. */
-	{
-		PrismResult r = prism_transpile_source(
-		    "typedef int arr_t[5];\n"
-		    "int *fallback(void);\n"
-		    "void f(void) { arr_t x = {0} orelse fallback(); }\n",
-		    "typedef_arr_orelse.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typedef-array-orelse: must reject orelse on array typedef");
-		prism_free(&r);
-	}
-	/* const-qualified typedef array also rejected. */
-	{
-		PrismResult r = prism_transpile_source(
-		    "typedef int arr_t[5];\n"
-		    "int *fallback(void);\n"
-		    "void f(void) { const arr_t x = {0} orelse fallback(); }\n",
-		    "typedef_arr_orelse_const.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typedef-array-orelse-const: const-qualified array still rejected");
-		prism_free(&r);
-	}
-	/* Pointer typedef must still be accepted. */
-	{
-		PrismResult r = prism_transpile_source(
-		    "typedef int *ptr_t;\n"
-		    "int *fallback(void);\n"
-		    "void f(void) { ptr_t x = 0 orelse fallback(); }\n",
-		    "typedef_ptr_orelse.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "typedef-ptr-orelse: pointer typedef accepted");
-		prism_free(&r);
-	}
-}
+/* Typedef-array / const-arr_t / ptr_t orelse polarity: completeness
+ * gen/orelse-array-type. */
 
 // anonymous struct/union declaration split produces incompatible types
 static void test_anon_struct_split_invalid(void) {
@@ -10071,7 +10036,6 @@ void run_orelse_tests(void) {
 	test_bracket_orelse_dim_hoisting_bypass();
 
 	// typedef array orelse escape + anon struct split + [*] VLA hoisting
-	test_typedef_array_orelse_escape();
 	test_anon_struct_split_invalid();
 	test_vla_star_dim_hoisting();
 

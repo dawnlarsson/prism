@@ -1,4 +1,13 @@
 
+/*
+ * Prism's reusable C parse library (included by prism.c).
+ *
+ * Lifecycle entry points:
+ *   c_parse_begin / c_parse_finalize / c_parse_reset / c_parse_build_scopes
+ * Declarator / type:
+ *   parse_type_specifier / c_parse_declarator / c_parse_function_return
+ */
+
 #if defined(_MSC_VER)
 #define PRISM_THREAD_LOCAL __declspec(thread)
 #else
@@ -3839,7 +3848,7 @@ static inline PRISM_PURE bool is_expr_ending_brace(Token *t) {
 	return is_expr_ending(t) || match_ch(t, '}');
 }
 
-static void parse_enum_constants(Token *tok, int scope_depth) {
+static void enum_constants(Token *tok, int scope_depth) {
 	if (!tok || !(match_ch(tok, '{'))) return;
 	tok = tok_next(tok); // Skip '{'
 	while (tok && tok->kind != TK_EOF && !(match_ch(tok, '}'))) {
@@ -4524,17 +4533,36 @@ static Token *c_mark_unevaluated_at(Token *t) {
 static void c_parse_mark_unevaluated_brackets(void) {
 	int file_scope_braces = 0;
 	bool file_scope_initializer = false;
+	/* Block-scope `static`/`extern`/`_Thread_local`/`constexpr` initializers
+	 * also require ICEs (C11 §6.7.9p4) — wrapping g[0] in __prism_bchk breaks
+	 * the backend. Track storage/constexpr from the last `;`/`{` body entry. */
+	bool static_storage_pending = false;
+	bool static_storage_initializer = false;
 	Token *pool_end = token_pool + token_count;
 	for (Token *t = token_pool + 1; t < pool_end && t->kind != TK_EOF; t++) {
-		if ((t->flags & TF_OPEN) && t->ch0 == '{')
+		if ((t->flags & TF_OPEN) && t->ch0 == '{') {
+			/* Function/compound body: outer `static void f(){` must not
+			 * keep pending across the body. Initializer braces (`= {`)
+			 * already have static_storage_initializer set. */
+			if (!file_scope_initializer && !static_storage_initializer)
+				static_storage_pending = false;
 			file_scope_braces++;
-		else if ((t->flags & TF_CLOSE) && t->ch0 == '}') {
+		} else if ((t->flags & TF_CLOSE) && t->ch0 == '}') {
 			if (file_scope_braces) file_scope_braces--;
-		} else if (file_scope_braces == 0) {
-			if (t->ch0 == '=' && t->len == 1) file_scope_initializer = true;
-			else if (t->ch0 == ';') file_scope_initializer = false;
+		} else if (t->ch0 == ';' && t->len == 1) {
+			file_scope_initializer = false;
+			static_storage_pending = false;
+			static_storage_initializer = false;
+		} else if ((t->tag & TT_STORAGE) ||
+			   ((t->tag & TT_QUALIFIER) && t->ch0 == 'c' && t->len == 9)) {
+			/* static / extern / thread_local / constexpr — not register. */
+			if (!(t->tag & TT_REGISTER)) static_storage_pending = true;
+		} else if (t->ch0 == '=' && t->len == 1) {
+			if (file_scope_braces == 0) file_scope_initializer = true;
+			if (static_storage_pending) static_storage_initializer = true;
 		}
-		if (file_scope_initializer && (t->flags & TF_OPEN) && t->ch0 == '[')
+		if ((file_scope_initializer || static_storage_initializer) &&
+		    (t->flags & TF_OPEN) && t->ch0 == '[')
 			tok_ann(t) |= P1_UNEVAL_BRACKET;
 		if ((t->flags & TF_STATIC_ASSERT) || (t->tag & TT_GENERIC) ||
 		    c_is_unevaluated_operand_intro(t)) {
@@ -4567,6 +4595,31 @@ static Token *c_bounds_peel_paren_ident(Token *last) {
 	return c_is_value_name_token(inner) && tok_next(inner) == last ? inner : last;
 }
 
+/* Peel nested `(ident)` / `(num)` groups from a subscript's left primary.
+ * Unlike c_bounds_peel_paren_ident (single layer, call-safe), this is for the
+ * commutative brute-scan gate so `(i)[…]` / `((i))[…]` / `(2)[…]` still see
+ * ternary/arith hidden arrays in the index. */
+static Token *c_bounds_peel_index_lhs(Token *last) {
+	Token *t = last;
+	for (;;) {
+		if (!t || !match_ch(t, ')') || !tok_match(t)) return t;
+		Token *open = tok_match(t);
+		Token *inner = tok_next(open);
+		if (!inner) return t;
+		if ((c_is_value_name_token(inner) || inner->kind == TK_NUM) && tok_next(inner) == t) {
+			t = inner;
+			continue;
+		}
+		/* Nested `((i))`: whole body is one paren group. */
+		if (match_ch(inner, '(') && (inner->flags & TF_OPEN) && tok_match(inner) &&
+		    tok_next(tok_match(inner)) == t) {
+			t = tok_match(inner);
+			continue;
+		}
+		return t;
+	}
+}
+
 static Token *c_bounds_find_tracked_array(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
@@ -4583,10 +4636,31 @@ static Token *c_bounds_find_tracked_array(Token *start, Token *end) {
 	return NULL;
 }
 
-static bool c_bounds_paren_derives_array(Token *open) {
-	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) return false;
-	Token *close = tok_match(open);
-	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; t = tok_next(t)) {
+/* After `&` / `*`, peel redundant `(ident)` groups: `&(a)` / `*(a)`. */
+static Token *c_bounds_peel_addr_operand(Token *next, Token *close) {
+	while (next && next != close && match_ch(next, '(') && (next->flags & TF_OPEN) &&
+	       tok_match(next)) {
+		Token *inner = tok_next(next);
+		Token *ic = tok_match(next);
+		if (!inner || !ic || inner == close) break;
+		if (c_is_value_name_token(inner) && tok_next(inner) == ic) {
+			next = inner;
+			break;
+		}
+		if (match_ch(inner, '(')) {
+			next = inner;
+			continue;
+		}
+		break;
+	}
+	return next;
+}
+
+/* Scan [first, close) for `&arr` / `*arr` (with redundant parens peeled).
+ * Used for both `(&arr[0])[i]` bodies and bare index spans `idx[&arr[0]]`. */
+static bool c_bounds_span_derives_array(Token *first, Token *close) {
+	if (!first || !close || first == close) return false;
+	for (Token *t = first; t && t != close && t->kind != TK_EOF; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
 			Token *prev = &token_pool[tok_idx(t) - 1];
 			if (c_is_unevaluated_operand_intro(prev) && tok_match(t)) {
@@ -4594,14 +4668,21 @@ static bool c_bounds_paren_derives_array(Token *open) {
 				continue;
 			}
 		}
-		if (match_ch(t, '&') && !(t->flags & TF_OPEN)) {
-			Token *next = tok_next(t);
+		/* `&arr` / `&(arr)` and `*arr` / `*(arr)` (row decay on multi-dim)
+		 * produce derived pointers the v1 matcher cannot verify. */
+		if ((match_ch(t, '&') || match_ch(t, '*')) && !(t->flags & TF_OPEN)) {
+			Token *next = c_bounds_peel_addr_operand(tok_next(t), close);
 			if (next && next != close && c_is_value_name_token(next) &&
 			    c_bounds_is_tracked_array(next))
 				return true;
 		}
 	}
 	return false;
+}
+
+static bool c_bounds_paren_derives_array(Token *open) {
+	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) return false;
+	return c_bounds_span_derives_array(tok_next(open), tok_match(open));
 }
 
 static bool c_bounds_paren_has_array_arithmetic(Token *open) {
@@ -4654,12 +4735,22 @@ static bool c_token_is_in_unevaluated_operand(Token *tok) {
 		}
 		if (depth != 0) continue;
 		if (c_is_unevaluated_operand_intro(t) || (t->tag & TT_GENERIC) ||
-		    (t->flags & TF_STATIC_ASSERT))
+		    (t->flags & TF_STATIC_ASSERT)) {
+			/* Parenthesized operand (`sizeof(0) + die()`): we already
+			 * left that group via the OPEN/CLOSE depth walk above.
+			 * Seeing the intro here means a sibling, not an encloser.
+			 * Bare form (`sizeof die`) has no `(` after the intro. */
+			Token *after = skip_noise(tok_next(t));
+			if (after && match_ch(after, '(')) continue;
 			return true;
+		}
 		if (t->kind == TK_IDENT &&
 		    ((t->len == 8 && prism_memeq_static(tok_loc(t), "_Alignof", 8)) ||
-		     (t->len == 7 && prism_memeq_static(tok_loc(t), "alignof", 7))))
+		     (t->len == 7 && prism_memeq_static(tok_loc(t), "alignof", 7)))) {
+			Token *after = skip_noise(tok_next(t));
+			if (after && match_ch(after, '(')) continue;
 			return true;
+		}
 		if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}') || match_ch(t, ','))
 			return false;
 	}
@@ -4877,7 +4968,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 								 * identifiers in the same dimension
 								 * (e.g. sizeof(enum { A = 5 }) + A)
 								 * are not misclassified as VLA. */
-								parse_enum_constants(brace, 0);
+								enum_constants(brace, 0);
 								inner = skip_balanced_group(brace);
 								if (inner == end) break;
 								continue;
@@ -5379,7 +5470,7 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 		if (is_enum_kw(t)) {
 			Token *brace = find_struct_body_brace(t);
 			if (brace) {
-				parse_enum_constants(brace, 0);
+				enum_constants(brace, 0);
 				prev = brace;
 				t = tok_match(brace);
 				continue;
@@ -5541,6 +5632,41 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start)) {
 				r.is_typedef = true;
 				if (typedef_flags(inner_start) & TDF_UNION) r.is_union = true;
+				if (typedef_flags(inner_start) & TDF_AGGREGATE) r.is_struct = true;
+			}
+			/* `_Atomic(typeof(T))` — propagate aggregate/array from the
+			 * typeof operand (bare `_Atomic(typeof(S))` otherwise leaves
+			 * is_struct false and false-accepts const+memset). */
+			if (inner_start && (inner_start->tag & TT_TYPEOF) && tok_next(inner_start) &&
+			    match_ch(tok_next(inner_start), '(')) {
+				Token *topen = tok_next(inner_start);
+				Token *tend = skip_balanced_group(topen);
+				bool saw_sue = false;
+				bool outer_ptr = false;
+				int depth = 0;
+				for (Token *t = tok_next(topen); t && t != tend; t = tok_next(t)) {
+					if ((t->flags & TF_OPEN)) {
+						depth++;
+						continue;
+					}
+					if ((t->flags & TF_CLOSE)) {
+						if (depth > 0) depth--;
+						continue;
+					}
+					if (depth == 0 && match_ch(t, '*')) outer_ptr = true;
+					if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE))
+						r.is_struct = true;
+					if ((t->tag & TT_SUE) && t->ch0 == 'u') r.is_union = true;
+					if ((t->tag & TT_SUE) && t->ch0 == 'e') r.is_enum = true;
+					if (typedef_flags(t) & TDF_UNION) r.is_union = true;
+					if (t->tag & TT_SUE) saw_sue = true;
+					if (is_identifier_like(t) && saw_sue) saw_sue = false;
+				}
+				if (outer_ptr) {
+					r.is_struct = false;
+					r.is_union = false;
+					r.is_enum = false;
+				}
 			}
 			/* `_Atomic(struct S *)` is a pointer, not a struct value. */
 			{
@@ -5756,7 +5882,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 	return r;
 }
 
-static void parse_typedef_declaration(Token *tok, int scope_depth) {
+static void typedef_declaration(Token *tok, int scope_depth) {
 	Token *typedef_start = tok;
 	tok = tok_next(tok); // Skip 'typedef'
 	Token *type_start = tok;
@@ -7340,6 +7466,12 @@ static inline Token *try_detect_noreturn_call(Token *tok) {
 			ue = open ? tok_walk_back(tok_idx(open), WB_PAST_NOISE) : NULL;
 			continue;
 		}
+		/* Grouping paren we are inside: `sizeof +(+die())` — peel to the
+		 * token before the open so uneval intros still win. */
+		if (ue && match_ch(ue, '(') && (ue->flags & TF_OPEN) && tok_match(ue)) {
+			ue = tok_walk_back(tok_idx(ue), WB_PAST_NOISE);
+			continue;
+		}
 		if (ue && ue->kind == TK_IDENT && equal(ue, "__extension__")) {
 			ue = tok_walk_back(tok_idx(ue), WB_PAST_NOISE);
 			continue;
@@ -7367,11 +7499,43 @@ static inline Token *try_detect_noreturn_call(Token *tok) {
 		/* `sizeof die();` / `_Alignof die();` — call is unevaluated;
 		 * must not inject unreachable after the statement. */
 		if (prev && is_sizeof_like(prev)) return NULL;
+		/* Short-circuit: `x && die();` / `x || die();` — die may not run. */
+		if (prev && prev->kind == TK_PUNCT && prev->len == 2 &&
+		    ((prev->ch0 == '&' && tok_loc(prev)[1] == '&') ||
+		     (prev->ch0 == '|' && tok_loc(prev)[1] == '|')))
+			return NULL;
 	}
 	Token *call = tok_next(tok);
 	if (!call || !match_ch(call, '(') || !tok_match(call)) return NULL;
+	/* Unevaluated operands (`sizeof(die())`, `_Generic`) must not inject. */
+	if (c_token_is_in_unevaluated_operand(tok)) return NULL;
 	Token *after = tok_next(tok_match(call));
-	return (after && match_ch(after, ';')) ? after : NULL;
+	/* Statement-final call through casts / grouping / comma tails:
+	 *   (void)die();          — after is `;` (classic)
+	 *   (void)(die());        — after is `)` then `;`
+	 *   (void)(0, die());     — after is `)` then `;`
+	 *   die(), 1;             — after is `,` … `;`
+	 *   foo(die());           — after is `)` of args then `;`
+	 * Control-paren sites (`if (die())`) are filtered by callers via
+	 * in_ctrl_paren(); do not special-case here. */
+	while (after && match_ch(after, ')')) after = tok_next(after);
+	if (after && match_ch(after, ';')) return after;
+	if (after && match_ch(after, ',')) {
+		int depth = 0;
+		for (Token *s = tok_next(after); s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) {
+				depth++;
+				continue;
+			}
+			if (s->flags & TF_CLOSE) {
+				if (depth == 0) break;
+				depth--;
+				continue;
+			}
+			if (depth == 0 && match_ch(s, ';')) return s;
+		}
+	}
+	return NULL;
 }
 
 static inline Token *p1d_find_open_paren(Token *tok) {

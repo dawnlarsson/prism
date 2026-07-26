@@ -1025,6 +1025,8 @@ static PRISM_HOT void emit_tok(Token *tok) {
 		ctx->aggregate_member_nest--;
 }
 
+static inline void reject_defer_in_expr_context(Token *t);
+
 static inline Token *emit_tok_checked(Token *t) {
 	Token *r = try_strip_raw(t);
 	if (r) return r;
@@ -1869,6 +1871,7 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 				continue;
 			}
 		}
+		reject_defer_in_expr_context(tok);
 		tok = emit_advance(tok);
 	}
 	return tok;
@@ -2418,9 +2421,9 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	{
 		Token *rb_close = tok_match(tok);
 		Token *inner_first = tok_next(tok);
-		if (inner_first && rb_close && match_ch(inner_first, '(') && (inner_first->flags & TF_OPEN) &&
-		    tok_match(inner_first) && tok_next(tok_match(inner_first)) == rb_close &&
-		    c_bounds_paren_derives_array(inner_first))
+		/* Parenthesized `idx[(&arr[0])]` and bare `idx[&arr[0]]` both derive
+		 * an unchecked pointer; require rewrite to `arr[idx]`. */
+		if (inner_first && rb_close && c_bounds_span_derives_array(inner_first, rb_close))
 			BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_DERIVED);
 	}
 
@@ -2463,40 +2466,23 @@ static Token *try_bounds_check_subscript(Token *tok) {
 					Token *le = c_bounds_peel_paren_ident(last_emitted);
 					if (!c_bounds_is_tracked_array(le) && !c_bounds_expr_base_is_pointer(le))
 						BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
-				} else if (inner != iclose && c_is_value_name_token(inner)) {
-					Token *array_root = NULL;
-					Token *scan = inner;
-					while (scan && scan != iclose) {
-						if (!c_is_value_name_token(scan)) break;
-						Token *lb = tok_next(scan);
-						if (!lb || !match_ch(lb, '[') || !(lb->flags & TF_OPEN) ||
-						    !tok_match(lb))
-							break;
-						array_root = scan;
-						Token *rb = tok_match(lb);
-						if (!rb) break;
-						scan = tok_next(rb);
-					}
-					if (scan == iclose && array_root &&
-					    c_bounds_is_tracked_array(array_root)) {
-						Token *le = c_bounds_peel_paren_ident(last_emitted);
-						if (!c_bounds_is_tracked_array(le) &&
-						    !c_bounds_expr_base_is_pointer(le))
-							BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
-					}
 				}
+				/* `ptr[arr[i]]` / `i[arr[j]]`: array name is itself
+				 * subscripted — SPEC §6.10: not a commutative bypass;
+				 * the inner `[` gets its own recursive wrap. */
 			} // !le_is_member
 		} // !comma_resolved
 	}
 	if (comma_resolved) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMMA_OP);
 	{
 		Token *rb = tok_match(tok);
-		if (rb && (c_is_value_name_token(last_emitted) || last_emitted->kind == TK_NUM)) {
-			bool memb = tok_idx(last_emitted) >= 1 &&
-				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
-			bool left_ok_scan = !memb && last_emitted->kind != TK_NUM &&
-					    !is_known_typedef(last_emitted) &&
-					    c_bounds_is_tracked_array(last_emitted);
+		/* `(i)[…]` / `(2)[…]`: last_emitted is `)`, peel to the index
+		 * primary so ternary/arith hidden-array scans still fire. */
+		Token *le = c_bounds_peel_index_lhs(last_emitted);
+		if (rb && (c_is_value_name_token(le) || le->kind == TK_NUM || last_emitted->kind == TK_NUM)) {
+			bool memb = tok_idx(le) >= 1 && (token_pool[tok_idx(le) - 1].tag & TT_MEMBER);
+			bool left_ok_scan = !memb && le->kind != TK_NUM && !is_known_typedef(le) &&
+					    c_bounds_is_tracked_array(le);
 			Token *hit = left_ok_scan ? NULL : c_bounds_find_tracked_array(tok_next(tok), rb);
 			while (hit) {
 				Token *nx = tok_next(hit);
@@ -2651,18 +2637,29 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	Token *arr_tok = name_tok;
 	Token *close = tok_match(tok);
 	/* Pointer-cast then subscript: bound with cast element size via
-	 * sizeof(arr)/sizeof(*(T *)arr), not sizeof(arr)/sizeof(arr[0]). */
-	Token *cast_close = NULL; /* ')' of (T *) */
+	 * sizeof(arr)/sizeof(*(T *)arr), not sizeof(arr)/sizeof(arr[0]).
+	 * Walk outward so the outermost cast wins: `((int*)(void*)a)[i]` must
+	 * use `*(int*)…`, not the inner `*(void*)`. Also accept pointer-to-array
+	 * casts `(T(*)[N])` whose last token before `)` is `]`. */
+	Token *cast_close = NULL; /* ')' of outermost (T *) / (T(*)[N]) */
 	{
 		Token *probe = arr_tok;
-		for (int peel = 0; peel < 4 && tok_idx(probe) >= 1; peel++) {
+		for (int peel = 0; peel < 8 && tok_idx(probe) >= 1; peel++) {
 			Token *prev = &token_pool[tok_idx(probe) - 1];
 			if (match_ch(prev, ')') && tok_match(prev)) {
 				Token *open = tok_match(prev);
 				Token *last = tok_idx(prev) >= 1 ? &token_pool[tok_idx(prev) - 1] : NULL;
-				if (last && match_ch(last, '*')) {
-					cast_close = prev;
-					break;
+				if (last && (match_ch(last, '*') || match_ch(last, ']'))) {
+					Token *fi = skip_noise(tok_next(open));
+					bool looks_cast =
+					    fi && (is_type_keyword(fi) ||
+						   (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) ||
+						   is_known_typedef(fi));
+					if (looks_cast) {
+						cast_close = prev;
+						probe = open;
+						continue;
+					}
 				}
 				if (tok_next(open) == probe && tok_next(probe) == prev) {
 					probe = open;
@@ -2762,6 +2759,25 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 		scan_end = inner_cp;
 		if (!lhs || lhs == scan_end) return NULL;
 	}
+	/* Peel a leading cast inside the grouping: `*((T*)(a+i))` — the cast
+	 * open is not a redundant whole-body wrap, so the loop above stops on
+	 * it and would otherwise skip both `(T*)` and `(a+i)` as nested groups. */
+	for (;;) {
+		if (!lhs || !match_ch(lhs, '(') || !(lhs->flags & TF_OPEN) || !tok_match(lhs)) break;
+		Token *cast_close = tok_match(lhs);
+		Token *fi = tok_next(lhs);
+		bool looks_cast =
+		    fi && (is_type_keyword(fi) || (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+		if (!looks_cast) break;
+		Token *after = tok_next(cast_close);
+		if (!after || !match_ch(after, '(') || !(after->flags & TF_OPEN) || !tok_match(after))
+			return NULL;
+		Token *add_close = tok_match(after);
+		if (!add_close || tok_next(add_close) != scan_end) break;
+		lhs = tok_next(after);
+		scan_end = add_close;
+		if (!lhs || lhs == scan_end) return NULL;
+	}
 	// Must contain a top-level `+` or `-` operator inside the parens.
 	bool has_addsub = false;
 	for (Token *t = lhs; t && t != scan_end && t->kind != TK_EOF; t = tok_next(t)) {
@@ -2799,17 +2815,17 @@ static inline Token *try_bounds_checks(Token *t) {
 }
 
 static inline void reject_defer_in_expr_context(Token *t) {
-#ifdef PRISM_DEBUG
+	/* Release+debug: mid-expression `defer` (e.g. `x=1, defer g();` /
+	 * `return defer g(), 0;`) must not leak the keyword to the C backend.
+	 * Statement-form defer is consumed by handle_defer_keyword and never
+	 * reaches emit_tok. */
 	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) && !c_is_known_function_call(t) &&
 	    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
 	    (!c_token_has_binding(t) || match_ch(tok_next(t), '{')) && tok_next(t) &&
 	    (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
 		error_tok(t,
 			  "'defer' cannot be used in expression context "
-			  "(array dimensions, parenthesized expressions, etc.)");
-#else
-	(void)t;
-#endif
+			  "(comma expressions, return values, array dimensions, etc.)");
 }
 
 static inline bool walk_balanced_tail(Token **tp) {
@@ -3979,7 +3995,12 @@ static void reject_const_unavoidable_memset(Token *var,
 			  "memset zero-initialization, which would modify a const object and cause "
 			  "undefined behavior. Provide an explicit initializer or use 'raw' to opt out.");
 	bool unavoidable = s->is_union_type || s->effective_vla || brace_unsafe ||
-			   (type->has_atomic && (s->is_aggregate || type->has_typeof));
+			   (type->has_atomic &&
+			    (s->is_aggregate ||
+			     /* SPEC: _Atomic(typeof(T)) only when T is aggregate.
+			      * Bare has_typeof falsely rejected const _Atomic typeof(int). */
+			     (type->has_typeof &&
+			      (type->is_array || type->is_struct || type->is_union))));
 	if (!unavoidable) return;
 	error_tok(var, ERR_CONST_UNAVOIDABLE_MEMSET);
 }
@@ -3997,6 +4018,11 @@ static void reject_decl_orelse_value_shape(Token *var_name,
 					   TypeSpecResult *type,
 					   DeclResult *decl) {
 	bool base_is_array = decl->is_array && (!decl->paren_pointer || decl->paren_array);
+	/* typeof(int[N]) / _Atomic(int[N]) — arrayness is on the type, not the
+	 * declarator suffix. Missing this accepted `typeof(int[2]) a={…} orelse`
+	 * and emitted broken `if (!a) {…}` C. */
+	if (!base_is_array && type->is_array && !decl->is_pointer && !decl->paren_pointer)
+		base_is_array = true;
 	if (!base_is_array && !decl->is_pointer && !decl->paren_pointer) {
 		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
 			if (is_array_typedef(t)) {
@@ -4248,7 +4274,11 @@ static Token *process_declarators(Token *tok,
 			if (!is_const_orelse_fallback) {
 				if (FEAT(F_AUTO_STATIC) && ctx->raw_block_depth == 0 && ctx->block_depth > 0 &&
 				    !in_ctrl_paren() &&
-				    has_effective_const_qual(type_start, type, &decl) &&
+				    /* SPEC §6.9 criterion 3: explicit const — do not use
+				     * has_effective_const_qual (typeof is treated as const for
+				     * orelse temps, which wrongly auto-static'd mutable
+				     * typeof(int[N]) arrays). */
+				    c_decl_has_explicit_const(type_start, type, &decl) &&
 				    !type->has_volatile && !type->has_volatile_member &&
 				    !type->has_static && !type->has_extern && !type->has_register &&
 				    !type->has_auto && !type->has_constexpr && !type->has_thread_local &&
@@ -4619,6 +4649,7 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 				continue;
 			}
 		}
+		reject_defer_in_expr_context(tok);
 		{
 			Token *r = emit_tok_checked(tok);
 			if (r) {
@@ -4690,6 +4721,11 @@ static Token *try_handle_defer_flow_kw(Token *tok) {
 	if ((tag & TT_DEFER) && !in_generic()) {
 		Token *next = handle_defer_keyword(tok);
 		if (next) return next;
+		/* Statement-shaped `defer` that handle_defer_keyword declined
+		 * (mid-expression after comma / in a return value, etc.): reject
+		 * rather than leaking the keyword. Identifier uses of a shadowed
+		 * name fall through — reject_defer_in_expr_context allows them. */
+		reject_defer_in_expr_context(tok);
 	}
 	if (FEAT(F_DEFER) && (tag & (TT_RETURN | TT_BREAK | TT_CONTINUE))) {
 		Token *next = handle_control_exit_defer(tok);
@@ -7219,6 +7255,81 @@ static bool p1d_decl_has_bracket_orelse(Token *start, Token *end) {
 	return false;
 }
 
+/* Shared by Phase 1D main decls and for/if/switch-init (`p1_scan_init_shadows`).
+ * Init-stmt decls previously only got P1K_DECL / shadows — never array bindings,
+ * so `for (int a[4]=…;;) return a[i];` skipped wraps and `for (int *g=0;;)`
+ * inherited outer `g[]` bounds. */
+static void p1d_register_decl_bounds_array(Token *type_tok,
+					   TypeSpecResult *type,
+					   DeclResult *decl,
+					   bool decl_raw,
+					   int brace_depth,
+					   bool did_shadow) {
+	if (!FEAT(F_BOUNDS_CHECK) || !decl->var_name) return;
+	bool base_is_array_here = false;
+	uint8_t base_array_rank_here = 0;
+	if (!decl_raw && !decl->is_pointer && !decl->is_func_ptr) {
+		for (Token *bt = type_tok; bt && bt != type->end; bt = tok_next(bt))
+			if (is_array_typedef(bt)) {
+				if (!decl->is_array) base_is_array_here = true;
+				base_array_rank_here = array_rank_for_tok(bt);
+				break;
+			}
+		if (!base_is_array_here && (type->has_typeof || type->has_atomic) && type->is_array)
+			base_is_array_here = true;
+	}
+	bool reg_as_array = decl->is_array && (!decl->paren_pointer || decl->paren_array);
+	bool has_complete_dim = true;
+	if (reg_as_array) {
+		has_complete_dim = false;
+		for (Token *dt = decl->var_name; dt && dt != decl->end; dt = tok_next(dt)) {
+			if (match_ch(dt, '[')) {
+				Token *nx = tok_next(dt);
+				if (nx && !match_ch(nx, ']')) has_complete_dim = true;
+				break;
+			}
+		}
+		if (!has_complete_dim && match_ch(decl->end, '=')) has_complete_dim = true;
+	}
+	if (!reg_as_array && base_is_array_here) {
+		has_complete_dim = false;
+		for (Token *bt = type_tok; bt && bt != type->end; bt = tok_next(bt)) {
+			if (is_array_typedef(bt)) {
+				if (c_array_binding_dim_complete(bt)) has_complete_dim = true;
+				break;
+			}
+		}
+		if (!has_complete_dim && (type->has_typeof || type->has_atomic) && type->is_array &&
+		    c_type_range_has_nonempty_array_dim(type_tok, type->end))
+			has_complete_dim = true;
+	}
+	bool registers_array =
+	    !decl_raw && (brace_depth > 0 || (brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
+	    has_complete_dim && (reg_as_array || base_is_array_here) && !decl->is_func_ptr;
+	if (!registers_array && c_bounds_is_tracked_array(decl->var_name))
+		c_register_array_shadow(decl->var_name);
+	if (!registers_array) return;
+	int rank = 0;
+	Token *prev_bt = NULL;
+	for (Token *dt = decl->var_name; dt && dt != decl->end;) {
+		if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
+			if (!array_bracket_closes_ptr_to_array(dt, prev_bt)) rank++;
+			Token *m = tok_match(dt);
+			dt = m ? tok_next(m) : tok_next(dt);
+			prev_bt = m;
+			continue;
+		}
+		prev_bt = dt;
+		dt = tok_next(dt);
+	}
+	if (type->type_array_rank > 0) rank += (int)type->type_array_rank;
+	else if (base_array_rank_here > 0) rank += (int)base_array_rank_here;
+	else if (base_is_array_here) rank += 1;
+	if (rank > 15) rank = ARRAY_RANK_WRAP_ALL;
+	if (did_shadow) c_mark_shadow_array(decl->var_name, (uint8_t)rank, has_complete_dim);
+	c_register_array_binding(decl->var_name, (uint8_t)rank, has_complete_dim, false, false);
+}
+
 static void p1_scan_init_shadows(Token *open,
 				 Token *init_end,
 				 uint32_t scope_close_idx,
@@ -7268,12 +7379,12 @@ static void p1_scan_init_shadows(Token *open,
 	if (init_tok->tag & TT_TYPEDEF) {
 		TD_SCOPE_SAVE();
 		td_scope_close = scope_close_idx;
-		parse_typedef_declaration(init_tok, brace_depth);
+		typedef_declaration(init_tok, brace_depth);
 		for (Token *tw = init_tok;
 		     tw && tw != init_end && tw->kind != TK_EOF && !match_ch(tw, ';');) {
 			if (is_enum_kw(tw)) {
 				Token *brace = find_struct_body_brace(tw);
-				if (brace) parse_enum_constants(brace, brace_depth);
+				if (brace) enum_constants(brace, brace_depth);
 			}
 			if (tw->flags & TF_OPEN && tok_match(tw)) {
 				tw = tok_next(tok_match(tw));
@@ -7329,6 +7440,18 @@ static void p1_scan_init_shadows(Token *open,
 			    !decl.is_func_ptr && !decl.is_func_decl) {
 				c_register_shadow_traits(decl.var_name, brace_depth, C_BIND_AGGREGATE);
 			}
+
+			bool did_shadow =
+			    is_known_typedef(decl.var_name) || is_known_enum_const(decl.var_name) ||
+			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
+			    (decl.var_name->flags & TF_RAW) || c_function_symbol(decl.var_name) ||
+			    is_vol_local || is_atomic_local || decl.is_func_decl ||
+			    (type.is_struct && !type.is_enum && !decl.is_pointer && !decl.is_array &&
+			     !decl.is_func_ptr && !decl.is_func_decl);
+			p1d_register_decl_bounds_array(
+			    init_tok, &type, &decl, decl_raw, brace_depth, did_shadow);
+			if (!decl_raw && (type.is_vla || decl.is_vla) && decl.var_name && brace_depth > 0)
+				c_register_vla_preserving_array(decl.var_name, brace_depth);
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
 			{
@@ -7772,8 +7895,8 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 		/* `defer` statement shape at expression position in a dimension
 		 * (not inside a `{…}` stmt-expr body). A variable named `defer`
 		 * used as a primary (`arr[defer+1]`, `[defer]=…`) must pass;
-		 * `defer printf(…)`, `defer 1`, `defer {…}` must reject. Pass 2's
-		 * reject_defer_in_expr_context is DEBUG-only. */
+		 * `defer printf(…)`, `defer 1`, `defer {…}` must reject. Pass 2
+		 * also rejects via reject_defer_in_expr_context on emit. */
 		if (FEAT(F_DEFER) && brace_depth_scan == 0 && (s->tag & TT_DEFER) &&
 		    !is_known_typedef(s) && !c_is_known_function_call(s) &&
 		    !(prev_bracket && (prev_bracket->tag & TT_MEMBER))) {
@@ -8530,7 +8653,7 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 		if (is_enum_kw(inner)) {
 			Token *brace = find_struct_body_brace(inner);
 			if (brace) {
-				parse_enum_constants(brace, brace_depth);
+				enum_constants(brace, brace_depth);
 				p1_check_enum_body_defer_shadow(brace, cur_sid, cur_func);
 			}
 		}
@@ -8835,86 +8958,7 @@ static void p1d_probe_declaration(Token *tok,
 		}
 
 		// -fbounds-check: register plain local array variables so Pass 2 can
-		bool base_is_array_here = false;
-		uint8_t base_array_rank_here = 0;
-		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && !decl.is_pointer &&
-		    !decl.is_func_ptr) {
-			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
-				if (is_array_typedef(bt)) {
-					if (!decl.is_array) base_is_array_here = true;
-					base_array_rank_here = array_rank_for_tok(bt);
-					break;
-				}
-			if (!base_is_array_here && (type.has_typeof || type.has_atomic) && type.is_array)
-				base_is_array_here = true;
-		}
-		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
-		bool has_complete_dim = true;
-		if (reg_as_array) {
-			has_complete_dim = false;
-			// ISO C: array type is complete only if the *outer* (first) `[]` has
-			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
-				if (match_ch(dt, '[')) {
-					Token *nx = tok_next(dt);
-					if (nx && !match_ch(nx, ']')) {
-						has_complete_dim = true;
-					}
-					break;
-				}
-			}
-			if (!has_complete_dim && match_ch(decl.end, '=')) has_complete_dim = true;
-		}
-		if (!reg_as_array && base_is_array_here) {
-			has_complete_dim = false;
-			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt)) {
-				if (is_array_typedef(bt)) {
-					if (c_array_binding_dim_complete(bt)) has_complete_dim = true;
-					break;
-				}
-			}
-			if (!has_complete_dim && (type.has_typeof || type.has_atomic) && type.is_array &&
-			    c_type_range_has_nonempty_array_dim(type_tok, type.end))
-				has_complete_dim = true;
-		}
-		/* A non-array declaration can hide a tracked outer array without
-		 * otherwise needing an ordinary parser shadow (the common case is a
-		 * local pointer). Record that namespace fact in the array registry. */
-		bool registers_array = FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-				       (brace_depth > 0 ||
-					(brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
-				       has_complete_dim && (reg_as_array || base_is_array_here) &&
-				       !decl.is_func_ptr;
-		if (FEAT(F_BOUNDS_CHECK) && decl.var_name && !registers_array &&
-		    c_bounds_is_tracked_array(decl.var_name))
-			c_register_array_shadow(decl.var_name);
-		if (registers_array) {
-			int rank = 0;
-			Token *prev_bt = NULL;
-			for (Token *dt = decl.var_name; dt && dt != decl.end;) {
-				if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
-					if (!array_bracket_closes_ptr_to_array(dt, prev_bt)) rank++;
-					Token *m = tok_match(dt);
-					dt = m ? tok_next(m) : tok_next(dt);
-					prev_bt = m;
-					continue;
-				}
-				prev_bt = dt;
-				dt = tok_next(dt);
-			}
-			if (type.type_array_rank > 0) {
-				rank += (int)type.type_array_rank;
-			} else if (base_array_rank_here > 0) {
-				rank += (int)base_array_rank_here;
-			} else if (base_is_array_here) {
-				rank += 1;
-			}
-			if (rank > 15) rank = ARRAY_RANK_WRAP_ALL;
-			/* Keep typedef-shadow is_array when the name already shadowed a
-			 * typedef/keyword; otherwise register only in the bounds table. */
-			if (did_shadow) c_mark_shadow_array(decl.var_name, (uint8_t)rank, has_complete_dim);
-			c_register_array_binding(
-			    decl.var_name, (uint8_t)rank, has_complete_dim, false, false);
-		}
+		p1d_register_decl_bounds_array(type_tok, &type, &decl, decl_raw, brace_depth, did_shadow);
 
 		t = decl.end;
 		/* Struct/union bitfield: declarator ends at `:`. Keep going so
@@ -8935,7 +8979,7 @@ static void p1d_probe_declaration(Token *tok,
 		bool has_init = match_ch(t, '=');
 		bool is_actual_vla = type.is_vla || decl.is_vla;
 		// is_vla_typedef() lookups during Pass 2.
-		if (is_actual_vla && decl.var_name && brace_depth > 0) {
+		if (!decl_raw && is_actual_vla && decl.var_name && brace_depth > 0) {
 			c_register_vla_preserving_array(decl.var_name, brace_depth);
 		}
 
@@ -9084,7 +9128,7 @@ static void p1d_register_enum_at(Token *tok, int brace_depth, uint16_t sid, int 
 	if (!is_enum_kw(tok)) return;
 	Token *brace = find_struct_body_brace(tok);
 	if (!brace) return;
-	parse_enum_constants(brace, brace_depth);
+	enum_constants(brace, brace_depth);
 	p1_check_enum_body_defer_shadow(brace, sid, p1d_cur_func);
 }
 
@@ -9586,7 +9630,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					td_scope_close = tok_idx(stmt_end);
 				}
 			}
-			parse_typedef_declaration(ps->tok, ps->brace_depth);
+			typedef_declaration(ps->tok, ps->brace_depth);
 			if (td_saved_close) td_scope_close = td_saved_close;
 			while (ps->tok && ps->tok->kind != TK_EOF && !match_ch(ps->tok, ';')) {
 				p1d_register_enum_at(ps->tok, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
