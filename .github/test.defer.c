@@ -2966,6 +2966,94 @@ static void test_defer_in_generic_stmt_expr(void) {
 	prism_free(&r);
 }
 
+/* ── stderr capture for diagnostic assertions ─────────────────────────
+ *
+ * These tests assert on warnings prism writes to stderr. Capturing stderr means
+ * redirecting fd 2, which is PROCESS-GLOBAL, while ~20 other suites run
+ * concurrently on their own pthreads (test.c). The naive version of this -
+ * pipe(), dup2(), one read() of 4 KB - failed on macOS x86 CI with a
+ * distinctive signature: every "transpile succeeds" check passed while every
+ * stderr assertion in the same function failed. The transpile was fine; only
+ * the capture was broken. Three separate defects, all of which had to go:
+ *
+ *   1. FOREIGN OUTPUT ARRIVES FIRST.  A full run writes ~350 KB to stderr, so
+ *      whatever else is executing lands in this pipe too. A single 4 KB read
+ *      could return nothing but another suite's output, and the assertion
+ *      failed on text that was in fact emitted, just past the read window.
+ *
+ *   2. FOREIGN OUTPUT IS INDISTINGUISHABLE.  The scale suite transpiles
+ *      sc_bulk.c / sc_solo.c, which emit this exact warning ~3700 times per
+ *      run. Matching on the message alone - or worse, on the bare word
+ *      "warning" - can pass on a diagnostic this transpile never produced.
+ *      So the capture keeps only lines prefixed "<name>:", and every name
+ *      below is unique to this file. A test can then only be satisfied by its
+ *      own transpile's output.
+ *
+ *   3. A PIPE CAN FILL AND BLOCK.  Pipe capacity is 64 KB on Linux, 16 KB on
+ *      macOS. Nothing reads until after fd 2 is restored, so a concurrent
+ *      thread emitting enough output blocks inside write(2) while holding no
+ *      lock and expecting none - a hang, not a failure, and one that would
+ *      look like a prism deadlock. A temp file cannot fill and cannot block
+ *      any writer, so the redirect is invisible to every other thread.
+ *
+ * Serializing captures against each other is defence-in-depth: all callers sit
+ * on the defer suite's single thread today, but that is incidental and the
+ * cost of not relying on it is one uncontended lock. */
+#ifndef _WIN32 /* Windows runs the suites serially and has no pthread. */
+static pthread_mutex_t dfr_stderr_lock = PTHREAD_MUTEX_INITIALIZER;
+#define DFR_LOCK() pthread_mutex_lock(&dfr_stderr_lock)
+#define DFR_UNLOCK() pthread_mutex_unlock(&dfr_stderr_lock)
+#else
+#define DFR_LOCK() ((void)0)
+#define DFR_UNLOCK() ((void)0)
+#endif
+
+/* Transpile `code` as `name`, capturing stderr. `out` receives only the
+ * diagnostic lines this transpile itself produced - those beginning "<name>:" -
+ * so concurrent output can neither satisfy nor displace an assertion.
+ * Returns the PrismResult; the caller frees it. */
+static PrismResult dfr_capture(const char *code, const char *name, char *out, size_t outcap) {
+	PrismResult r;
+	out[0] = '\0';
+
+	FILE *tf = tmpfile(); /* not a pipe: cannot fill, cannot block a writer */
+	if (!tf)	      /* capture unavailable; let the assertion fail loudly */
+		return prism_transpile_source(code, name, prism_defaults());
+
+	DFR_LOCK();
+	fflush(stderr);
+	int saved = dup(STDERR_FILENO);
+	dup2(fileno(tf), STDERR_FILENO);
+	r = prism_transpile_source(code, name, prism_defaults());
+	fflush(stderr);
+	dup2(saved, STDERR_FILENO);
+	close(saved);
+	DFR_UNLOCK();
+
+	/* Keep this transpile's own lines. Diagnostics are one per line and
+	 * written with a single fprintf, so a line is never interleaved. */
+	rewind(tf);
+	size_t nlen = strlen(name), used = 0;
+	char line[2048];
+	while (fgets(line, sizeof line, tf)) {
+		if (strncmp(line, name, nlen) != 0 || line[nlen] != ':')
+			continue;
+		size_t llen = strlen(line);
+		if (used + llen >= outcap)
+			break;
+		memcpy(out + used, line, llen);
+		used += llen;
+	}
+	out[used] = '\0';
+	fclose(tf);
+	return r;
+}
+
+/* The exact text emitted for a noreturn call with defers still pending.
+ * Paired with the "<name>:" filter above, an assertion on this can only be
+ * satisfied by the transpile that the assertion belongs to. */
+#define DFR_NORETURN_WARN "referenced with active defers"
+
 static void test_defer_user_noreturn_no_warning(void) {
 	/* Prism detects hardcoded noreturn functions (abort, exit, _Exit,
 	 * quick_exit, thrd_exit, __builtin_trap, __builtin_unreachable) via
@@ -2990,22 +3078,10 @@ static void test_defer_user_noreturn_no_warning(void) {
 	    "    defer cleanup();\n"
 	    "    abort();\n"
 	    "}\n";
-	int pipefd[2];
-	pipe(pipefd);
-	int saved = dup(STDERR_FILENO);
-	dup2(pipefd[1], STDERR_FILENO);
-	PrismResult r1 = prism_transpile_source(code_abort, "abort_warn.c",
-						prism_defaults());
-	fflush(stderr);
-	dup2(saved, STDERR_FILENO);
-	close(saved);
-	close(pipefd[1]);
-	char buf[4096];
-	int n = read(pipefd[0], buf, sizeof(buf) - 1);
-	buf[n > 0 ? n : 0] = '\0';
-	close(pipefd[0]);
+	char buf[8192];
+	PrismResult r1 = dfr_capture(code_abort, "abort_warn.c", buf, sizeof buf);
 	CHECK(r1.status == PRISM_OK, "noreturn-warn: abort transpile succeeds");
-	CHECK(n > 0 && strstr(buf, "warning") != NULL,
+	CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 	      "noreturn-warn: abort() with defer produces warning (baseline)");
 	prism_free(&r1);
 
@@ -3017,20 +3093,9 @@ static void test_defer_user_noreturn_no_warning(void) {
 	    "    defer cleanup();\n"
 	    "    my_panic();\n"
 	    "}\n";
-	pipe(pipefd);
-	saved = dup(STDERR_FILENO);
-	dup2(pipefd[1], STDERR_FILENO);
-	PrismResult r2 = prism_transpile_source(code_noreturn, "noreturn_warn.c",
-						prism_defaults());
-	fflush(stderr);
-	dup2(saved, STDERR_FILENO);
-	close(saved);
-	close(pipefd[1]);
-	n = read(pipefd[0], buf, sizeof(buf) - 1);
-	buf[n > 0 ? n : 0] = '\0';
-	close(pipefd[0]);
+	PrismResult r2 = dfr_capture(code_noreturn, "noreturn_warn.c", buf, sizeof buf);
 	CHECK(r2.status == PRISM_OK, "noreturn-warn: _Noreturn transpile succeeds");
-	CHECK(n > 0 && strstr(buf, "warning") != NULL,
+	CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 	      "noreturn-warn: _Noreturn user function with active defer must "
 	      "warn ('_Noreturn void my_panic()' is not in hardcoded "
 	      "TT_NORETURN_FN list; Phase 1 body scanner ignores _Noreturn / "
@@ -4240,21 +4305,10 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_panic();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t64a.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t64a.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "[[__noreturn__]] must produce defer-bypass warning");
 		prism_free(&r);
 	}
@@ -4268,21 +4322,10 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_fatal();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t64b.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t64b.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "[[gnu::__noreturn__]] must produce defer-bypass warning");
 		prism_free(&r);
 	}
@@ -4296,21 +4339,10 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_exit();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t64c.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t64c.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "[[noreturn]] must still produce warning (regression)");
 		prism_free(&r);
 	}
@@ -4332,21 +4364,10 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_panic();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t66a.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t66a.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "__attribute__((cold, __noreturn__)) must warn");
 		prism_free(&r);
 	}
@@ -4360,21 +4381,10 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_abort();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t66b.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t66b.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "__attribute__((always_inline, noreturn)) must warn");
 		prism_free(&r);
 	}
@@ -4388,21 +4398,10 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_exit();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t66c.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t66c.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "__attribute__((noreturn, cold)) must still warn");
 		prism_free(&r);
 	}
@@ -4416,21 +4415,10 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		    "    defer cleanup();\n"
 		    "    my_fatal();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t66d.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t66d.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpile succeeds");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "__declspec(__noreturn__) must produce warning");
 		prism_free(&r);
 	}
@@ -4534,21 +4522,10 @@ static void test_paren_noreturn_warning_bypass(void) {
 		    "    defer cleanup();\n"
 		    "    (fatal_panic)();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t71a.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t71a.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpiles OK");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "(fatal_panic)() must warn about defers not running");
 		prism_free(&r);
 	}
@@ -4562,21 +4539,10 @@ static void test_paren_noreturn_warning_bypass(void) {
 		    "    defer cleanup();\n"
 		    "    fatal_panic();\n"
 		    "}\n";
-		int pipefd[2];
-		pipe(pipefd);
-		int saved = dup(STDERR_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "t71b.c", prism_defaults());
-		fflush(stderr);
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-		close(pipefd[1]);
-		char buf[4096];
-		int n = read(pipefd[0], buf, sizeof(buf) - 1);
-		buf[n > 0 ? n : 0] = '\0';
-		close(pipefd[0]);
+		char buf[8192];
+		PrismResult r = dfr_capture(code, "t71b.c", buf, sizeof buf);
 		CHECK(r.status == PRISM_OK, "transpiles OK");
-		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		CHECK(strstr(buf, DFR_NORETURN_WARN) != NULL,
 		      "fatal_panic() must still warn (regression guard)");
 		prism_free(&r);
 	}

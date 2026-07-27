@@ -4094,12 +4094,14 @@ static void test_cli_dep_flags_routing(void) {
 static void test_cli_check_analyzer(void) {
 	printf("\n--- CLI check (static analyzer wrapper) ---\n");
 
-	if (system("cppcheck --version >/dev/null 2>&1") != 0) {
-		passed++;
-		total++;
-		printf("[PASS] check: skipped (cppcheck not installed)\n");
-		return;
-	}
+	/* cppcheck is not installed on any CI image this project uses, so gating the
+	 * whole tier on it meant `prism check` was exercised nowhere and the skip
+	 * counted itself as a pass. Fall back to the C compiler as the analyzer: it
+	 * is guaranteed present (prism cannot run without one) and it verifies the
+	 * same three properties — sources swapped for the analysis artifact, the
+	 * tool's exit code propagated, and findings mapped back to the ORIGINAL
+	 * file:line through the emitted #line directives. */
+	bool have_cppcheck = system("cppcheck --version >/dev/null 2>&1") == 0;
 
 	char tmpdir[PATH_MAX];
 	char *dir = test_mkdtemp(tmpdir, "prism_check_");
@@ -4121,17 +4123,29 @@ static void test_cli_check_analyzer(void) {
 		      "int f(void) {\n"
 		      "\tint x = get() orelse 7;\n"
 		      "\tint arr[8];\n"
-		      "\tarr[8] = x;\n" /* out-of-bounds: cppcheck must see it */
+		      "\tarr[8] = x;\n"	   /* line 5: cppcheck sees arrayIndexOutOfBounds */
+		      "\tundefined_thing(arr);\n" /* line 6: any C compiler sees this */
 		      "\treturn arr[0];\n"
 		      "}\n",
 		      f);
 		fclose(f);
 	}
 	snprintf(errtxt, sizeof(errtxt), "%s/err.txt", dir);
-	snprintf(cmd,
-		 sizeof(cmd),
-		 "'%s' check cppcheck --error-exitcode=2 --enable=warning '%s' >/dev/null 2>'%s'",
-		 prism_bin, src, errtxt);
+	if (have_cppcheck)
+		snprintf(cmd,
+			 sizeof(cmd),
+			 "'%s' check cppcheck --error-exitcode=2 --enable=warning '%s' >/dev/null "
+			 "2>'%s'",
+			 prism_bin, src, errtxt);
+	else
+		/* -Warray-bounds needs optimisation passes that -fsyntax-only skips, so
+		 * the fallback keys on the implicit declaration instead: every C
+		 * compiler reports it, at a known original line, without optimising. */
+		snprintf(cmd,
+			 sizeof(cmd),
+			 "'%s' check cc -fsyntax-only -Werror=implicit-function-declaration '%s' "
+			 ">/dev/null 2>'%s'",
+			 prism_bin, src, errtxt);
 	int st = system(cmd);
 	CHECK(st != 0, "check: analyzer exit code propagates on findings");
 	bool mapped = false;
@@ -4141,11 +4155,21 @@ static void test_cli_check_analyzer(void) {
 		size_t got = fread(ebuf, 1, sizeof(ebuf) - 1, f);
 		ebuf[got] = '\0';
 		fclose(f);
-		mapped = strstr(ebuf, "bug.c:5") != NULL && strstr(ebuf, "arrayIndexOutOfBounds") != NULL;
+		/* Either analyzer must name the ORIGINAL file and line, never the
+		 * transpiled artifact prism handed it. */
+		mapped = have_cppcheck ? (strstr(ebuf, "bug.c:5") != NULL &&
+					  strstr(ebuf, "arrayIndexOutOfBounds") != NULL)
+				       : (strstr(ebuf, "bug.c:6") != NULL &&
+					  strstr(ebuf, "undefined_thing") != NULL);
+		/* Whichever analyzer ran, it must never name the artifact prism
+		 * handed it - that is the whole point of the #line mapping. */
+		mapped = mapped && strstr(ebuf, ".t.c.") == NULL;
 	}
-	CHECK(mapped, "check: finding maps to original file:line via #line");
+	CHECK(mapped, have_cppcheck ? "check: finding maps to original file:line via #line"
+				    : "check: finding maps to original file:line via #line (cc fallback)");
 
-	snprintf(cmd, sizeof(cmd), "'%s' check cppcheck --version >/dev/null 2>&1", prism_bin);
+	snprintf(cmd, sizeof(cmd), "'%s' check %s --version >/dev/null 2>&1", prism_bin,
+		 have_cppcheck ? "cppcheck" : "cc");
 	CHECK_EQ(system(cmd), 0, "check: no-source tool passthrough");
 
 	snprintf(cmd, sizeof(cmd), "rm -f '%s' '%s'", src, errtxt);
