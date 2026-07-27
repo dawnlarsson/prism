@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-14538%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-13667%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a lightweight and fast transpiler that makes C safer and faster without changing how you write it.
 
-- **14538+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
+- **13667+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C:** OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler:** full semantic analysis before a single byte is emitted
 - **Progressive optimization:** auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -449,6 +449,28 @@ prism main.c helper.cpp -o mixed
 ```
 
 **Passthrough files:** `.s`, `.S` (assembly), `.cc`, `.cpp`, `.cxx`, `.mm` (C++), `.m` (Objective-C) are passed directly to the compiler without transpilation.
+
+## Preprocessor Cache
+
+Prism shells out to `cc -E` before transpiling, and that spawn dominates its runtime — 39–99% of wall time. Prism caches the preprocessor's output and skips the spawn whenever nothing it read has changed, which is roughly a **2x end-to-end speedup** on a warm cache.
+
+It is on by default and needs no configuration.
+
+```sh
+prism --prism-cache-info      # location, entry count, size, limits
+prism --prism-cache-clear     # delete every cached entry
+```
+
+| variable | default | meaning |
+|---|---|---|
+| `PRISM_NO_PP_CACHE=1` | off | disable the cache entirely |
+| `PRISM_PP_CACHE_DIR` | `$XDG_CACHE_HOME/prism-pp` | cache location |
+| `PRISM_PP_CACHE_MAX_MB` | `1024` | size cap; oldest entries evicted first |
+| `PRISM_PP_CACHE_MAX_DAYS` | `14` | age cap |
+
+**How an entry is invalidated.** The cache key covers the exact preprocessor argv, the resolved compiler binary's size and timestamp, and the include-affecting environment (`CPATH`, `SDKROOT`, …) — so upgrading your compiler or changing a flag misses. An entry is only reused if *every file that contributed to it* still has the same size, mtime (to nanosecond resolution where the platform provides it) and ctime. That dependency list is recovered from the `# N "file"` linemarkers in the preprocessed output itself, so editing any transitive header invalidates the entry without prism needing a `.d` sidecar.
+
+Every uncertainty resolves to a miss rather than a hit: unresolvable paths, filesystems too coarse to distinguish a same-second rewrite, and sources mentioning `__DATE__`, `__TIME__` or `__TIMESTAMP__` (whose expansion is not a function of the inputs) are never cached.
 
 ## Error Reporting
 
