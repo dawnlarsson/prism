@@ -8325,7 +8325,7 @@ static void test_collect_source_defines_disabled_include_abi_drop(void) {
 }
 
 // generic_member_rewrite_target and generic_decl_rewrite_target scan
-// from pparse_next(open) which includes the controlling expression.  If the
+// from pparse_next(_pc, open) which includes the controlling expression.  If the
 // controlling expression is a function call like get_state(1), it matches
 // as "valid varname followed by (" and gets extracted as the target branch.
 static void test_generic_controlling_expr_mutilation(void) {
@@ -8704,7 +8704,7 @@ static void test_skip_one_stmt_deep_do_iterative(void) {
 }
 
 static void test_raw_attr_boundary_skip_noise(void) {
-	/* is_raw_strip_context checked pparse_next(after_raw) directly,
+	/* is_raw_strip_context checked pparse_next(_pc, after_raw) directly,
 	 * not through skip_noise().  GNU/C23 attributes between variable name
 	 * and boundary punctuation (;/,) caused the check to fail, leaking
 	 * the 'raw' keyword into transpiler output. */
@@ -8722,7 +8722,7 @@ static void test_raw_attr_boundary_skip_noise(void) {
 
 static void test_typeof_paren_func_memset(void) {
 	/* typeof((func)) bypasses function-type detection because
-	 * the parenthesized name fails the pparse_next(inner)==close check.
+	 * the parenthesized name fails the pparse_next(_pc, inner)==close check.
 	 * Prism emits memset on a function type → .text overwrite. */
 	PrismResult r = prism_transpile_source(
 		"void privileged_func(void);\n"

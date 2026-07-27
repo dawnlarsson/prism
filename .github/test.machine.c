@@ -57,17 +57,18 @@ static int dm_setup_markers(void) {
 	memset(dm_marker_buf + len, 0, 8);
 
 	PParseToken *tok = pparse_tokenize_buffer((char *)"dm_markers.c", dm_marker_buf);
+	PPARSE_CTX();
 	if (!tok) return 0;
 
 	int found = 0;
-	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF; t = pparse_next(t)) {
+	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF; t = pparse_next(_pc, t)) {
 		if (t->kind != PPARSE_TK_IDENT || t->len < 2) continue;
-		char *p = pparse_loc(t);
+		char *p = pparse_loc(_pc, t);
 		if (p[0] != 'm' || p[1] < '0' || p[1] > '9') continue;
 		int id = atoi(p + 1);
 		if (id < 0 || id >= DM_MAX_IDS) continue;
 		PParseToken *e = t;
-		while (e && !pparse_match_ch(e, ';')) e = pparse_next(e);
+		while (e && !pparse_match_ch(e, ';')) e = pparse_next(_pc, e);
 		if (!e) return 0;
 		dm_marker_stmt[id] = t;
 		dm_marker_end[id] = e; /* exclusive bound, same as Pass 2 braceless defer */

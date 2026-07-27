@@ -185,11 +185,12 @@ static int ins_boundaries(const char *src, int *bounds) {
 	memcpy(buf, src, len);
 	memset(buf + len, 0, 8);
 	PParseToken *tok = pparse_tokenize_buffer((char *)"ins_bounds.c", buf);
+	PPARSE_CTX();
 	if (!tok) return -1;
 	int n = 0;
 	long prev_end = -1;
-	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF && n < INS_MAX_BOUNDS - 2; t = pparse_next(t)) {
-		long start = pparse_loc(t) - buf;
+	for (PParseToken *t = tok; t && t->kind != PPARSE_TK_EOF && n < INS_MAX_BOUNDS - 2; t = pparse_next(_pc, t)) {
+		long start = pparse_loc(_pc, t) - buf;
 		long end = start + t->len;
 		if (start != prev_end) bounds[n++] = (int)start;
 		bounds[n++] = (int)end;
