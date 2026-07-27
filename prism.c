@@ -5256,6 +5256,15 @@ static void collect_source_defines(const char *input_file) {
 			goto check_continuation;
 		}
 
+		/* Stop collecting at the first top-level #include.
+		 *
+		 * emit_consumed_defines writes the collected defines ABOVE the
+		 * re-emitted includes, so anything defined after an include in the
+		 * source cannot be hoisted without changing what it means - the
+		 * macro may deliberately override something the header defined, or
+		 * depend on it. Collecting only the prefix before the first include
+		 * is what makes the hoist sound. Conditional includes do not stop
+		 * the scan: they are re-emitted with their guards intact. */
 		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
 		if (cond_depth > cond_stack_cap) goto check_continuation;
 		if (cond_depth > 0) {
@@ -5276,7 +5285,25 @@ static void collect_source_defines(const char *input_file) {
 			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '(') p++;
 			int name_len = (int)(p - name_start);
 			if (name_len <= 0) goto check_continuation;
-			if (*p == '(') goto check_continuation;
+			/* Function-like macro: the parameter list is part of the
+			 * spelling and has to travel with the name, because the
+			 * collected form is a -D spec and `-D'F(a)=(a)'` is how a
+			 * function-like macro is written there.
+			 *
+			 * `(` must be adjacent to the name: `#define F (x)` is
+			 * object-like with value `(x)`, and the scan above already
+			 * stopped at the space in that case. Parameter lists cannot
+			 * nest, so the first `)` closes the list. A list continued
+			 * onto the next line is still skipped, as before.
+			 *
+			 * Dropping these silently was the bug: object-like defines
+			 * survived a transpile and function-like ones did not. */
+			if (*p == '(') {
+				char *params_end = strchr(p, ')');
+				if (!params_end) goto check_continuation;
+				p = params_end + 1;
+				name_len = (int)(p - name_start);
+			}
 			char *saved_name = malloc(name_len + 1);
 			if (!saved_name) goto check_continuation;
 			memcpy(saved_name, name_start, name_len);

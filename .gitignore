@@ -16,3 +16,5 @@ compat/
 /*.i
 /*.s
 .gate/
+# macOS debug symbol bundles from local prism builds
+*.dSYM/

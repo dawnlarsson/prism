@@ -1254,7 +1254,7 @@ PRISM_COLD noreturn void pparse_error_tok(PParseToken *tok, const char *fmt, ...
 	exit(1);
 }
 
-static void pparse_warn_tok(PParseToken *tok, const char *fmt, ...) {
+static PRISM_COLD void pparse_warn_tok(PParseToken *tok, const char *fmt, ...) {
 	PPARSE_CTX();
 #ifdef PRISM_LIB_MODE
 	(void)tok;
@@ -7780,7 +7780,7 @@ static bool pparse_has_storage_in(PParseToken *from, PParseToken *to) {
 	return false;
 }
 
-static bool pparse_needs_space(PParseToken *prev, PParseToken *tok) {
+static PRISM_PURE bool pparse_needs_space(PParseToken *prev, PParseToken *tok) {
 	PPARSE_CTX();
 	if (!prev || pparse_at_bol(tok)) return false;
 	if (tok->flags & PPARSE_TF_HAS_SPACE) return true;
@@ -8799,8 +8799,22 @@ reject_defer_context(PParseToken *tok, bool ctrl_paren, bool ctrl_pending, bool 
 static void reject_defer_unterminated(PParseToken *tok, PParseToken *body, PParseToken *semi) {
 	PPARSE_CTX();
 	if (semi->kind == PPARSE_TK_EOF || !pparse_match_ch(semi, ';')) pparse_error_tok(tok, PPARSE_ERR_DEFER_UNTERMINATED);
-	if (body && body->kind == PPARSE_TK_KEYWORD && (body->tag & (PPARSE_TT_NON_EXPR_STMT | PPARSE_TT_DEFER)))
-		pparse_error_tok(tok, PPARSE_ERR_DEFER_MISSING_SEMI, body->len, pparse_loc(_pc, body));
+	/* Scan the whole braceless body, not just its first token.
+	 *
+	 * `defer break;` was caught because the keyword is the body's first token,
+	 * but `defer f() break;` was not: the body scan runs to the next `;`,
+	 * swallows the keyword, and finds a semicolon after it, so neither check
+	 * fired. prism then emitted `f() break;` with the defer keyword stripped,
+	 * and the user got a backend error pointing at code they had not written.
+	 *
+	 * None of PPARSE_TT_NON_EXPR_STMT can appear in an expression, so finding
+	 * one here always means a missing `;` - except inside a statement
+	 * expression, which is a nested group and is skipped. */
+	for (PParseToken *s = body; s && s != semi && s->kind != PPARSE_TK_EOF; s = pparse_next(_pc, s)) {
+		PPARSE_SKIP_GROUP_LENIENT(s)
+		if (s->kind == PPARSE_TK_KEYWORD && (s->tag & (PPARSE_TT_NON_EXPR_STMT | PPARSE_TT_DEFER)))
+			pparse_error_tok(tok, PPARSE_ERR_DEFER_MISSING_SEMI, s->len, pparse_loc(_pc, s));
+	}
 }
 
 // Find a label in the current function's Phase 1D P1FuncEntry array.

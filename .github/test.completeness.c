@@ -1923,6 +1923,288 @@ static void cm_gen_defer_ret_shape(void) {
  * are equal.  A tokenizer that mis-scans the delimiter either fails to compile
  * or returns nonzero — no substring inspection involved.
  */
+/* ── gen/source-defines ───────────────────────────────────────────────
+ *
+ * `collect_source_defines` re-emits the `#define`s it scrapes out of the
+ * original source, because prism's output is post-`cc -E` and the directives
+ * are otherwise gone. Getting that wrong is silent and serious in both
+ * directions: scraping a `#define` that was never active resurrects
+ * commented-out configuration into the build (test.api.c pins one such case
+ * for `_FILE_OFFSET_BITS`), and dropping a live one changes what later
+ * translation units see.
+ *
+ * The function is a five-state line scanner — continuation, block comment,
+ * block comment opened *between* `#` and the directive name, multi-line raw
+ * string, and `#if` nesting with branch accumulation — and it was 1.4% covered.
+ * Hand-picked cells cannot close a five-state product, so this sweeps
+ * context × directive spelling and asks one question of every cell.
+ *
+ * ORACLE — no expected strings, and no guess about any individual cell.
+ *
+ *     prism must preserve whether a macro is defined, wherever the plain
+ *     preprocessor's own output preserves it.
+ *
+ * Three measurements per cell, all from the platform's C preprocessor with an
+ * `#error` probe appended (definedness is read from the exit status, so no
+ * output has to be captured or parsed):
+ *
+ *     ref  definedness at the end of the ORIGINAL source
+ *     cc   definedness after re-preprocessing `cc -E original`
+ *     got  definedness after re-preprocessing prism's output
+ *
+ * The `cc` leg is what keeps the tier honest. `cc -E` is not idempotent for
+ * every input: given
+ *
+ *     int pad = 0; \
+ *     #define X 1
+ *
+ * the backslash splices those into one logical line, so `X` is never defined —
+ * but `cc -E` emits the `#define` as passthrough text on its own line, and its
+ * own output re-preprocesses to *defined*. A tier that compared `got` against
+ * `ref` alone would report that as a prism bug. It is not; prism inherits it.
+ * So a cell where `got == cc` but both differ from `ref` is counted as
+ * `inherited`, reported and not failed.
+ *
+ * Comparing against `cc` alone would be equally wrong in the other direction:
+ * `cc -E` drops every `#define` it consumes, and re-emitting them is the whole
+ * point of collect_source_defines, so prism is *supposed* to differ there.
+ *
+ * The oracle also survives guarded re-emission: when a define sits inside
+ * `#ifdef __APPLE__`, prism re-emits the guard around it and re-preprocessing
+ * gives the same answer on this platform as the original did. */
+
+#define CSD_MACRO "CSD_T"
+
+/* 1 = macro defined at end of `code`, 0 = not defined, -1 = infrastructure. */
+static int csd_defined(const char *code) {
+	static const char *probe = "\n#ifndef " CSD_MACRO "\n#error csd_undefined\n#endif\n";
+	size_t n = strlen(code) + strlen(probe) + 1;
+	char *buf = malloc(n);
+	if (!buf) return -1;
+	snprintf(buf, n, "%s%s", code, probe);
+	char *path = create_temp_file(buf);
+	free(buf);
+	if (!path) return -1;
+	char cmd[PATH_MAX + 96];
+	/* -w: GCC rejects clang's -Wno-everything, and a rejected flag would make
+	 * every cell read as "undefined" and the tier vacuously green. */
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -E -w %s >/dev/null 2>&1", path);
+	int rc = run_command_status(cmd);
+	unlink(path);
+	free(path);
+	if (rc < 0) return -1;
+	return rc == 0 ? 1 : 0;
+}
+
+/* Is `code` valid C at all? `cc -E` succeeding proves nothing: the
+ * preprocessor accepts text the compiler rejects, and a cell built from such
+ * text is not a legitimate input to judge prism against. The splice contexts
+ * below produce exactly that - `int pad = 0; \\` followed by `#define X 1`
+ * splices into an expression statement containing `#`, which gcc reports as
+ * "stray '#' in program". prism rejecting it is correct. */
+static int csd_compiles(const char *code) {
+	char *path = create_temp_file(code);
+	if (!path) return -1;
+	char cmd[PATH_MAX + 96];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", path);
+	int rc = run_command_status(cmd);
+	unlink(path);
+	free(path);
+	if (rc < 0) return -1;
+	return rc == 0 ? 1 : 0;
+}
+
+/* Definedness after `cc -E` has had the source once and its output is fed back
+ * in. Isolates the preprocessor's own non-idempotence from prism's behaviour. */
+static int csd_cc_roundtrip(const char *code) {
+	char *in = create_temp_file(code);
+	if (!in) return -1;
+	char *out = create_temp_file("");
+	if (!out) {
+		unlink(in);
+		free(in);
+		return -1;
+	}
+	char cmd[2 * PATH_MAX + 96];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -E -w %s -o %s 2>/dev/null", in, out);
+	int rc = run_command_status(cmd);
+	unlink(in);
+	free(in);
+	if (rc != 0) {
+		unlink(out);
+		free(out);
+		return -1;
+	}
+	FILE *f = fopen(out, "r");
+	if (!f) {
+		unlink(out);
+		free(out);
+		return -1;
+	}
+	fseek(f, 0, SEEK_END);
+	long n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char *buf = (n >= 0) ? malloc((size_t)n + 1) : NULL;
+	if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+		free(buf);
+		buf = NULL;
+	}
+	if (buf) buf[n] = '\0';
+	fclose(f);
+	unlink(out);
+	free(out);
+	if (!buf) return -1;
+	int r = csd_defined(buf);
+	free(buf);
+	return r;
+}
+
+static void cm_gen_source_defines(void) {
+	/* Where the directive sits. %s is the directive spelling. Each entry
+	 * drives one state of the scanner; the trailing group exercises states
+	 * that only arise from a *previous* line's parse. */
+	static const char *contexts[] = {
+	    "%s\n",                                              /* active code           */
+	    "/* %s */\n",                                        /* inside one-line block */
+	    "/* opening\n%s\n*/\n",                              /* inside multi-line     */
+	    "/* opening\n * starred\n%s\n*/\n",                  /* starred continuation  */
+	    "#if 0\n%s\n#endif\n",                               /* dead branch           */
+	    "#if 1\n%s\n#endif\n",                               /* live branch           */
+	    "#ifdef CSD_ABSENT\n%s\n#endif\n",                   /* ifdef false           */
+	    "#ifndef CSD_ABSENT\n%s\n#endif\n",                  /* ifndef true           */
+	    "#if 0\n#else\n%s\n#endif\n",                        /* else branch, live     */
+	    "#if 1\n#else\n%s\n#endif\n",                        /* else branch, dead     */
+	    "#if 0\n#elif 1\n%s\n#endif\n",                      /* elif branch, live     */
+	    "#if 1\n#if 1\n%s\n#endif\n#endif\n",                /* nested, both live     */
+	    "#if 1\n#if 0\n%s\n#endif\n#endif\n",                /* nested, inner dead    */
+	    "#if 0\n#if 1\n%s\n#endif\n#endif\n",                /* nested, outer dead    */
+	    "// %s\n",                                           /* line comment          */
+	    "int csd_pad = 0; \\\n%s\n",                         /* spliced onto prev line*/
+	    "#if defined(CSD_ABSENT) && \\\n    defined(CSD_X)\n%s\n#endif\n", /* multi-line cond */
+	    "#define CSD_OTHER 1\n%s\n",                         /* after another define  */
+	    "/* c */ %s\n",                                      /* comment then directive*/
+	    "#include <stddef.h>\n%s\n",                         /* AFTER a top-level include */
+	    "#if 0\n#include <stddef.h>\n#endif\n%s\n",          /* after a dead include   */
+	};
+	/* Index of the context whose define sits after a top-level #include.
+	 * collect_source_defines deliberately stops there, because the collected
+	 * defines are emitted above the re-emitted includes and hoisting a later
+	 * define would change what it means. Counted, not failed. */
+	const size_t post_include_ctx = sizeof(contexts) / sizeof(contexts[0]) - 2;
+	/* How the directive is spelled. All of these define CSD_T. */
+	static const char *spellings[] = {
+	    "#define " CSD_MACRO " 1",
+	    "#  define " CSD_MACRO " 1",
+	    "#\tdefine " CSD_MACRO " 1",
+	    "#define " CSD_MACRO,
+	    "#define " CSD_MACRO "(a) (a)",
+	    "#define " CSD_MACRO " 1 /* trailing */",
+	    "#define " CSD_MACRO " (1 + \\\n                   1)",
+	};
+
+	CmStats st = {0};
+	long infra = 0, skipped = 0, inherited = 0, hoist_boundary = 0;
+	char src[2048], directive[256];
+
+	for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); c++)
+		for (size_t d = 0; d < sizeof(spellings) / sizeof(spellings[0]); d++) {
+			/* A directive whose own value continues onto the next line
+			 * cannot be planted inside a one-line comment or a splice
+			 * without changing which construct is under test. */
+			bool multiline_dir = strstr(spellings[d], "\\\n") != NULL;
+			bool one_line_ctx = strstr(contexts[c], "// %s") || strstr(contexts[c], "/* %s */");
+			if (multiline_dir && one_line_ctx) {
+				skipped++;
+				continue;
+			}
+			snprintf(directive, sizeof(directive), "%s", spellings[d]);
+			int len = snprintf(src, sizeof(src), contexts[c], directive);
+			if (len < 0 || (size_t)len >= sizeof(src)) {
+				skipped++;
+				continue;
+			}
+			/* Give every cell a body so the output is a real TU. */
+			size_t sl = strlen(src);
+			snprintf(src + sl, sizeof(src) - sl, "int csd_main(void) { return 0; }\n");
+
+			/* Only legitimate inputs are judged. */
+			int valid = csd_compiles(src);
+			if (valid < 0) {
+				infra++;
+				continue;
+			}
+			if (!valid) {
+				skipped++;
+				continue;
+			}
+			int ref = csd_defined(src);
+			if (ref < 0) {
+				infra++;
+				continue;
+			}
+			/* What the bare preprocessor's own output preserves. */
+			int cc_ref = csd_cc_roundtrip(src);
+			if (cc_ref < 0) {
+				infra++;
+				continue;
+			}
+
+			char *path = create_temp_file(src);
+			if (!path) {
+				infra++;
+				continue;
+			}
+			PrismFeatures feat = prism_defaults();
+			feat.flatten_headers = false; /* the collect_source_defines path */
+			PrismResult r = prism_transpile_file(path, feat);
+			unlink(path);
+			free(path);
+
+			if (r.status != PRISM_OK || !r.output) {
+				/* The input compiles, so a rejection is a finding. */
+				cm_note(&st, "ctx%zu/spell%zu: prism rejected a TU that cc compiles", c, d);
+				st.cells++;
+				prism_free(&r);
+				continue;
+			}
+			int got = csd_defined(r.output);
+			prism_free(&r);
+			st.cells++;
+			if (got < 0) {
+				infra++;
+				continue;
+			}
+			if (got == ref) continue;
+			if (c == post_include_ctx) {
+				/* Documented hoist boundary, not a defect. */
+				hoist_boundary++;
+				continue;
+			}
+			if (got == cc_ref) {
+				/* cc -E's own output already disagrees with the
+				 * source the same way; prism only passed it on. */
+				inherited++;
+				continue;
+			}
+			cm_note(&st,
+				"ctx%zu/spell%zu: " CSD_MACRO " defined=%d in source, %d after cc -E, "
+				"%d after transpile",
+				c, d, ref, cc_ref, got);
+		}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/source-defines]: %ld cells, %ld bad, %ld inherited-from-cc, "
+		 "%ld past-hoist-boundary, %ld skipped, %ld infra%s%s",
+		 st.cells, st.bad, inherited, hoist_boundary, skipped, infra,
+		 st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	/* An all-infrastructure run must not read as coverage. */
+	CHECK(st.cells > 0 && infra < st.cells, "completeness[gen/source-defines]: cells actually ran");
+}
+
+#undef CSD_MACRO
+
 static void cm_gen_raw_string(void) {
 	/* Contents chosen to break naive scanners: embedded quotes, backslashes,
 	 * a false ')' + partial-delimiter ending, newlines, and the empty body. */
@@ -6346,6 +6628,1297 @@ static void cm_gen_runtime_zi(void) {
 	cm_report("gen/runtime-zi", &st);
 }
 
+/* ── gen/runtime-defer-product ────────────────────────────────────────
+ *
+ * The two existing executed cross-feature tiers (gen/runtime-defer,
+ * gen/runtime-cross) are hand-written cells with the expected trace typed in
+ * as a literal. That bounds what they can catch to what someone thought to
+ * write down, and defer's hard part is exactly the combinatorial bit: which
+ * scopes unwind, in what order, when a scope is left by something other than
+ * falling off the end.
+ *
+ * This sweeps scope kind × inner defer count × outer defer count × exit path
+ * and, for each cell, does two independent things with one structural model:
+ *
+ *   1. emits the C program, and
+ *   2. simulates it to derive the expected trace.
+ *
+ * The oracle is the simulation, not a string a human chose. If prism unwinds
+ * the wrong scopes, runs defers in the wrong order, or skips an iteration's
+ * defers on `continue`, the emitted program's own trace disagrees and it exits
+ * non-zero. Zero-init and an in-range bounds access ride along in every cell so
+ * a cross-feature regression shows up here too rather than only in isolation.
+ *
+ * Traces use one char per event: 's' scope start, 'b' body, 'e' after the
+ * construct, 'A'/'B' outer defers, 'a'/'b'... inner defers. Defers are LIFO, so
+ * registering a then b yields "ba". */
+
+enum { DP_MAX_D = 2 };
+
+/* Inner construct kinds. */
+enum { DPK_BLOCK, DPK_LOOP, DPK_SWITCH, DPK_IF, DPK_N };
+/* How the inner scope is left. */
+enum { DPX_FALL, DPX_BREAK, DPX_CONTINUE, DPX_RETURN, DPX_GOTO, DPX_N };
+
+static const char *dp_kind_name(int k) {
+	return k == DPK_BLOCK ? "block" : k == DPK_LOOP ? "loop" : k == DPK_SWITCH ? "switch" : "if";
+}
+static const char *dp_exit_name(int x) {
+	return x == DPX_FALL	 ? "fall"
+	       : x == DPX_BREAK	 ? "break"
+	       : x == DPX_CONTINUE ? "continue"
+	       : x == DPX_RETURN	 ? "return"
+				 : "goto";
+}
+
+/* `break` needs a loop or a switch; `continue` needs a loop. */
+static int dp_valid(int kind, int exit) {
+	if (exit == DPX_BREAK) return kind == DPK_LOOP || kind == DPK_SWITCH;
+	if (exit == DPX_CONTINUE) return kind == DPK_LOOP;
+	return 1;
+}
+
+/* Append the inner defers in LIFO order: registered a,b -> runs b,a. */
+static void dp_unwind_inner(char *t, size_t cap, int ndef) {
+	size_t n = strlen(t);
+	for (int i = ndef - 1; i >= 0 && n + 1 < cap; i--) t[n++] = (char)('a' + i);
+	t[n] = '\0';
+}
+static void dp_unwind_outer(char *t, size_t cap, int ndef) {
+	size_t n = strlen(t);
+	for (int i = ndef - 1; i >= 0 && n + 1 < cap; i--) t[n++] = (char)('A' + i);
+	t[n] = '\0';
+}
+static void dp_put(char *t, size_t cap, char c) {
+	size_t n = strlen(t);
+	if (n + 1 < cap) {
+		t[n] = c;
+		t[n + 1] = '\0';
+	}
+}
+
+/* Derive the trace the program must produce. This is the oracle. */
+static void dp_expect(char *t, size_t cap, int kind, int nin, int nout, int exit) {
+	t[0] = '\0';
+	dp_put(t, cap, 's');
+	int iters = (kind == DPK_LOOP) ? 2 : 1;
+	for (int it = 0; it < iters; it++) {
+		dp_put(t, cap, 'b');
+		dp_unwind_inner(t, cap, nin); /* scope left, whichever way */
+		if (exit == DPX_RETURN || exit == DPX_GOTO) {
+			/* leaves the construct and skips the trailing marker */
+			dp_unwind_outer(t, cap, nout);
+			return;
+		}
+		if (exit == DPX_BREAK) break;
+		/* DPX_FALL and DPX_CONTINUE both proceed to the next iteration */
+	}
+	dp_put(t, cap, 'e');
+	dp_unwind_outer(t, cap, nout);
+}
+
+/* Emit the program described by the same model. */
+static void dp_emit(char *src, size_t cap, int kind, int nin, int nout, int exit) {
+	char outer[128] = "", inner[128] = "", body[512], ctrl[640];
+	for (int i = 0; i < nout; i++) {
+		char one[32];
+		snprintf(one, sizeof(one), "defer L(\"%c\"); ", (char)('A' + i));
+		strncat(outer, one, sizeof(outer) - strlen(outer) - 1);
+	}
+	for (int i = 0; i < nin; i++) {
+		char one[32];
+		snprintf(one, sizeof(one), "defer L(\"%c\"); ", (char)('a' + i));
+		strncat(inner, one, sizeof(inner) - strlen(inner) - 1);
+	}
+	const char *ex = exit == DPX_FALL	      ? ""
+			 : exit == DPX_BREAK   ? "break;"
+			 : exit == DPX_CONTINUE ? "continue;"
+			 : exit == DPX_RETURN  ? "return 0;"
+					      : "goto done;";
+	/* Zero-init and an in-range bounds access ride along in every cell.
+	 * `zi` must be 0 and `arr[2]` must be 3; either failing sets the flag. */
+	snprintf(body, sizeof(body),
+		 "%sint zi; int arr[4] = {1,2,3,4}; if (zi != 0 || arr[2] != 3) __bad = 1; L(\"b\"); %s",
+		 inner, ex);
+	switch (kind) {
+	case DPK_LOOP:
+		snprintf(ctrl, sizeof(ctrl), "for (int i = 0; i < 2; i++) { %s }", body);
+		break;
+	case DPK_SWITCH:
+		snprintf(ctrl, sizeof(ctrl), "switch (1) { case 1: { %s } }", body);
+		break;
+	case DPK_IF:
+		snprintf(ctrl, sizeof(ctrl), "if (1) { %s }", body);
+		break;
+	default:
+		snprintf(ctrl, sizeof(ctrl), "{ %s }", body);
+		break;
+	}
+	snprintf(src, cap,
+		 CM_LOG_PRE "static int __bad;\n"
+			    "static int f(void) { %sL(\"s\"); %s L(\"e\"); done: ; return 0; }\n"
+			    "int main(void){ f(); return __bad || chk(\"%s\"); }\n",
+		 outer, ctrl, "%s");
+}
+
+static void cm_gen_runtime_defer_product(void) {
+	CmStats st = {0};
+	long infra = 0;
+	char src[2048], tmpl[2048], expect[64];
+
+	for (int kind = 0; kind < DPK_N; kind++)
+		for (int exit = 0; exit < DPX_N; exit++) {
+			if (!dp_valid(kind, exit)) continue;
+			for (int nin = 0; nin <= DP_MAX_D; nin++)
+				for (int nout = 0; nout <= DP_MAX_D; nout++) {
+					dp_expect(expect, sizeof(expect), kind, nin, nout, exit);
+					dp_emit(tmpl, sizeof(tmpl), kind, nin, nout, exit);
+					snprintf(src, sizeof(src), tmpl, expect);
+					st.cells++;
+					PrismFeatures f = prism_defaults();
+					f.bounds_check = true;
+					int ex = cm_exec(src, f);
+					if (ex <= -1000) {
+						infra++;
+						cm_note(&st,
+							"%s/%s in=%d out=%d: transpile or compile "
+							"failed (%d)",
+							dp_kind_name(kind), dp_exit_name(exit), nin,
+							nout, ex);
+						continue;
+					}
+					if (ex != 0)
+						cm_note(&st, "%s/%s in=%d out=%d: expected trace %s",
+							dp_kind_name(kind), dp_exit_name(exit), nin,
+							nout, expect);
+				}
+		}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-defer-product]: %ld cells, %ld bad, %ld infra%s%s",
+		 st.cells, st.bad, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-defer-product]: cells actually ran");
+}
+
+/* ── gen/runtime-orelse-product ───────────────────────────────────────
+ *
+ * `orelse` lowers to a ternary over its left-hand side, so the LHS appears
+ * twice in the naive expansion and has to be hoisted into a temporary. That
+ * makes double-evaluation the feature's signature defect — it is why
+ * reject_orelse_side_effects exists at all — and it is invisible to any
+ * substring oracle, because the emitted C looks perfectly reasonable while
+ * calling the function twice.
+ *
+ * Every cell therefore *counts* evaluations at runtime rather than inspecting
+ * the output:
+ *
+ *   the LHS must be evaluated exactly once, always;
+ *   the fallback must be evaluated exactly once when the LHS is falsy and
+ *   never when it is truthy;
+ *   the resulting value must be the LHS when truthy and the fallback when not.
+ *
+ * All three expectations are derived from the cell's own axes, not typed in.
+ * The sweep is LHS truthiness × declaration form × fallback shape × site, so a
+ * hoist that is correct at statement level but wrong inside a loop or a switch
+ * case — this project's recurring shape — shows up as a wrong count rather
+ * than as output that merely looks odd. */
+
+enum { OPT_TRUTHY_N = 2 };
+/* Where the orelse sits. */
+enum { OPS_BLOCK, OPS_LOOP, OPS_SWITCH, OPS_IF, OPS_N };
+/* How the value is bound. */
+enum { OPF_DECL, OPF_ASSIGN, OPF_N };
+/* What the fallback is. */
+enum { OPB_CONST, OPB_CALL, OPB_EXPR, OPB_N };
+
+static const char *op_site_name(int s) {
+	return s == OPS_BLOCK ? "block" : s == OPS_LOOP ? "loop" : s == OPS_SWITCH ? "switch" : "if";
+}
+static const char *op_bind_name(int f) { return f == OPF_DECL ? "decl" : "assign"; }
+static const char *op_fb_name(int b) {
+	return b == OPB_CONST ? "const" : b == OPB_CALL ? "call" : "expr";
+}
+
+/* The fallback's value and whether evaluating it calls the counted helper. */
+static int op_fb_value(int b) { return b == OPB_CONST ? 11 : b == OPB_CALL ? 5 : 9; }
+static int op_fb_counts(int b) { return b == OPB_CALL; }
+
+static void cm_gen_orelse_product(void) {
+	CmStats st = {0};
+	long infra = 0;
+	char src[2048];
+
+	for (int truthy = 0; truthy < OPT_TRUTHY_N; truthy++)
+		for (int site = 0; site < OPS_N; site++)
+			for (int bind = 0; bind < OPF_N; bind++)
+				for (int fb = 0; fb < OPB_N; fb++) {
+					int lhs_val = truthy ? 7 : 0;
+					const char *fb_txt = fb == OPB_CONST  ? "11"
+							     : fb == OPB_CALL ? "fbc()"
+									      : "(4 + 5)";
+					/* A loop body runs twice, so every count doubles. */
+					int iters = (site == OPS_LOOP) ? 2 : 1;
+					int exp_val = truthy ? lhs_val : op_fb_value(fb);
+					int exp_lc = 1 * iters;
+					int exp_rc = (!truthy && op_fb_counts(fb)) ? iters : 0;
+
+					char stmt[256];
+					if (bind == OPF_DECL)
+						snprintf(stmt, sizeof(stmt),
+							 "int x = src() orelse %s; __val = x;", fb_txt);
+					else
+						snprintf(stmt, sizeof(stmt),
+							 "int x; x = src() orelse %s; __val = x;",
+							 fb_txt);
+
+					char ctrl[512];
+					switch (site) {
+					case OPS_LOOP:
+						snprintf(ctrl, sizeof(ctrl),
+							 "for (int i = 0; i < 2; i++) { %s }", stmt);
+						break;
+					case OPS_SWITCH:
+						snprintf(ctrl, sizeof(ctrl),
+							 "switch (1) { case 1: { %s } }", stmt);
+						break;
+					case OPS_IF:
+						snprintf(ctrl, sizeof(ctrl), "if (1) { %s }", stmt);
+						break;
+					default:
+						snprintf(ctrl, sizeof(ctrl), "{ %s }", stmt);
+						break;
+					}
+
+					snprintf(src, sizeof(src),
+						 "static int __lc, __rc, __val;\n"
+						 "static int src(void){ __lc++; return %d; }\n"
+						 "static int fbc(void){ __rc++; return 5; }\n"
+						 "static void t(void){ %s }\n"
+						 "int main(void){ t(); return !(__val == %d && __lc == "
+						 "%d && __rc == %d); }\n",
+						 lhs_val, ctrl, exp_val, exp_lc, exp_rc);
+
+					st.cells++;
+					PrismFeatures f = prism_defaults();
+					int ex = cm_exec(src, f);
+					if (ex <= -1000) {
+						infra++;
+						cm_note(&st,
+							"%s/%s/%s truthy=%d: transpile or compile "
+							"failed (%d)",
+							op_site_name(site), op_bind_name(bind),
+							op_fb_name(fb), truthy, ex);
+						continue;
+					}
+					if (ex != 0)
+						cm_note(&st,
+							"%s/%s/%s truthy=%d: expected val=%d "
+							"lhs_evals=%d fb_evals=%d",
+							op_site_name(site), op_bind_name(bind),
+							op_fb_name(fb), truthy, exp_val, exp_lc,
+							exp_rc);
+				}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-orelse-product]: %ld cells, %ld bad, %ld infra%s%s",
+		 st.cells, st.bad, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-orelse-product]: cells actually ran");
+}
+
+/* ── gen/runtime-orelse-defer ─────────────────────────────────────────
+ *
+ * The SPEC promise for an orelse action is that "all active defers run, just
+ * like a normal return". That sentence puts the two heaviest machines in the
+ * transpiler on the same statement: orelse has to hoist its left-hand side
+ * into a temporary, and defer has to unwind the right set of scopes for
+ * whichever control-flow edge the action takes.
+ *
+ * Neither existing executed tier crosses them. gen/runtime-defer sweeps defer
+ * exits with no orelse; gen/runtime-orelse-product sweeps orelse values with no
+ * defers; gen/runtime-cross has two hand-written cells that happen to use both.
+ *
+ * Each cell here plants defers at two nesting levels, an orelse whose action is
+ * return / break / continue / goto, and a left-hand side that is falsy (action
+ * fires) or truthy (it does not). The expected trace is simulated from the same
+ * model that emits the program, so nothing is asserted by hand:
+ *
+ *   'p' reached the orelse, 'q' survived it, 'e' left the construct,
+ *   'a','b' inner defers, 'A','B' outer defers — LIFO within a scope.
+ *
+ * A wrong answer here means either a scope was unwound that should not have
+ * been, or one that should have been was skipped. */
+
+enum { OD_MAX_D = 2 };
+enum { ODS_BLOCK, ODS_LOOP, ODS_SWITCH, ODS_IF, ODS_N };
+enum { ODA_RETURN, ODA_BREAK, ODA_CONTINUE, ODA_GOTO, ODA_N };
+
+static const char *od_site_name(int s) {
+	return s == ODS_BLOCK ? "block" : s == ODS_LOOP ? "loop" : s == ODS_SWITCH ? "switch" : "if";
+}
+static const char *od_act_name(int a) {
+	return a == ODA_RETURN ? "return" : a == ODA_BREAK ? "break" : a == ODA_CONTINUE ? "continue" : "goto";
+}
+static int od_valid(int site, int act) {
+	if (act == ODA_BREAK) return site == ODS_LOOP || site == ODS_SWITCH;
+	if (act == ODA_CONTINUE) return site == ODS_LOOP;
+	return 1;
+}
+
+static void od_put(char *t, size_t cap, char c) {
+	size_t n = strlen(t);
+	if (n + 1 < cap) {
+		t[n] = c;
+		t[n + 1] = '\0';
+	}
+}
+static void od_unwind(char *t, size_t cap, int n, char base) {
+	size_t k = strlen(t);
+	for (int i = n - 1; i >= 0 && k + 1 < cap; i--) t[k++] = (char)(base + i);
+	t[k] = '\0';
+}
+
+/* Simulate the cell. This is the oracle. */
+static void od_expect(char *t, size_t cap, int site, int act, int nin, int nout, int truthy) {
+	t[0] = '\0';
+	od_put(t, cap, 's');
+	int iters = (site == ODS_LOOP) ? 2 : 1;
+	for (int it = 0; it < iters; it++) {
+		od_put(t, cap, 'p');
+		if (!truthy) {
+			/* the action fires: the inner scope is left right here */
+			od_unwind(t, cap, nin, 'a');
+			if (act == ODA_RETURN || act == ODA_GOTO) {
+				od_unwind(t, cap, nout, 'A');
+				return; /* skips the trailing marker */
+			}
+			if (act == ODA_BREAK) break;
+			continue; /* ODA_CONTINUE: next iteration */
+		}
+		/* truthy: the action does not fire, the scope ends normally */
+		od_put(t, cap, 'q');
+		od_unwind(t, cap, nin, 'a');
+	}
+	od_put(t, cap, 'e');
+	od_unwind(t, cap, nout, 'A');
+}
+
+static void cm_gen_orelse_defer(void) {
+	CmStats st = {0};
+	long infra = 0;
+	char src[2048], outer[128], inner[128], stmt[256], ctrl[640], expect[64];
+
+	for (int site = 0; site < ODS_N; site++)
+		for (int act = 0; act < ODA_N; act++) {
+			if (!od_valid(site, act)) continue;
+			for (int truthy = 0; truthy < 2; truthy++)
+				for (int nin = 0; nin <= OD_MAX_D; nin++)
+					for (int nout = 0; nout <= OD_MAX_D; nout++) {
+						od_expect(expect, sizeof(expect), site, act, nin,
+							  nout, truthy);
+						outer[0] = inner[0] = '\0';
+						for (int i = 0; i < nout; i++) {
+							char one[32];
+							snprintf(one, sizeof(one),
+								 "defer L(\"%c\"); ", (char)('A' + i));
+							strncat(outer, one,
+								sizeof(outer) - strlen(outer) - 1);
+						}
+						for (int i = 0; i < nin; i++) {
+							char one[32];
+							snprintf(one, sizeof(one),
+								 "defer L(\"%c\"); ", (char)('a' + i));
+							strncat(inner, one,
+								sizeof(inner) - strlen(inner) - 1);
+						}
+						const char *action =
+						    act == ODA_RETURN     ? "return"
+						    : act == ODA_BREAK    ? "break"
+						    : act == ODA_CONTINUE ? "continue"
+									  : "goto done";
+						snprintf(stmt, sizeof(stmt),
+							 "%sL(\"p\"); int x = src() orelse %s; (void)x; "
+							 "L(\"q\");",
+							 inner, action);
+						switch (site) {
+						case ODS_LOOP:
+							snprintf(ctrl, sizeof(ctrl),
+								 "for (int i = 0; i < 2; i++) { %s }",
+								 stmt);
+							break;
+						case ODS_SWITCH:
+							snprintf(ctrl, sizeof(ctrl),
+								 "switch (1) { case 1: { %s } }", stmt);
+							break;
+						case ODS_IF:
+							snprintf(ctrl, sizeof(ctrl), "if (1) { %s }",
+								 stmt);
+							break;
+						default:
+							snprintf(ctrl, sizeof(ctrl), "{ %s }", stmt);
+							break;
+						}
+						snprintf(src, sizeof(src),
+							 CM_LOG_PRE
+							 "static int src(void){ return %d; }\n"
+							 "static void t(void){ %sL(\"s\"); %s L(\"e\"); "
+							 "done: ; }\n"
+							 "int main(void){ t(); return chk(\"%s\"); }\n",
+							 truthy ? 7 : 0, outer, ctrl, expect);
+
+						st.cells++;
+						PrismFeatures f = prism_defaults();
+						int ex = cm_exec(src, f);
+						if (ex <= -1000) {
+							infra++;
+							cm_note(&st,
+								"%s/%s truthy=%d in=%d out=%d: "
+								"transpile or compile failed (%d)",
+								od_site_name(site), od_act_name(act),
+								truthy, nin, nout, ex);
+							continue;
+						}
+						if (ex != 0)
+							cm_note(&st,
+								"%s/%s truthy=%d in=%d out=%d: expected "
+								"trace %s",
+								od_site_name(site), od_act_name(act),
+								truthy, nin, nout, expect);
+					}
+		}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-orelse-defer]: %ld cells, %ld bad, %ld infra%s%s", st.cells,
+		 st.bad, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-orelse-defer]: cells actually ran");
+}
+
+/* ── gen/passthrough-equivalence ──────────────────────────────────────
+ *
+ * The headline claim is "drop-in overlay: use CC=prism in any build system".
+ * That is a statement about code using *none* of prism's features, which is
+ * the overwhelming majority of every real translation unit it will ever see.
+ * Zero-init, bounds-check and auto-static are on by default, so prism rewrites
+ * such files anyway: every declaration is a zero-init site, every subscript a
+ * bounds site, every const array a promotion candidate.
+ *
+ * Nothing else in the tree tests that. The executed tiers all run programs
+ * written to exercise defer/orelse/raw and self-check their own semantics, and
+ * cm_cc_accepts only asks whether prism's output *compiles*. A transform that
+ * changed what ordinary C computes while still emitting compilable output
+ * would pass every existing oracle in the suite.
+ *
+ * ORACLE — differential against the unmodified compiler:
+ *
+ *     for well-defined C using no prism feature, compiling and running the
+ *     ORIGINAL and compiling and running PRISM'S OUTPUT must agree exactly.
+ *
+ * Both legs use the same compiler on the same program, so nothing is asserted
+ * about what the answer should be — only that prism did not change it. Every
+ * cell is gated on the original building and running first, so a malformed
+ * template is reported as infrastructure and never as a prism defect.
+ *
+ * Programs must be free of undefined behaviour: zero-init legitimately changes
+ * the result of an uninitialised read, which is the feature working. Every
+ * local here is initialised before use. */
+
+/* Compile and run `code` with no prism involvement. Exit status, or <= -1000. */
+static int cm_run_plain(const char *code) {
+	char *path = create_temp_file(code);
+	if (!path) return -1002;
+	char bin[PATH_MAX];
+	int fd = test_mkstemp(bin, "cm_plain_");
+	if (fd < 0) {
+		unlink(path);
+		free(path);
+		return -1002;
+	}
+	close(fd);
+	unlink(bin);
+	char cmd[PATH_MAX * 2 + 80];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -w -o %s %s >/dev/null 2>&1", bin, path);
+	if (run_command_status(cmd) != 0) {
+		unlink(path);
+		free(path);
+		return -1001;
+	}
+	int st = run_command_status(bin);
+	unlink(bin);
+	unlink(path);
+	free(path);
+	return st;
+}
+
+static void cm_gen_passthrough(void) {
+	/* `pre` is emitted at file scope, `body` inside main, which must leave the
+	 * answer in `r`. Recursion, function pointers and struct-by-value need a
+	 * real function definition, and ISO C has no nested functions. */
+	static const struct {
+		const char *pre;
+		const char *body;
+	} cells[] = {
+	    /* scalars and declarations */
+	    {"", "int a = 5, b = 7; r = a + b;"},
+	    {"", "int a = 40; { int a = 2; r = a; } r += 1;"},
+	    {"", "long a = 100000L; r = (int)(a % 97);"},
+	    {"", "unsigned u = 250u; r = (int)(u & 0x3f);"},
+	    {"", "char c = 'A'; r = c - 'A' + 9;"},
+	    {"", "double d = 2.5; r = (int)(d * 4);"},
+	    {"", "const int k = 12; r = k;"},
+	    {"", "static int s = 33; r = s;"},
+	    {"", "volatile int v = 21; r = v;"},
+	    {"", "_Bool f1 = 1; r = f1 ? 27 : 0;"},
+	    /* arrays and subscripts — the bounds-check surface */
+	    {"", "int a[4] = {1,2,3,4}; r = a[0]+a[1]+a[2]+a[3];"},
+	    {"", "int a[4] = {1,2,3,4}; int i = 2; r = a[i] * 3;"},
+	    {"", "int a[2][3] = {{1,2,3},{4,5,6}}; r = a[1][2] + a[0][0];"},
+	    {"", "int a[5] = {0}; for (int i = 0; i < 5; i++) a[i] = i*i; r = a[4];"},
+	    {"", "int a[4] = {9,8,7,6}; int *p = a; r = p[2] + *(p+1);"},
+	    {"", "char s[8] = \"abcd\"; r = (int)s[3];"},
+	    {"", "int a[4] = {[2] = 11}; r = a[2] + a[0];"},
+	    /* const arrays — the auto-static promotion surface */
+	    {"", "const int k[4] = {2,4,6,8}; r = k[0]+k[3];"},
+	    {"", "const char msg[6] = \"hello\"; r = (int)msg[1];"},
+	    {"", "static const int t[3] = {9,9,9}; r = t[0]+t[1];"},
+	    /* VLAs — zero-init lowers these to a runtime memset */
+	    {"", "int n = 4; int v[n]; for (int i=0;i<n;i++) v[i]=i+1; r = v[3]*5;"},
+	    {"", "int n = 3; int v[n][2]; for(int i=0;i<n;i++){v[i][0]=i;v[i][1]=i*2;} r = v[2][1]*7;"},
+	    /* structs and unions */
+	    {"", "struct S { int x, y; }; struct S s = {3,4}; r = s.x * s.y;"},
+	    {"", "struct S { int x; struct { int y; } in; }; struct S s = {1,{2}}; r = s.x + s.in.y * 10;"},
+	    {"", "union U { int i; char c[4]; }; union U u; u.i = 0; u.c[0] = 7; r = u.c[0];"},
+	    {"", "struct S { int a[3]; }; struct S s = {{5,6,7}}; r = s.a[1];"},
+	    {"", "struct S { int x, y; }; struct S s = {.y = 8, .x = 1}; r = s.y - s.x;"},
+	    {"", "struct S { int a, b; }; struct S arr[3] = {{1,2},{3,4},{5,6}}; r = arr[2].a + arr[0].b;"},
+	    {"", "struct B { unsigned a : 3; unsigned b : 5; }; struct B x = {5, 9}; r = (int)(x.a + x.b);"},
+	    {"", "struct S { int x; union { int a; int b; }; }; struct S s = {0}; s.a = 12; r = s.a;"},
+	    /* pointers and declarator shapes */
+	    {"", "int x = 17; int *p = &x; r = *p;"},
+	    {"", "int x = 3; int *p = &x; int **q = &p; r = **q * 5;"},
+	    {"", "int a[4] = {1,2,3,4}; int *p = a + 3; r = (int)(p - a) + *p;"},
+	    {"", "int *const p = (int[1]){13}; r = *p;"},
+	    {"", "int a[2] = {1,2}; int (*pa)[2] = &a; r = (*pa)[1] * 15;"},
+	    {"", "int a[3] = {1,2,3}; int *p = (int[3]){7,8,9}; r = p[1] + a[0];"},
+	    /* control flow */
+	    {"", "int n = 0; for (int i = 0; i < 6; i++) n += i; r = n;"},
+	    {"", "int n = 0, i = 0; while (i < 5) { n += 2; i++; } r = n;"},
+	    {"", "int n = 0, i = 0; do { n += 3; i++; } while (i < 4); r = n;"},
+	    {"", "int x = 2; switch (x) { case 1: r = 1; break; case 2: r = 22; break; default: r = 3; }"},
+	    {"", "int x = 5; if (x > 3) r = 11; else r = 22;"},
+	    {"", "int n = 0; for (int i=0;i<10;i++){ if (i==3) continue; if (i==7) break; n++; } r = n;"},
+	    {"", "int n = 0; for (int i=0;i<3;i++) for (int j=0;j<3;j++) n++; r = n;"},
+	    {"", "int i = 0, n = 0; goto mid; top: n += 5; mid: i++; if (i < 3) goto top; r = n;"},
+	    /* typedef, enum, expressions */
+	    {"", "typedef int myint; myint m = 14; r = m;"},
+	    {"", "enum E { A = 2, B = 5 }; enum E e = B; r = (int)e * 3;"},
+	    {"", "typedef struct { int a, b; } P; P p = {2,3}; r = p.a * p.b + 1;"},
+	    {"", "typedef int arr3[3]; arr3 a = {4,5,6}; r = a[2] * 4;"},
+	    {"", "int a = 1; typeof(a) b = 30; r = b;"},
+	    {"", "int a = 6, b = 3; r = (a << 1) + (b >> 1) + (a % b) + (a / b);"},
+	    {"", "int a = 1, b = 0; r = (a && !b) ? 31 : 0;"},
+	    {"", "int a = 5; a += 3; a *= 2; a -= 4; r = a;"},
+	    {"", "int a = 0; r = (a++, a += 9, a);"},
+	    {"", "int a[3] = {1,2,3}; r = (int)(sizeof a / sizeof a[0]) * 7;"},
+	    {"", "int a = 65; r = (int)(char)a - 40;"},
+	    {"", "unsigned long long big = 1ULL << 40; r = (int)(big >> 38);"},
+	    {"", "char *strs[3] = {\"aa\",\"bb\",\"cc\"}; r = (int)strs[1][0];"},
+	    /* functions: recursion, by-value structs, function pointers */
+	    {"static int fact(int n){ return n <= 1 ? 1 : n * fact(n-1); }", "r = fact(4);"},
+	    {"struct S { int a, b; }; static int sv(struct S s){ return s.a + s.b; }",
+	     "struct S q = {6,7}; r = sv(q);"},
+	    {"static int add(int a, int b){ return a+b; }", "int (*fp)(int,int) = add; r = fp(20,3);"},
+	    {"static int g1(void){return 1;} static int g2(void){return 2;}",
+	     "int (*t[2])(void) = {g1,g2}; r = t[0]() + t[1]() * 10;"},
+	    {"static int sum(int *a, int n){ int s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }",
+	     "int a[4] = {1,2,3,4}; r = sum(a, 4) * 4;"},
+	    /* file-scope declarations */
+	    {"static int gcount = 17;", "r = gcount;"},
+	    {"static int gtab[4] = {1,2,3,4};", "r = gtab[2] + gtab[3];"},
+	    {"static const char *gs = \"xyz\";", "r = (int)gs[2];"},
+	    {"struct G { int a; int b[2]; }; static struct G gg = {1,{2,3}};", "r = gg.b[1] * 9;"},
+	    {"static const int gk[3] = {5,10,15};", "r = gk[1] + gk[0];"},
+	};
+
+	CmStats st = {0};
+	long infra = 0;
+	char src[1400];
+
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		snprintf(src, sizeof(src), "%s\nint main(void){ int r = 0; %s return r & 0x7f; }\n",
+			 cells[i].pre, cells[i].body);
+		/* Gate: if the original does not build and run, the cell says
+		 * nothing about prism. */
+		int want = cm_run_plain(src);
+		if (want <= -1000) {
+			infra++;
+			cm_note(&st, "cell %zu: baseline failed to build or run (%d): %s", i, want,
+				cells[i].body);
+			continue;
+		}
+		st.cells++;
+		int got = cm_exec(src, prism_defaults());
+		if (got <= -1000) {
+			cm_note(&st, "cell %zu: prism output failed to build or run (%d): %s", i, got,
+				cells[i].body);
+			continue;
+		}
+		if (got != want)
+			cm_note(&st, "cell %zu: plain C returns %d, through prism returns %d: %s", i,
+				want, got, cells[i].body);
+	}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/passthrough-equivalence]: %ld cells, %ld bad, %ld infra%s%s",
+		 st.cells, st.bad, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/passthrough-equivalence]: cells actually ran");
+}
+
+/* ── gen/runtime-defer-depth ──────────────────────────────────────────
+ *
+ * gen/runtime-defer-product sweeps exits at ONE nesting level. The cases the
+ * SPEC calls out as hard are all multi-level:
+ *
+ *   "Nested loops: break/continue unwind the correct scope"
+ *
+ * `break` leaves the nearest enclosing loop *or switch*, stepping over any
+ * plain blocks between and running their defers on the way. `continue` leaves
+ * the nearest enclosing loop, stepping over blocks *and* switches. `goto` and
+ * `return` leave everything. Those are three different answers to "which
+ * defers run", and a transpiler carrying one scope stack for all of them gets
+ * some subset wrong.
+ *
+ * ORACLE — a conservation law, not a predicted trace.
+ *
+ *     every scope that is entered runs its defer exactly once on the way out.
+ *
+ * So the program counts entries and firings per level and asserts they balance.
+ * That is universally true for every kind/exit combination, holds under loops
+ * without having to predict iteration counts, and needs no model of C's
+ * break/continue targeting — which matters, because a simulator that got the
+ * targeting wrong in the same way the transpiler did would agree with it and
+ * report green.
+ *
+ * It is also the property that defer exists to provide: an unbalanced count is
+ * a leaked cleanup (fired too few) or a double free (fired too many), which are
+ * exactly the bugs the feature is meant to make impossible.
+ *
+ * A second, independent check rides along: defers must fire strictly
+ * inner-to-outer, so the last firing of an inner level always precedes the
+ * enclosing level's. */
+
+enum { DDK_BLOCK, DDK_LOOP, DDK_SWITCH, DDK_N };
+enum { DDX_FALL, DDX_RETURN, DDX_BREAK, DDX_CONTINUE, DDX_GOTO, DDX_N };
+enum { DD_LEVELS = 3 };
+
+static const char *dd_kind_ch(int k) { return k == DDK_BLOCK ? "b" : k == DDK_LOOP ? "l" : "s"; }
+static const char *dd_exit_name(int x) {
+	return x == DDX_FALL	     ? "fall"
+	       : x == DDX_RETURN     ? "return"
+	       : x == DDX_BREAK	     ? "break"
+	       : x == DDX_CONTINUE   ? "continue"
+				     : "goto";
+}
+
+/* `break` needs an enclosing loop or switch, `continue` an enclosing loop.
+ * Without one the program would not compile, so those cells are not cells. */
+static int dd_legal(const int *kind, int exit) {
+	if (exit == DDX_BREAK) {
+		for (int i = 0; i < DD_LEVELS; i++)
+			if (kind[i] == DDK_LOOP || kind[i] == DDK_SWITCH) return 1;
+		return 0;
+	}
+	if (exit == DDX_CONTINUE) {
+		for (int i = 0; i < DD_LEVELS; i++)
+			if (kind[i] == DDK_LOOP) return 1;
+		return 0;
+	}
+	return 1;
+}
+
+static void cm_gen_defer_depth(void) {
+	CmStats st = {0};
+	long infra = 0, skipped = 0;
+	char src[2400], open_s[DD_LEVELS][160], close_s[DD_LEVELS][16], nest[1200];
+
+	for (int k0 = 0; k0 < DDK_N; k0++)
+		for (int k1 = 0; k1 < DDK_N; k1++)
+			for (int k2 = 0; k2 < DDK_N; k2++)
+				for (int exit = 0; exit < DDX_N; exit++) {
+					int kind[DD_LEVELS] = {k0, k1, k2};
+					if (!dd_legal(kind, exit)) {
+						skipped++;
+						continue;
+					}
+					for (int i = 0; i < DD_LEVELS; i++) {
+						if (kind[i] == DDK_LOOP)
+							snprintf(open_s[i], sizeof(open_s[i]),
+								 "for (int i%d = 0; i%d < 2; i%d++) {", i,
+								 i, i);
+						else if (kind[i] == DDK_SWITCH)
+							snprintf(open_s[i], sizeof(open_s[i]),
+								 "switch (1) { case 1: {");
+						else
+							snprintf(open_s[i], sizeof(open_s[i]), "{");
+						snprintf(close_s[i], sizeof(close_s[i]), "%s",
+							 kind[i] == DDK_SWITCH ? "} }" : "}");
+					}
+					const char *act = exit == DDX_FALL	 ? ""
+							  : exit == DDX_RETURN	 ? "return;"
+							  : exit == DDX_BREAK	 ? "break;"
+							  : exit == DDX_CONTINUE ? "continue;"
+										 : "goto done;";
+					snprintf(nest, sizeof(nest),
+						 "%s ent[0]++; defer d0(); "
+						 "%s ent[1]++; defer d1(); "
+						 "%s ent[2]++; defer d2(); %s "
+						 "%s %s %s",
+						 open_s[0], open_s[1], open_s[2], act, close_s[2],
+						 close_s[1], close_s[0]);
+					snprintf(
+					    src, sizeof(src),
+					    "static int ent[3], fir[3], ord[3], seq;\n"
+					    "static void d0(void){ fir[0]++; ord[0] = ++seq; }\n"
+					    "static void d1(void){ fir[1]++; ord[1] = ++seq; }\n"
+					    "static void d2(void){ fir[2]++; ord[2] = ++seq; }\n"
+					    "static void t(void){ %s done: ; }\n"
+					    "int main(void){ t();\n"
+					    "  for (int i = 0; i < 3; i++) if (fir[i] != ent[i]) return 10 + i;\n"
+					    "  if (ent[2] && ent[1] && ord[2] > ord[1]) return 20;\n"
+					    "  if (ent[1] && ent[0] && ord[1] > ord[0]) return 21;\n"
+					    "  if (!ent[0]) return 30;\n"
+					    "  return 0; }\n",
+					    nest);
+					st.cells++;
+					PrismFeatures f = prism_defaults();
+					int ex = cm_exec(src, f);
+					if (ex <= -1000) {
+						infra++;
+						cm_note(&st, "%s%s%s/%s: build failed (%d)",
+							dd_kind_ch(k0), dd_kind_ch(k1),
+							dd_kind_ch(k2), dd_exit_name(exit), ex);
+						continue;
+					}
+					if (ex != 0) {
+						const char *why =
+						    ex >= 10 && ex <= 12  ? "defer count != scope entries"
+						    : ex == 20 || ex == 21 ? "defers fired outer-before-inner"
+						    : ex == 30		   ? "outermost scope never entered"
+									   : "unexpected exit";
+						cm_note(&st, "%s%s%s/%s: %s (exit=%d)", dd_kind_ch(k0),
+							dd_kind_ch(k1), dd_kind_ch(k2),
+							dd_exit_name(exit), why, ex);
+					}
+				}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-defer-depth]: %ld cells, %ld bad, %ld skipped, %ld infra%s%s",
+		 st.cells, st.bad, skipped, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-defer-depth]: cells actually ran");
+}
+
+/* ── gen/runtime-defer-edges ──────────────────────────────────────────
+ *
+ * Two cases the README names as handled, neither with a procedural tier:
+ *
+ *   "Statement expressions ({ ... }): defers fire at inner scope, not outer"
+ *   "switch fallthrough: defers don't double-fire between cases"
+ *
+ * Both are places where the scope a defer belongs to is not the one the braces
+ * suggest. A switch body is a single scope shared by every case label, so
+ * falling from one case into the next registers a second defer in that same
+ * scope; a transpiler treating each `case` as a boundary either fires the
+ * first early or fires it twice. A statement expression is an expression
+ * containing a block, so its defers must fire while the enclosing expression
+ * is still being evaluated.
+ *
+ * prism restricts both shapes on purpose, and building the tier surfaced that:
+ *
+ *   defer in an unbraced switch case  -> "requires braces"
+ *   defer at the top of a stmt-expr   -> "wrap in a block"
+ *
+ * Neither is a defect — an unbraced case lets a later label jump past the
+ * registration, and a top-level defer in a statement expression has no
+ * unambiguous firing point relative to the value. So the tier sweeps the legal
+ * forms for behaviour AND asserts the two rejections, which keeps a
+ * restriction from silently lapsing later.
+ *
+ * ORACLE for the legal forms is the conservation law from
+ * gen/runtime-defer-depth, with registration counted rather than assumed:
+ *
+ *     a defer fires exactly once per time control actually reached it.
+ *
+ * `reg[i]++` sits immediately before each `defer`, so entering a switch at
+ * case 1 leaves reg[0] at zero and the law then *requires* d0 never to fire —
+ * testing both directions without predicting which cases an entry visits. */
+
+enum { DE_ENTRY_N = 3 };
+enum { DEB_UNBRACED, DEB_BRACED, DEB_N };
+enum { DE_BRK_NONE, DE_BRK_LAST, DE_BRK_EACH, DE_BRK_N };
+
+static const char *de_brk_name(int b) {
+	return b == DE_BRK_NONE ? "no-break" : b == DE_BRK_LAST ? "break-last" : "break-each";
+}
+
+static void cm_gen_defer_edges(void) {
+	static const char *pre =
+	    "static int reg[4], fir[4];\n"
+	    "static void d0(void){ fir[0]++; }\n"
+	    "static void d1(void){ fir[1]++; }\n"
+	    "static void d2(void){ fir[2]++; }\n"
+	    "static void d3(void){ fir[3]++; }\n";
+	static const char *balance =
+	    "  for (int i = 0; i < 4; i++) if (fir[i] != reg[i]) return 10 + i;\n";
+
+	CmStats st = {0};
+	long infra = 0;
+	char src[2400], cases[900];
+
+	/* ── switch: fallthrough, entry point, break placement ───────── */
+	for (int entry = 0; entry < DE_ENTRY_N; entry++)
+		for (int braced = 0; braced < DEB_N; braced++)
+			for (int brk = 0; brk < DE_BRK_N; brk++) {
+				cases[0] = '\0';
+				for (int c = 0; c < 3; c++) {
+					char one[300];
+					const char *tail =
+					    (brk == DE_BRK_EACH || (brk == DE_BRK_LAST && c == 2))
+						? "break;"
+						: "";
+					if (braced == DEB_BRACED)
+						snprintf(one, sizeof(one),
+							 "case %d: { reg[%d]++; defer d%d(); %s } ", c, c,
+							 c, tail);
+					else
+						snprintf(one, sizeof(one),
+							 "case %d: reg[%d]++; defer d%d(); %s ", c, c, c,
+							 tail);
+					strncat(cases, one, sizeof(cases) - strlen(cases) - 1);
+				}
+				snprintf(src, sizeof(src),
+					 "%s"
+					 "static void t(int n){ reg[3]++; defer d3(); switch (n) { %s } }\n"
+					 "int main(void){ t(%d);\n%s"
+					 "  if (fir[3] != 1) return 20;\n"
+					 "  return 0; }\n",
+					 pre, cases, entry, balance);
+				st.cells++;
+				if (braced == DEB_UNBRACED) {
+					PrismResult r = cm_txf(src, prism_defaults());
+					if (cm_ok(&r))
+						cm_note(&st,
+							"switch entry=%d unbraced %s: accepted a defer "
+							"in an unbraced case",
+							entry, de_brk_name(brk));
+					prism_free(&r);
+					continue;
+				}
+				int ex = cm_exec(src, prism_defaults());
+				if (ex <= -1000) {
+					infra++;
+					cm_note(&st, "switch entry=%d braced %s: build failed (%d)",
+						entry, de_brk_name(brk), ex);
+					continue;
+				}
+				if (ex != 0)
+					cm_note(&st,
+						"switch entry=%d braced %s: defer count != times "
+						"reached (exit=%d)",
+						entry, de_brk_name(brk), ex);
+			}
+
+	/* ── statement expressions, legal (block-wrapped) forms ──────── */
+	{
+		static const char *sites[] = {
+		    "int v = ({ { reg[0]++; defer d0(); } 7; }); if (fir[0] != 1) rc = 40; (void)v;",
+		    "int v = 0; v = ({ { reg[0]++; defer d0(); } 7; }); if (fir[0] != 1) rc = 41; (void)v;",
+		    "int v = 1 + ({ { reg[0]++; defer d0(); } 7; }); if (fir[0] != 1) rc = 42; (void)v;",
+		    "if (({ { reg[0]++; defer d0(); } 1; })) { if (fir[0] != 1) rc = 43; }",
+		    "int v = ({ { reg[0]++; defer d0(); } ({ { reg[1]++; defer d1(); } 3; }); }); "
+		    "if (fir[0] != 1 || fir[1] != 1) rc = 44; (void)v;",
+		    "for (int i = 0; i < 2; i++) { int v = ({ { reg[0]++; defer d0(); } i; }); (void)v; } "
+		    "if (fir[0] != 2) rc = 45;",
+		    "int a[2] = {0,0}; a[({ { reg[0]++; defer d0(); } 1; })] = 5; "
+		    "if (fir[0] != 1 || a[1] != 5) rc = 46;",
+		    /* the defer must have fired before the value is taken */
+		    "int v = ({ int w; { reg[0]++; defer d0(); w = 6; } if (fir[0] != 1) rc = 47; w; }); "
+		    "if (v != 6) rc = 48;",
+		    /* a block nested inside the statement expression's block */
+		    "int v = ({ { reg[0]++; defer d0(); { reg[1]++; defer d1(); } } 9; }); "
+		    "if (fir[0] != 1 || fir[1] != 1) rc = 49; (void)v;",
+		};
+		for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); i++) {
+			snprintf(src, sizeof(src),
+				 "%s"
+				 "static int t(void){ int rc = 0; reg[3]++; defer d3(); %s return rc; }\n"
+				 "int main(void){ int rc = t(); if (rc) return rc;\n%s"
+				 "  return 0; }\n",
+				 pre, sites[i], balance);
+			st.cells++;
+			int ex = cm_exec(src, prism_defaults());
+			if (ex <= -1000) {
+				infra++;
+				cm_note(&st, "stmt-expr %zu: build failed (%d)", i, ex);
+				continue;
+			}
+			if (ex != 0)
+				cm_note(&st,
+					"stmt-expr %zu: defer did not fire at the inner scope "
+					"(exit=%d)",
+					i, ex);
+		}
+	}
+
+	/* ── the two restrictions must keep holding ──────────────────── */
+	{
+		static const char *illegal[] = {
+		    "int v = ({ reg[0]++; defer d0(); 7; }); (void)v;",
+		    "int v = ({ defer d0(); 7; }); (void)v;",
+		    "int v = 1 + ({ reg[0]++; defer d0(); 7; }); (void)v;",
+		};
+		for (size_t i = 0; i < sizeof(illegal) / sizeof(illegal[0]); i++) {
+			snprintf(src, sizeof(src),
+				 "%s"
+				 "static int t(void){ int rc = 0; %s return rc; }\n"
+				 "int main(void){ return t(); }\n",
+				 pre, illegal[i]);
+			st.cells++;
+			PrismResult r = cm_txf(src, prism_defaults());
+			if (cm_ok(&r))
+				cm_note(&st,
+					"stmt-expr illegal %zu: accepted a defer at the top level "
+					"of a statement expression",
+					i);
+			prism_free(&r);
+		}
+	}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-defer-edges]: %ld cells, %ld bad, %ld infra%s%s", st.cells,
+		 st.bad, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-defer-edges]: cells actually ran");
+}
+
+/* ── gen/runtime-defer-wide ───────────────────────────────────────────
+ *
+ * Closes the axes the other defer tiers leave open:
+ *
+ *   depth 4        (defer-depth stops at 3)
+ *   do/while       (only `for` was swept)
+ *   3 defers/scope (only 0-2)
+ *   goto backward  (only forward, to a label past the construct)
+ *   recursion      (defers of several live frames)
+ *   multi-return   (returns at different depths in one function)
+ *
+ * ORACLE is the conservation law from gen/runtime-defer-depth — every scope
+ * entered runs its defer exactly once — for the same reason: it needs no model
+ * of C's break/continue targeting, so a simulator that got the targeting wrong
+ * the same way the transpiler did cannot make the tier agree with a bug.
+ * Registration is counted (`reg[i]++` immediately before each `defer`) so a
+ * scope that is never reached must not fire, and one reached twice must fire
+ * twice.
+ *
+ * The kind vectors are a representative list rather than the full 4^4 product:
+ * 256 patterns x 5 exits at two process spawns each would dominate the suite's
+ * wall clock, and the combinations that matter are the ones where the scope a
+ * `break` or `continue` targets is NOT the innermost — blocks and switches
+ * interposed between the exit and its loop. Those are all present below. */
+
+enum { DW_LVL = 4 };
+
+static void cm_gen_defer_wide(void) {
+	/* 'b' block, 'f' for, 'd' do-while, 's' switch, 'i' if. Chosen so every
+	 * pattern puts something non-targetable between an exit and its loop. */
+	static const char *pats[] = {
+	    "bbbb", "ffff", "dddd", "ssss", "bfbf", "fbfb", "fsbf", "sfsb",
+	    "fbsd", "dbsf", "ifbf", "fifi", "sbdb", "dsfb", "bdsf", "fdbs",
+	};
+	static const int ndef[] = {1, 3};
+	enum { DWX_FALL, DWX_RETURN, DWX_BREAK, DWX_CONTINUE, DWX_GOTO, DWX_N };
+	static const char *acts[] = {"", "return;", "break;", "continue;", "goto done;"};
+	static const char *xname[] = {"fall", "return", "break", "continue", "goto"};
+
+	CmStats st = {0};
+	long infra = 0, skipped = 0;
+	char src[4096], nest[3000], pre[600], chk[400];
+
+	for (size_t p = 0; p < sizeof(pats) / sizeof(pats[0]); p++)
+		for (size_t nd = 0; nd < sizeof(ndef) / sizeof(ndef[0]); nd++)
+			for (int x = 0; x < DWX_N; x++) {
+				const char *pat = pats[p];
+				/* `break` needs a loop or switch somewhere, `continue` a loop. */
+				int has_loop = 0, has_brk_target = 0;
+				for (int i = 0; i < DW_LVL; i++) {
+					if (pat[i] == 'f' || pat[i] == 'd') has_loop = 1;
+					if (pat[i] == 'f' || pat[i] == 'd' || pat[i] == 's')
+						has_brk_target = 1;
+				}
+				if (x == DWX_BREAK && !has_brk_target) {
+					skipped++;
+					continue;
+				}
+				if (x == DWX_CONTINUE && !has_loop) {
+					skipped++;
+					continue;
+				}
+				int n = ndef[nd];
+				/* counters + one cleanup fn per (level, slot) */
+				int slots = DW_LVL * n;
+				pre[0] = '\0';
+				chk[0] = '\0';
+				{
+					char one[128];
+					snprintf(one, sizeof(one),
+						 "static int reg[%d], fir[%d];\n", slots, slots);
+					strncat(pre, one, sizeof(pre) - strlen(pre) - 1);
+					for (int k = 0; k < slots; k++) {
+						snprintf(one, sizeof(one),
+							 "static void c%d(void){ fir[%d]++; }\n", k, k);
+						strncat(pre, one, sizeof(pre) - strlen(pre) - 1);
+					}
+					snprintf(chk, sizeof(chk),
+						 "  for (int k = 0; k < %d; k++) if (fir[k] != reg[k]) "
+						 "return 10 + k;\n",
+						 slots);
+				}
+				nest[0] = '\0';
+				for (int i = 0; i < DW_LVL; i++) {
+					char open[192];
+					switch (pat[i]) {
+					case 'f':
+						snprintf(open, sizeof(open),
+							 "for (int i%d = 0; i%d < 2; i%d++) { ", i, i, i);
+						break;
+					case 'd': snprintf(open, sizeof(open), "do { "); break;
+					case 's':
+						snprintf(open, sizeof(open), "switch (1) { case 1: { ");
+						break;
+					case 'i': snprintf(open, sizeof(open), "if (1) { "); break;
+					default: snprintf(open, sizeof(open), "{ "); break;
+					}
+					strncat(nest, open, sizeof(nest) - strlen(nest) - 1);
+					for (int k = 0; k < n; k++) {
+						char one[96];
+						int slot = i * n + k;
+						snprintf(one, sizeof(one), "reg[%d]++; defer c%d(); ",
+							 slot, slot);
+						strncat(nest, one, sizeof(nest) - strlen(nest) - 1);
+					}
+				}
+				strncat(nest, acts[x], sizeof(nest) - strlen(nest) - 1);
+				for (int i = DW_LVL - 1; i >= 0; i--) {
+					const char *close = pat[i] == 's'	? " } } "
+							    : pat[i] == 'd' ? " } while (0); "
+									    : " } ";
+					strncat(nest, close, sizeof(nest) - strlen(nest) - 1);
+				}
+				snprintf(src, sizeof(src),
+					 "%s"
+					 "static void t(void){ %s done: ; }\n"
+					 "int main(void){ t();\n%s  return 0; }\n",
+					 pre, nest, chk);
+				st.cells++;
+				int ex = cm_exec(src, prism_defaults());
+				if (ex <= -1000) {
+					infra++;
+					cm_note(&st, "%s n=%d %s: build failed (%d)", pat, n,
+						xname[x], ex);
+					continue;
+				}
+				if (ex != 0)
+					cm_note(&st,
+						"%s n=%d %s: defer count != scope entries (exit=%d)",
+						pat, n, xname[x], ex);
+			}
+
+	/* ── shapes that are not a nesting product ───────────────────── */
+	{
+		static const char *fixed[] = {
+		    /* goto backward over a scope containing defers */
+		    "static int reg[2], fir[2];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void t(void){ int n = 0; again: { reg[0]++; defer c0(); n++; } "
+		    "if (n < 3) goto again; }\n"
+		    "int main(void){ t(); return fir[0] != reg[0]; }\n",
+		    /* recursion: several live frames each with defers */
+		    "static int reg[2], fir[2];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void r(int n){ reg[0]++; defer c0(); if (n > 0) r(n - 1); }\n"
+		    "int main(void){ r(5); return fir[0] != reg[0] || reg[0] != 6; }\n",
+		    /* returns at three different depths in one function */
+		    "static int reg[3], fir[3];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void c1(void){ fir[1]++; }\n"
+		    "static void c2(void){ fir[2]++; }\n"
+		    "static void t(int k){ reg[0]++; defer c0(); if (k == 0) return; "
+		    "{ reg[1]++; defer c1(); if (k == 1) return; "
+		    "{ reg[2]++; defer c2(); return; } } }\n"
+		    "int main(void){ for (int k = 0; k < 3; k++) t(k);\n"
+		    "  for (int i = 0; i < 3; i++) if (fir[i] != reg[i]) return 10 + i;\n"
+		    "  return !(reg[0] == 3 && reg[1] == 2 && reg[2] == 1); }\n",
+		    /* many defers in one scope */
+		    "static int reg[1], fir[1];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void t(void){ for (int i = 0; i < 8; i++) { reg[0]++; defer c0(); } }\n"
+		    "int main(void){ t(); return fir[0] != reg[0] || reg[0] != 8; }\n",
+		    /* defer in a do-while that runs several iterations */
+		    "static int reg[1], fir[1];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void t(void){ int i = 0; do { reg[0]++; defer c0(); i++; } while (i < 4); }\n"
+		    "int main(void){ t(); return fir[0] != reg[0] || reg[0] != 4; }\n",
+		    /* defer inside a while whose body exits early */
+		    "static int reg[1], fir[1];\n"
+		    "static void c0(void){ fir[0]++; }\n"
+		    "static void t(void){ int i = 0; while (i < 9) { reg[0]++; defer c0(); i++; "
+		    "if (i == 3) break; } }\n"
+		    "int main(void){ t(); return fir[0] != reg[0] || reg[0] != 3; }\n",
+		};
+		for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+			st.cells++;
+			int ex = cm_exec(fixed[i], prism_defaults());
+			if (ex <= -1000) {
+				infra++;
+				cm_note(&st, "shape %zu: build failed (%d)", i, ex);
+				continue;
+			}
+			if (ex != 0) cm_note(&st, "shape %zu: exit=%d", i, ex);
+		}
+	}
+
+	char name[384];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/runtime-defer-wide]: %ld cells, %ld bad, %ld skipped, %ld infra%s%s",
+		 st.cells, st.bad, skipped, infra, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/runtime-defer-wide]: cells actually ran");
+}
+
+/* ── gen/defer-reject-product ─────────────────────────────────────────
+ *
+ * prism enforces 19 restrictions on where a defer may appear. Each had exactly
+ * one hand-written test, which proves the rule fires for the shape somebody
+ * wrote down and says nothing about its siblings. The failure mode that
+ * matters is a rule that holds in a function body and lapses inside a switch
+ * case, or holds at depth 1 and lapses at depth 2 — a shape where the
+ * transpiler accepts what it believes it rejects and lowers it to something
+ * with no defined meaning.
+ *
+ * This crosses every restriction with every enclosing context it can still
+ * apply in. A restriction about placement within a function (nested defer,
+ * control flow inside a defer body, labels, statics) must hold no matter how
+ * deeply the defer itself is nested, so each fragment is planted in a plain
+ * body, a block, a loop, a braced switch case, an if, and two nested blocks.
+ *
+ * ORACLE: prism must reject. An acceptance is reported with the context that
+ * produced it, because the interesting part of such a finding is always which
+ * placement let it through. Cells whose *baseline* is rejected for an
+ * unrelated reason cannot exist here — these fragments are invalid prism, not
+ * invalid C, so there is nothing to gate on. */
+
+static void cm_gen_defer_reject(void) {
+	/* Fragments that must never be accepted, wherever they sit. */
+	static const struct {
+		const char *name;
+		const char *frag;
+	} rules[] = {
+	    {"nested-defer", "defer { defer f(); }"},
+	    {"nested-defer-block", "defer { { defer f(); } }"},
+	    {"nested-defer-loop", "defer { for (int q = 0; q < 2; q++) { defer f(); } }"},
+	    {"return-in-defer", "defer { f(); return; }"},
+	    {"goto-in-defer", "defer { f(); goto zz; } zz: ;"},
+	    {"label-in-defer", "defer { zq: f(); goto zq; }"},
+	    {"static-in-defer", "defer { static int sq; sq++; f(); }"},
+	    {"stmt-expr-top", "int vq = ({ defer f(); 1; }); (void)vq;"},
+	    {"paren-top", "(defer f());"},
+	    {"static-assert", "_Static_assert(sizeof(({ int q; defer f(); q = 4; q; })) == 4, \"x\");"},
+	    {"missing-semi", "defer f()"},
+	};
+	/* Enclosing contexts. %s is the fragment. */
+	static const struct {
+		const char *name;
+		const char *wrap;
+	} ctxs[] = {
+	    {"body", "%s"},
+	    {"block", "{ %s }"},
+	    {"loop", "for (int zi = 0; zi < 2; zi++) { %s }"},
+	    {"switch", "switch (1) { case 1: { %s } }"},
+	    {"if", "if (1) { %s }"},
+	    {"nested2", "{ { %s } }"},
+	    {"while", "while (1) { %s break; }"},
+	    {"do", "do { %s } while (0);"},
+	};
+
+	CmStats st = {0};
+	char src[1600], inner[900];
+
+	for (size_t r = 0; r < sizeof(rules) / sizeof(rules[0]); r++)
+		for (size_t c = 0; c < sizeof(ctxs) / sizeof(ctxs[0]); c++) {
+			/* `break` in the while wrapper would be inside a defer body for
+			 * the control-flow rules, changing which rule is under test. */
+			if (strstr(ctxs[c].wrap, "break;") && strstr(rules[r].frag, "defer {")) continue;
+			snprintf(inner, sizeof(inner), ctxs[c].wrap, rules[r].frag);
+			snprintf(src, sizeof(src), "void f(void);\nvoid t(void){ %s }\n", inner);
+			st.cells++;
+			PrismResult res = cm_txf(src, prism_defaults());
+			if (cm_ok(&res))
+				cm_note(&st, "%s accepted in context '%s'", rules[r].name, ctxs[c].name);
+			prism_free(&res);
+		}
+
+	/* Restrictions that are about the function, not the statement's nesting. */
+	{
+		static const struct {
+			const char *name;
+			const char *src;
+		} whole[] = {
+		    {"file-scope", "void f(void);\ndefer f();\n"},
+		    {"braceless-if", "void f(void);\nvoid t(int c){ if (c) defer f(); }\n"},
+		    {"braceless-for",
+		     "void f(void);\nvoid t(void){ for (int i = 0; i < 2; i++) defer f(); }\n"},
+		    {"braceless-while", "void f(void);\nvoid t(void){ while (1) defer f(); }\n"},
+		    {"unbraced-switch-case",
+		     "void f(void);\nvoid t(int n){ switch (n) { case 0: defer f(); break; } }\n"},
+		    {"computed-goto",
+		     "void f(void);\nvoid t(void){ void *p = &&L; defer f(); goto *p; L: ; }\n"},
+		    {"asm-goto",
+		     "void f(void);\nvoid t(void){ defer f(); asm goto (\"\" ::: : L); L: ; }\n"},
+		    {"setjmp", "#include <setjmp.h>\nvoid f(void);\nstatic jmp_buf b;\n"
+			       "void t(void){ defer f(); setjmp(b); }\n"},
+		    {"nested-function",
+		     "void f(void);\nvoid t(void){ defer f(); void inner(void){ } inner(); }\n"},
+		    {"goto-skips-defer", "void f(void);\nvoid t(void){ goto L; defer f(); L: ; }\n"},
+		    {"goto-loops-defer",
+		     "void f(void);\nvoid t(void){ int i=0; L: defer f(); i++; if (i<2) goto L; }\n"},
+		    {"goto-skips-defer-nested",
+		     "void f(void);\nvoid t(void){ { goto L; defer f(); L: ; } }\n"},
+		    {"goto-skips-defer-loop",
+		     "void f(void);\nvoid t(void){ for(int i=0;i<2;i++){ goto L; defer f(); L: ; } }\n"},
+		};
+		for (size_t i = 0; i < sizeof(whole) / sizeof(whole[0]); i++) {
+			st.cells++;
+			PrismResult res = cm_txf(whole[i].src, prism_defaults());
+			if (cm_ok(&res)) cm_note(&st, "%s accepted", whole[i].name);
+			prism_free(&res);
+		}
+	}
+
+	char name[384];
+	snprintf(name, sizeof(name), "completeness[gen/defer-reject-product]: %ld cells, %ld bad%s%s",
+		 st.cells, st.bad, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+	CHECK(st.cells > 0, "completeness[gen/defer-reject-product]: cells actually ran");
+}
+
 /* Cross-feature executed: defer+bounds, orelse+zi, raw suppress, as promote. */
 static void cm_gen_runtime_cross(void) {
 	static const struct {
@@ -6514,5 +8087,14 @@ void run_completeness_open_tests(void) {
 	cm_gen_cert_compile_run();
 	cm_gen_raw_identifier();
 	cm_gen_raw_string();
+	cm_gen_source_defines();
+	cm_gen_runtime_defer_product();
+	cm_gen_orelse_product();
+	cm_gen_orelse_defer();
+	cm_gen_passthrough();
+	cm_gen_defer_depth();
+	cm_gen_defer_edges();
+	cm_gen_defer_wide();
+	cm_gen_defer_reject();
 #endif
 }
