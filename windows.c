@@ -1138,6 +1138,14 @@ static bool cc_is_msvc(const char *cc) {
 		(len == 6 && _strnicmp(base, "cl.exe", 6) == 0));
 }
 
+// Defined in prism.c, which includes parse.c, which includes this file — so the
+// definition is not visible here and cannot be reordered to make it visible
+// without breaking parse.c's "self-contained, nothing declared above" property.
+// Declaring it locally keeps windows.c independent of include order; without
+// this, MSVC infers `int()` at the call below and then rejects the real
+// declaration with C2040 (and GCC 14+ rejects the implicit declaration).
+static char **build_clean_environ(void);
+
 // Run a command and wait for it to complete.
 // Returns exit status, or -1 on error.
 // Uses CreateProcess with proper quoting so paths with spaces work.

@@ -6169,7 +6169,9 @@ static bool pp_source_is_cacheable(const char *input_file) {
 	bool ok = false;
 
 	if (stat(input_file, &st) != 0) return false;
-	if (st.st_size <= 0 || st.st_size > (off_t)(64 << 20)) return false;
+	/* Not off_t: that name is POSIX and MSVC only exposes it under
+	 * _CRT_DECLARE_NONSTDC_NAMES. st_size is an integer type on every target. */
+	if (st.st_size <= 0 || (long long)st.st_size > (long long)(64 << 20)) return false;
 	f = fopen(input_file, "rb");
 	if (!f) return false;
 	b = malloc((size_t)st.st_size);
