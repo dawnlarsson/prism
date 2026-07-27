@@ -48,6 +48,9 @@ static int run_command_quiet(char **argv);
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #endif
+#ifndef _WIN32
+#include <dirent.h> /* preprocessor-cache eviction sweep */
+#endif
 
 #define OUT_BUF_SIZE (128 * 1024)
 
@@ -5643,11 +5646,48 @@ static bool input_is_dot_i(const char *path) {
  * one of the build-time date macros (whose expansion is not a function of the
  * inputs - see pp_text_has_time_macro). Set PRISM_NO_PP_CACHE=1 to disable.
  */
-#define PP_CACHE_MAGIC "PRISMPPC1\n"
+#define PP_CACHE_MAGIC "PRISMPPC2\n"
+
+/* Sub-second mtime, where the platform exposes it. POSIX.1-2008 requires
+ * st_mtime to be a macro for st_mtim.tv_sec, which is the portable probe for
+ * the timespec fields. Without nanoseconds a file rewritten inside the same
+ * second it was recorded is indistinguishable from an unchanged one, so
+ * pp_cache_store refuses to record entries that recent. */
+#if defined(_WIN32)
+#define PP_MTIME_NSEC(st) 0LL
+#elif defined(__APPLE__)
+#define PP_MTIME_NSEC(st) ((long long)(st).st_mtimespec.tv_nsec)
+#elif defined(st_mtime)
+#define PP_MTIME_NSEC(st) ((long long)(st).st_mtim.tv_nsec)
+#else
+#define PP_MTIME_NSEC(st) 0LL
+#endif
+
+#ifdef _WIN32
+#define PP_PATHLIST_SEP ';'
+#else
+#define PP_PATHLIST_SEP ':'
+#endif
 
 typedef struct {
 	uint64_t a, b;
 } PPKey;
+
+/* Identity of one dependency. ctime catches metadata-only replacements
+ * (`cp -p`, checkout of a same-size file) that leave size and mtime intact. */
+typedef struct {
+	long long size, mtime_sec, mtime_nsec, ctime_sec;
+} PPStat;
+
+static bool pp_stat_id(const char *path, PPStat *o) {
+	struct stat st;
+	if (stat(path, &st) != 0) return false;
+	o->size = (long long)st.st_size;
+	o->mtime_sec = (long long)st.st_mtime;
+	o->mtime_nsec = PP_MTIME_NSEC(st);
+	o->ctime_sec = (long long)st.st_ctime;
+	return true;
+}
 
 static void ppk_feed(PPKey *k, const void *p, size_t n) {
 	const unsigned char *s = (const unsigned char *)p;
@@ -5669,73 +5709,123 @@ static const char *const pp_cache_env_keys[] = {
     "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "SOURCE_DATE_EPOCH", "PRISM_CC",
 };
 
+static bool pp_is_dir_sep(char c) {
+#ifdef _WIN32
+	return c == '/' || c == '\\';
+#else
+	return c == '/';
+#endif
+}
+
 /* Resolve `name` through PATH and fold the binary's identity into the key, so
  * upgrading or switching compilers invalidates every entry. */
 static void ppk_feed_compiler(PPKey *k, const char *name) {
-	struct stat st;
-	if (strchr(name, '/') && stat(name, &st) == 0) {
-		ppk_feed(k, &st.st_size, sizeof st.st_size);
-		ppk_feed(k, &st.st_mtime, sizeof st.st_mtime);
+	PPStat id;
+	bool has_sep = false;
+	for (const char *c = name; *c; c++)
+		if (pp_is_dir_sep(*c)) has_sep = true;
+	if (has_sep) {
+		if (pp_stat_id(name, &id)) ppk_feed(k, &id, sizeof id);
 		return;
 	}
 	const char *path = getenv("PATH");
 	if (!path) return;
 	size_t nlen = strlen(name);
 	for (const char *p = path; *p;) {
-		const char *sep = strchr(p, ':');
+		const char *sep = strchr(p, PP_PATHLIST_SEP);
 		size_t dlen = sep ? (size_t)(sep - p) : strlen(p);
-		if (dlen && dlen + nlen + 2 < PATH_MAX) {
+		if (dlen && dlen + nlen + 8 < PATH_MAX) {
 			char buf[PATH_MAX];
 			memcpy(buf, p, dlen);
 			buf[dlen] = '/';
 			memcpy(buf + dlen + 1, name, nlen + 1);
-			if (stat(buf, &st) == 0) {
+			if (pp_stat_id(buf, &id)) {
 				ppk_feed_str(k, buf);
-				ppk_feed(k, &st.st_size, sizeof st.st_size);
-				ppk_feed(k, &st.st_mtime, sizeof st.st_mtime);
+				ppk_feed(k, &id, sizeof id);
 				return;
 			}
+#ifdef _WIN32
+			/* PATH entries on Windows omit the extension. */
+			memcpy(buf + dlen + 1 + nlen, ".exe", 5);
+			if (pp_stat_id(buf, &id)) {
+				ppk_feed_str(k, buf);
+				ppk_feed(k, &id, sizeof id);
+				return;
+			}
+#endif
 		}
 		if (!sep) break;
 		p = sep + 1;
 	}
 }
 
+/* snprintf truncation is never benign here: a clipped path can name a different
+ * entry than the key describes, which is exactly the collision the 128-bit key
+ * exists to prevent. Every path build goes through this and fails closed. */
+static bool pp_pathf(char *out, size_t cap, const char *fmt, ...) {
+	va_list ap;
+	int n = 0;
+	va_start(ap, fmt);
+	n = vsnprintf(out, cap, fmt, ap);
+	va_end(ap);
+	return n >= 0 && (size_t)n < cap;
+}
+
+/* Cache root, or NULL if it cannot be composed or created. Callers treat NULL
+ * as "cache unavailable" and fall back to running the preprocessor. */
 static const char *pp_cache_dir(void) {
 	static PRISM_THREAD_LOCAL char dir[PATH_MAX];
-	if (dir[0]) return dir;
-	const char *base = getenv("PRISM_PP_CACHE_DIR");
+	static PRISM_THREAD_LOCAL int state; /* 0 unknown, 1 ready, -1 unusable */
+	const char *base = NULL;
+	const char *xdg = NULL;
+	const char *home = NULL;
+	bool ok = false;
+	char *s = NULL;
+
+	if (state) return state > 0 ? dir : NULL;
+	state = -1;
+
+	base = getenv("PRISM_PP_CACHE_DIR");
 	if (base && *base) {
-		snprintf(dir, sizeof dir, "%s", base);
-		mkdir(dir, 0700);
-		return dir;
+		ok = pp_pathf(dir, sizeof dir, "%s", base);
+	} else {
+		xdg = getenv("XDG_CACHE_HOME");
+		home = getenv("HOME");
+#ifdef _WIN32
+		if (!home || !*home) home = getenv("LOCALAPPDATA");
+#endif
+		if (xdg && *xdg)
+			ok = pp_pathf(dir, sizeof dir, "%s/prism-pp", xdg);
+		else if (home && *home)
+			ok = pp_pathf(dir, sizeof dir, "%s/.cache/prism-pp", home);
+		else
+			ok = pp_pathf(dir, sizeof dir, "%sprism-pp", get_tmp_dir());
 	}
-	const char *xdg = getenv("XDG_CACHE_HOME");
-	const char *home = getenv("HOME");
-	if (xdg && *xdg)
-		snprintf(dir, sizeof dir, "%s/prism", xdg);
-	else if (home && *home)
-		snprintf(dir, sizeof dir, "%s/.cache/prism", home);
-	else
-		snprintf(dir, sizeof dir, "%sprism-ppcache", get_tmp_dir());
-	/* Parents may not exist; create each level and ignore EEXIST. */
-	for (char *s = dir + 1; *s; s++) {
-		if (*s != '/') continue;
+	/* Leave room for "/<32 hex>.pp.<pid>.tmp" appended by callers. */
+	if (!ok || strlen(dir) + 64 >= sizeof dir) {
+		dir[0] = '\0';
+		return NULL;
+	}
+	/* Parents may not exist; create each level, ignoring EEXIST. */
+	for (s = dir + 1; *s; s++) {
+		char save = *s;
+		if (!pp_is_dir_sep(*s)) continue;
 		*s = '\0';
 		mkdir(dir, 0700);
-		*s = '/';
+		*s = save;
 	}
 	mkdir(dir, 0700);
+	state = 1;
 	return dir;
 }
 
 /* A source expanding one of the build-time date macros does not produce output
  * that is a pure function of its inputs, so it must never be cached.
  *
- * The names are assembled from fragments rather than written whole. The scan
- * below is a plain substring match, so spelling them literally anywhere in this
- * file - including in a comment - would make prism.c match itself and exclude
- * prism from its own cache. Hence also the circumlocution in these comments. */
+ * The names are assembled from fragments rather than written whole. The scan is
+ * a plain substring match, so spelling them literally anywhere in this file -
+ * including in a comment - would make prism.c match itself and exclude prism
+ * from its own cache. Hence also the circumlocution in these comments. */
 static bool pp_text_has_time_macro(const char *buf, size_t len) {
 	static const char *const m[] = {"__DA"
 					"TE__",
@@ -5777,6 +5867,7 @@ static size_t pp_marker_path(const char *l, const char *end, char *out, size_t o
 }
 
 static bool pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file) {
+	char abs[PATH_MAX];
 	*k = (PPKey){0xcbf29ce484222325ULL, 0x9e3779b97f4a7c15ULL};
 	ppk_feed_str(k, PP_CACHE_MAGIC);
 	for (int i = 0; i < argc; i++) {
@@ -5788,42 +5879,68 @@ static bool pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file
 		ppk_feed_str(k, pp_cache_env_keys[i]);
 		ppk_feed_str(k, getenv(pp_cache_env_keys[i]));
 	}
-	char abs[PATH_MAX];
 	if (realpath(input_file, abs)) ppk_feed_str(k, abs);
 	return true;
 }
 
-static void pp_cache_path(const PPKey *k, char *out, size_t cap) {
-	snprintf(out, cap, "%s/%016llx%016llx.pp", pp_cache_dir(), (unsigned long long)k->a,
-		 (unsigned long long)k->b);
+static bool pp_cache_path(const PPKey *k, char *out, size_t cap) {
+	const char *dir = pp_cache_dir();
+	if (!dir) return false;
+	return pp_pathf(out, cap, "%s/%016llx%016llx.pp", dir, (unsigned long long)k->a,
+			(unsigned long long)k->b);
 }
 
-/* Return the cached payload if every recorded dependency is unchanged. */
+/* Portable atomic publish. POSIX rename replaces; Win32 needs the explicit flag. */
+static bool pp_replace_file(const char *tmp, const char *dst) {
+#ifdef _WIN32
+	return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+	return rename(tmp, dst) == 0;
+#endif
+}
+
+/* Return the cached payload if every recorded dependency is unchanged.
+ *
+ * All declarations precede the first `goto`: prism rejects a jump that skips an
+ * initialised declaration, and this file is compiled by prism when self-hosting. */
 static char *pp_cache_load(const PPKey *k) {
 	char path[PATH_MAX];
-	pp_cache_path(k, path, sizeof path);
-	FILE *f = fopen(path, "rb");
-	if (!f) return NULL;
+	char line[PATH_MAX + 128];
 	char *out = NULL;
-	char line[PATH_MAX + 64];
+	FILE *f = NULL;
+	long ndeps = 0;
+	long long plen = 0;
+	long i = 0;
+
+	if (!pp_cache_path(k, path, sizeof path)) return NULL;
+	f = fopen(path, "rb");
+	if (!f) return NULL;
 
 	if (!fgets(line, sizeof line, f) || strcmp(line, PP_CACHE_MAGIC) != 0) goto done;
-	long ndeps = 0;
-	if (!fgets(line, sizeof line, f) || sscanf(line, "deps %ld", &ndeps) != 1 || ndeps < 0) goto done;
-	for (long i = 0; i < ndeps; i++) {
-		long long sz = 0, mt = 0;
-		if (!fgets(line, sizeof line, f)) goto done;
+	if (!fgets(line, sizeof line, f) || sscanf(line, "deps %ld", &ndeps) != 1) goto done;
+	if (ndeps < 0 || ndeps > 65536) goto done;
+
+	for (i = 0; i < ndeps; i++) {
+		PPStat rec, now;
 		int off = 0;
-		if (sscanf(line, "%lld %lld %n", &sz, &mt, &off) < 2 || off <= 0) goto done;
-		char *p = line + off;
-		size_t pl = strlen(p);
+		char *p = NULL;
+		size_t pl = 0;
+		if (!fgets(line, sizeof line, f)) goto done;
+		if (sscanf(line, "%lld %lld %lld %lld %n", &rec.size, &rec.mtime_sec, &rec.mtime_nsec,
+			   &rec.ctime_sec, &off) < 4 ||
+		    off <= 0)
+			goto done;
+		p = line + off;
+		pl = strlen(p);
 		while (pl && (p[pl - 1] == '\n' || p[pl - 1] == '\r')) p[--pl] = '\0';
-		struct stat st;
-		if (!pl || stat(p, &st) != 0) goto done;
-		if ((long long)st.st_size != sz || (long long)st.st_mtime != mt) goto done;
+		if (!pl || !pp_stat_id(p, &now)) goto done;
+		if (now.size != rec.size || now.mtime_sec != rec.mtime_sec ||
+		    now.mtime_nsec != rec.mtime_nsec || now.ctime_sec != rec.ctime_sec)
+			goto done;
 	}
-	long long plen = 0;
-	if (!fgets(line, sizeof line, f) || sscanf(line, "payload %lld", &plen) != 1 || plen < 0) goto done;
+
+	if (!fgets(line, sizeof line, f) || sscanf(line, "payload %lld", &plen) != 1) goto done;
+	if (plen < 0) goto done;
 	out = malloc((size_t)plen + 8);
 	if (!out) goto done;
 	if (fread(out, 1, (size_t)plen, f) != (size_t)plen) {
@@ -5837,61 +5954,200 @@ done:
 	return out;
 }
 
-static void pp_cache_store(const PPKey *k, const char *input_file, const char *payload, size_t len) {
-	/* Collect the dependency set from the output's own linemarkers. Heap, not
-	 * thread-local: a fixed [MAX_DEPS][PATH_MAX] array is 16 MB of TLS and
-	 * overflows the small-model TLS relocations on aarch64. */
-	enum { MAX_DEPS = 4096 };
-	char **deps = calloc(MAX_DEPS, sizeof *deps);
-	if (!deps) return;
-	int ndeps = 0;
-	char abs[PATH_MAX];
-	deps[ndeps++] = strdup(realpath(input_file, abs) ? abs : input_file);
+/* ---- eviction ---------------------------------------------------------
+ *
+ * Bounded by total size and age. Scanning on every store would cost more than
+ * the cache saves, so a marker file rate-limits the sweep to once an hour. */
+#define PP_PRUNE_MARKER ".prune"
 
+typedef struct {
+	long long mtime, size;
+	char name[64];
+} PPEntry;
+
+static long long pp_env_ll(const char *name, long long dflt) {
+	const char *v = getenv(name);
+	long long r = 0;
+	if (!v || !*v) return dflt;
+	r = strtoll(v, NULL, 10);
+	return r > 0 ? r : dflt;
+}
+
+static int pp_entry_cmp(const void *a, const void *b) {
+	long long x = ((const PPEntry *)a)->mtime, y = ((const PPEntry *)b)->mtime;
+	return (x > y) - (x < y);
+}
+
+/* Invoke `cb` for every `*.pp` entry in the cache directory. */
+static void pp_each_entry(void (*cb)(const char *dir, const char *name, void *ud), void *ud) {
+	const char *dir = pp_cache_dir();
+	if (!dir) return;
+#ifdef _WIN32
+	char glob[PATH_MAX];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+	snprintf(glob, sizeof glob, "%s\\*.pp", dir);
+	h = FindFirstFileA(glob, &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+	do {
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) cb(dir, fd.cFileName, ud);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+#else
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	if (!d) return;
+	while ((e = readdir(d)) != NULL) {
+		size_t n = strlen(e->d_name);
+		if (n > 3 && strcmp(e->d_name + n - 3, ".pp") == 0) cb(dir, e->d_name, ud);
+	}
+	closedir(d);
+#endif
+}
+
+typedef struct {
+	PPEntry *v;
+	int n, cap;
+	long long total;
+} PPScan;
+
+static void pp_collect_cb(const char *dir, const char *name, void *ud) {
+	PPScan *s = (PPScan *)ud;
+	char full[PATH_MAX];
+	PPStat id;
+	if (strlen(name) >= sizeof s->v[0].name) return;
+	if (!pp_pathf(full, sizeof full, "%s/%s", dir, name)) return;
+	if (!pp_stat_id(full, &id)) return;
+	if (s->n == s->cap) {
+		int nc = s->cap ? s->cap * 2 : 128;
+		PPEntry *nv = realloc(s->v, (size_t)nc * sizeof *nv);
+		if (!nv) return;
+		s->v = nv;
+		s->cap = nc;
+	}
+	s->v[s->n].mtime = id.mtime_sec;
+	s->v[s->n].size = id.size;
+	snprintf(s->v[s->n].name, sizeof s->v[s->n].name, "%s", name);
+	s->n++;
+	s->total += id.size;
+}
+
+static void pp_cache_prune(void) {
+	const char *dir = pp_cache_dir();
+	char marker[PATH_MAX], full[PATH_MAX];
+	long long max_bytes = pp_env_ll("PRISM_PP_CACHE_MAX_MB", 1024) * 1024 * 1024;
+	long long max_age = pp_env_ll("PRISM_PP_CACHE_MAX_DAYS", 14) * 24 * 3600;
+	long long now = (long long)time(NULL);
+	PPStat mst;
+	PPScan s;
+	FILE *mf = NULL;
+	int i = 0;
+
+	if (!dir) return;
+	if (!pp_pathf(marker, sizeof marker, "%s/%s", dir, PP_PRUNE_MARKER)) return;
+	if (pp_stat_id(marker, &mst) && now - mst.mtime_sec < 3600) return;
+	mf = fopen(marker, "wb");
+	if (mf) fclose(mf);
+
+	memset(&s, 0, sizeof s);
+	pp_each_entry(pp_collect_cb, &s);
+	if (!s.v) return;
+
+	for (i = 0; i < s.n; i++) {
+		if (now - s.v[i].mtime <= max_age) continue;
+		if (!pp_pathf(full, sizeof full, "%s/%s", dir, s.v[i].name)) continue;
+		if (remove(full) == 0) {
+			s.total -= s.v[i].size;
+			s.v[i].size = -1; /* already gone */
+		}
+	}
+	if (s.total > max_bytes) {
+		/* Oldest first, down to 80% of the cap so this does not run every hour. */
+		qsort(s.v, (size_t)s.n, sizeof *s.v, pp_entry_cmp);
+		for (i = 0; i < s.n && s.total > max_bytes * 4 / 5; i++) {
+			if (s.v[i].size < 0) continue;
+			if (!pp_pathf(full, sizeof full, "%s/%s", dir, s.v[i].name)) continue;
+			if (remove(full) == 0) s.total -= s.v[i].size;
+		}
+	}
+	free(s.v);
+}
+
+static void pp_cache_store(const PPKey *k, const char *input_file, const char *payload, size_t len) {
+	enum { MAX_DEPS = 4096 };
+	char path[PATH_MAX], tmp[PATH_MAX], abs[PATH_MAX];
+	char **deps = NULL;
+	int ndeps = 0, i = 0;
+	long long now = (long long)time(NULL);
 	const char *end = payload + len;
-	for (const char *l = payload; l < end;) {
-		char buf[PATH_MAX];
+	const char *l = NULL;
+	FILE *f = NULL;
+	bool ok = true;
+
+	deps = calloc(MAX_DEPS, sizeof *deps);
+	if (!deps) return;
+	if (!realpath(input_file, abs)) goto out;
+	deps[ndeps++] = strdup(abs);
+
+	/* The dependency set is recovered from the output's own linemarkers, so no
+	 * -MD sidecar has to be produced or kept in sync. */
+	for (l = payload; l < end;) {
+		char buf[PATH_MAX], can[PATH_MAX];
+		const char *nl = NULL;
 		size_t n = pp_marker_path(l, end, buf, sizeof buf);
 		if (n) {
 			int seen = 0;
-			for (int i = 0; i < ndeps; i++)
-				if (strcmp(deps[i], buf) == 0) {
+			/* Linemarkers carry the path as cc saw it, which is often relative
+			 * to the invoking directory. Validating a relative path would stat
+			 * whatever sits at that name in a future run's cwd - a different
+			 * file with the same name would then validate as unchanged. Canonical
+			 * paths only; if a dep cannot be resolved, do not cache at all. */
+			if (!realpath(buf, can)) goto out;
+			for (i = 0; i < ndeps; i++)
+				if (strcmp(deps[i], can) == 0) {
 					seen = 1;
 					break;
 				}
 			if (!seen) {
-				if (ndeps >= MAX_DEPS) goto out; /* too many; skip caching */
-				deps[ndeps++] = strdup(buf);
+				if (ndeps >= MAX_DEPS) goto out;
+				deps[ndeps++] = strdup(can);
 			}
 		}
-		const char *nl = memchr(l, '\n', (size_t)(end - l));
+		nl = memchr(l, '\n', (size_t)(end - l));
 		if (!nl) break;
 		l = nl + 1;
 	}
-	for (int i = 0; i < ndeps; i++)
+	for (i = 0; i < ndeps; i++)
 		if (!deps[i]) goto out;
 
-	char path[PATH_MAX], tmp[PATH_MAX];
-	pp_cache_path(k, path, sizeof path);
-	snprintf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid());
-	FILE *f = fopen(tmp, "wb");
-	if (!f) return;
-	bool ok = fputs(PP_CACHE_MAGIC, f) >= 0 && fprintf(f, "deps %d\n", ndeps) > 0;
-	for (int i = 0; ok && i < ndeps; i++) {
-		struct stat st;
-		if (stat(deps[i], &st) != 0) {
+	if (!pp_cache_path(k, path, sizeof path)) goto out;
+	if (!pp_pathf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid())) goto out;
+	f = fopen(tmp, "wb");
+	if (!f) goto out;
+	ok = fputs(PP_CACHE_MAGIC, f) >= 0 && fprintf(f, "deps %d\n", ndeps) > 0;
+	for (i = 0; ok && i < ndeps; i++) {
+		PPStat id;
+		if (!pp_stat_id(deps[i], &id)) {
 			ok = false;
 			break;
 		}
-		ok = fprintf(f, "%lld %lld %s\n", (long long)st.st_size, (long long)st.st_mtime, deps[i]) > 0;
+		/* Without sub-second resolution, a file written in the second we are
+		 * recording could change again and still compare equal. Skip the entry;
+		 * the next build a second later records it safely. */
+		if (id.mtime_nsec == 0 && now - id.mtime_sec < 2) {
+			ok = false;
+			break;
+		}
+		ok = fprintf(f, "%lld %lld %lld %lld %s\n", id.size, id.mtime_sec, id.mtime_nsec,
+			     id.ctime_sec, deps[i]) > 0;
 	}
 	if (ok) ok = fprintf(f, "payload %llu\n", (unsigned long long)len) > 0;
 	if (ok) ok = fwrite(payload, 1, len, f) == len;
 	if (fclose(f) != 0) ok = false;
-	/* Atomic publish: a concurrent prism either sees the old entry or this one. */
-	if (!ok || rename(tmp, path) != 0) remove(tmp);
+	if (!ok || !pp_replace_file(tmp, path)) remove(tmp);
+	if (ok) pp_cache_prune();
 out:
-	for (int i = 0; i < ndeps; i++) free(deps[i]);
+	for (i = 0; i < ndeps; i++) free(deps[i]);
 	free(deps);
 }
 
@@ -5900,30 +6156,71 @@ static bool pp_cache_enabled(void) {
 	return !(v && *v && strcmp(v, "0") != 0);
 }
 
-/* Decided before the spawn, not at store time: a source that expands a time
- * macro can never be cached, so probing and storing are both wasted work.
- *
- * The scan is deliberately conservative - it matches the macro name anywhere,
- * including in comments and string literals. Distinguishing a real expansion
- * would need a lexer, and the penalty for a false positive is one cache miss
- * while the penalty for a false negative is a silently stale build. (prism.c
- * itself trips this, because the detector names the macros it looks for.) */
+/* Decided before the spawn, not at store time: a source that expands a date
+ * macro can never be cached, so probing and storing are both wasted work. The
+ * scan is deliberately conservative - it matches the name anywhere, including
+ * in comments and string literals. A false positive costs one cache miss; a
+ * false negative would be a silently stale build. */
 static bool pp_source_is_cacheable(const char *input_file) {
 	struct stat st;
+	FILE *f = NULL;
+	char *b = NULL;
+	size_t got = 0;
+	bool ok = false;
+
 	if (stat(input_file, &st) != 0) return false;
 	if (st.st_size <= 0 || st.st_size > (off_t)(64 << 20)) return false;
-	FILE *f = fopen(input_file, "rb");
+	f = fopen(input_file, "rb");
 	if (!f) return false;
-	char *b = malloc((size_t)st.st_size);
+	b = malloc((size_t)st.st_size);
 	if (!b) {
 		fclose(f);
 		return false;
 	}
-	size_t got = fread(b, 1, (size_t)st.st_size, f);
+	got = fread(b, 1, (size_t)st.st_size, f);
 	fclose(f);
-	bool ok = !pp_text_has_time_macro(b, got);
+	ok = !pp_text_has_time_macro(b, got);
 	free(b);
 	return ok;
+}
+
+/* `--prism-cache-clear` / `--prism-cache-info` support. */
+static void pp_clear_cb(const char *dir, const char *name, void *ud) {
+	char full[PATH_MAX];
+	long *n = (long *)ud;
+	if (!pp_pathf(full, sizeof full, "%s/%s", dir, name)) return;
+	if (remove(full) == 0) (*n)++;
+}
+
+static void pp_info_cb(const char *dir, const char *name, void *ud) {
+	char full[PATH_MAX];
+	PPScan *s = (PPScan *)ud;
+	PPStat id;
+	(void)name;
+	if (!pp_pathf(full, sizeof full, "%s/%s", dir, name)) return;
+	if (!pp_stat_id(full, &id)) return;
+	s->n++;
+	s->total += id.size;
+}
+
+static int pp_cache_clear(void) {
+	long n = 0;
+	pp_each_entry(pp_clear_cb, &n);
+	printf("prism: cleared %ld cached preprocessor %s from %s\n", n, n == 1 ? "entry" : "entries",
+	       pp_cache_dir());
+	return 0;
+}
+
+static int pp_cache_info(void) {
+	PPScan s;
+	memset(&s, 0, sizeof s);
+	pp_each_entry(pp_info_cb, &s);
+	printf("prism preprocessor cache\n  dir      %s\n  entries  %d\n  size     %.1f MB\n"
+	       "  limits   %lld MB / %lld days  (PRISM_PP_CACHE_MAX_MB, PRISM_PP_CACHE_MAX_DAYS)\n"
+	       "  status   %s\n",
+	       pp_cache_dir(), s.n, s.total / (1024.0 * 1024.0), pp_env_ll("PRISM_PP_CACHE_MAX_MB", 1024),
+	       pp_env_ll("PRISM_PP_CACHE_MAX_DAYS", 14), pp_cache_enabled() ? "enabled" : "disabled (PRISM_NO_PP_CACHE)");
+	return 0;
 }
 
 static char *preprocess_with_cc(const char *input_file) {
@@ -7926,6 +8223,10 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.profile = true;
 				continue;
 			}
+			/* Cache maintenance runs immediately and exits: there is no
+			 * translation unit involved and nothing later in argv matters. */
+			if (!strcmp(a, "--prism-cache-clear")) exit(pp_cache_clear());
+			if (!strcmp(a, "--prism-cache-info")) exit(pp_cache_info());
 			if (!strcmp(a, "--prism-verify")) {
 				cli.verify = true;
 				continue;
@@ -8579,6 +8880,8 @@ static PRISM_COLD void print_help(void) {
 	       "  --prism-prof           Print per-phase timing breakdown\n"
 	       "  --prism-verify         Translation validation: re-transpile emitted C,\n"
 	       "                         require a fixed point (also: PRISM_VERIFY env)\n"
+	       "  --prism-cache-info     Show the preprocessor cache location and size\n"
+	       "  --prism-cache-clear    Delete all cached preprocessor output\n"
 	       "  --                     Separator: remaining args are passed to the "
 	       "binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
