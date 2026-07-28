@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.5"
+#define PRISM_VERSION "1.1.6"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -8185,52 +8185,64 @@ static Cli cli_parse(int argc, char **argv) {
 			 * (backend would emit `-.o:` as the dep target). */
 			cli.passthrough = true;
 		} else if (a[1] == 'f') {
-			if (!strcmp(a, "-fno-defer")) {
-				cli.features.defer = false;
+			/* Both polarities of every feature flag are accepted. GCC's
+			 * convention is that -fno-X implies -fX exists, and a build that
+			 * inherits -fno-zeroinit from a parent needs some way to turn it
+			 * back on for one target. Through 1.1.5 only -fbounds-check and
+			 * -fflatten-headers had a positive form; -fzeroinit, -fdefer,
+			 * -forelse, -fauto-static and the rest fell through to the C
+			 * compiler, which rejected them with "unrecognized command-line
+			 * option" naming a flag the user reasonably believed was Prism's.
+			 *
+			 * Matching is exact after the optional "no-", so unrelated
+			 * compiler flags (-fno-strict-aliasing, -fdefer-pop) still fall
+			 * through to CC untouched. Note the two inversions: `safety`
+			 * drives warn_safety, and `link-pragma` drives no_link_pragma, so
+			 * both store the complement. */
+			const char *fb = a + 2;
+			bool on = true;
+			if (!strncmp(fb, "no-", 3)) {
+				on = false;
+				fb += 3;
+			}
+			if (!strcmp(fb, "defer")) {
+				cli.features.defer = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-zeroinit")) {
-				cli.features.zeroinit = false;
+			if (!strcmp(fb, "zeroinit")) {
+				cli.features.zeroinit = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-orelse")) {
-				cli.features.orelse = false;
+			if (!strcmp(fb, "orelse")) {
+				cli.features.orelse = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-line-directives")) {
-				cli.features.line_directives = false;
+			if (!strcmp(fb, "line-directives")) {
+				cli.features.line_directives = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-safety")) {
-				cli.features.warn_safety = true;
+			if (!strcmp(fb, "safety")) {
+				cli.features.warn_safety = !on;
 				continue;
 			}
-			if (!strcmp(a, "-fflatten-headers")) {
-				cli.features.flatten_headers = true;
+			if (!strcmp(fb, "flatten-headers")) {
+				cli.features.flatten_headers = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-flatten-headers")) {
-				cli.features.flatten_headers = false;
+			if (!strcmp(fb, "auto-unreachable")) {
+				cli.features.auto_unreachable = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-auto-unreachable")) {
-				cli.features.auto_unreachable = false;
+			if (!strcmp(fb, "auto-static")) {
+				cli.features.auto_static = on;
 				continue;
 			}
-			if (!strcmp(a, "-fno-auto-static")) {
-				cli.features.auto_static = false;
+			if (!strcmp(fb, "bounds-check")) {
+				cli.features.bounds_check = on;
 				continue;
 			}
-			if (!strcmp(a, "-fbounds-check")) {
-				cli.features.bounds_check = true;
-				continue;
-			}
-			if (!strcmp(a, "-fno-bounds-check")) {
-				cli.features.bounds_check = false;
-				continue;
-			}
-			if (!strcmp(a, "-fno-link-pragma")) {
-				cli.no_link_pragma = true;
+			if (!strcmp(fb, "link-pragma")) {
+				cli.no_link_pragma = !on;
 				continue;
 			}
 		} else {
@@ -8446,16 +8458,39 @@ static const char *get_install_path(void) {
 	return INSTALL_PATH;
 }
 
+/* Create the directory holding `p`, including any missing parents.
+ *
+ * This used to be a single mkdir, which cannot create `$PREFIX/bin` unless
+ * $PREFIX already exists. The failure was not reported as "could not create
+ * the directory" either: the caller treats a false return as a permissions
+ * problem and retries the whole install under sudo, so
+ * `PREFIX=$HOME/.local prism install` prompted for a root password and then
+ * failed, on a path the user could write to perfectly well. */
 static bool ensure_install_dir(const char *p) {
 	char dir[PATH_MAX];
 	strncpy(dir, p, PATH_MAX - 1);
 	dir[PATH_MAX - 1] = '\0';
 	char *sep = strrchr(dir, '/');
-	if (sep) *sep = '\0';
+	if (!sep) return true; /* bare filename: install into the cwd */
+	*sep = '\0';
+	if (!dir[0]) return true; /* p was "/name": root always exists */
+
 	struct stat st;
-	if (stat(dir, &st) == 0) return true;
-	mkdir(dir, 0755);
-	return stat(dir, &st) == 0;
+	if (stat(dir, &st) == 0) return S_ISDIR(st.st_mode);
+
+	/* Walk the chain, creating each missing component. Start at 1 so a
+	 * leading '/' is never treated as an empty component to create. */
+	for (char *q = dir + 1; *q; q++) {
+		if (*q != '/') continue;
+		*q = '\0';
+		if (stat(dir, &st) != 0 && mkdir(dir, 0755) != 0 && errno != EEXIST) {
+			*q = '/';
+			return false;
+		}
+		*q = '/';
+	}
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST) return false;
+	return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void add_to_user_path(const char *dir) {
@@ -8528,6 +8563,33 @@ static void check_path_shadow(const char *install_path) {
 	}
 }
 
+/* Do two paths name the same file?
+ *
+ * The install self-check used to be strcmp, which only matches when the user
+ * spells the destination exactly as argv[0]. Running the already-installed
+ * copy through a symlink, a relative path, or any equivalent spelling slipped
+ * past it and fell through to copying the file onto itself. On Linux that is
+ * ETXTBSY, because the file is currently executing, so `prism install` from an
+ * installed prism reported "Failed to install" and then escalated to sudo,
+ * which also failed. Comparing device and inode answers the question the code
+ * was actually asking; realpath alone would still miss hard links. */
+static bool paths_are_same_file(const char *a, const char *b) {
+#ifdef _WIN32
+	char ra[PATH_MAX], rb[PATH_MAX];
+	if (!_fullpath(ra, a, sizeof(ra)) || !_fullpath(rb, b, sizeof(rb)))
+		return strcmp(a, b) == 0;
+	for (char *p = ra; *p; p++)
+		if (*p == '/') *p = '\\';
+	for (char *p = rb; *p; p++)
+		if (*p == '/') *p = '\\';
+	return _stricmp(ra, rb) == 0;
+#else
+	struct stat sa, sb;
+	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return strcmp(a, b) == 0;
+	return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+#endif
+}
+
 static int install(char *self_path) {
 	const char *install_path = get_install_path();
 	printf("[prism] Installing to %s...\n", install_path);
@@ -8543,7 +8605,7 @@ static int install(char *self_path) {
 	if (!ensure_install_dir(install_path)) goto use_sudo;
 	if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
 		self_path = resolved_path;
-	if (strcmp(self_path, install_path) == 0) {
+	if (paths_are_same_file(self_path, install_path)) {
 		printf("[prism] Already installed at %s\n", install_path);
 		return 0;
 	}
@@ -8803,8 +8865,9 @@ static PRISM_COLD void print_help(void) {
 	       "  -fno-auto-static       Disable auto-static for const arrays with "
 	       "literal inits\n"
 	       "  -fno-bounds-check      Disable runtime bounds checks on "
-	       "local/param array subscripts\n"
+	       "local, static and file-scope array subscripts\n"
 	       "  -fno-link-pragma       Ignore #pragma link directives in source\n"
+	       "  (each -fno-X above also accepts -fX to re-enable it)\n"
 	       "  --prism-cc=<compiler>  Use specific compiler\n"
 	       "  --prism-verbose        Show commands\n"
 	       "  --prism-prof           Print per-phase timing breakdown\n"
@@ -8812,6 +8875,7 @@ static PRISM_COLD void print_help(void) {
 	       "                         require a fixed point (also: PRISM_VERIFY env)\n"
 	       "  --prism-cache-info     Show the preprocessor cache location and size\n"
 	       "  --prism-cache-clear    Delete all cached preprocessor output\n"
+	       "  --prism-emit[=<file>]  Write transpiled C to stdout, or to <file>\n"
 	       "  --                     Separator: remaining args are passed to the "
 	       "binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
@@ -8829,7 +8893,7 @@ static PRISM_COLD void print_help(void) {
 	       "linux_arm64\n"
 	       "              linux_x86_64 | linux_riscv64 | windows | "
 	       "windows_x86_64 | windows_arm64\n"
-	       "    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, "
+	       "    name:     plain name (e.g. `Cocoa`, `m`): macOS => -framework, "
 	       "else -l<name>\n"
 	       "              or a literal flag starting with `-` (e.g. `-lm`, "
 	       "`-framework Foo`)\n\n"

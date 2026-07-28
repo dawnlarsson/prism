@@ -233,7 +233,7 @@ static const char PPARSE_ERR_DEFER_EXPR_CTX[] =
     "expressions, function arguments, sizeof/_Static_assert operands, etc.); move it to "
     "statement position";
 static const char PPARSE_ERR_BARE_ORELSE_SPANS_PP[] = "bare orelse assignment cannot be used when the "
-					       "expression spans preprocessor conditionals — the "
+					       "expression spans preprocessor conditionals: the "
 					       "transpiler would emit tokens from all branches, "
 					       "producing invalid C; use a temporary variable or "
 					       "move the #ifdef outside the expression";
@@ -356,7 +356,7 @@ static const char PPARSE_ERR_ORELSE_DEFN_DIM[] =
     "'orelse' in array dimensions of a function "
     "definition parameter is not allowed (the "
     "ternary expansion would evaluate the "
-    "dimension twice — undefined behavior for "
+    "dimension twice: undefined behavior for "
     "volatile expressions)";
 
 #if defined(_MSC_VER)
@@ -8339,7 +8339,7 @@ static void reject_orelse_side_effects(PParseToken *start, PParseToken *end,
 			pparse_error_tok(s,
 				  "%s with comma operator at top level (the "
 				  "left-hand sub-expression before ',' is evaluated "
-				  "twice — double evaluation of volatile reads or "
+				  "twice: double evaluation of volatile reads or "
 				  "other side effects) %s",
 				  ctx_msg,
 				  advice);
@@ -10223,7 +10223,7 @@ p1d_classify_bracket_orelse_ex(PParseToken *tok, uint16_t cur_sid, int p1d_cur_f
 		if (ppc)
 			pparse_error_tok(ppc,
 				  "'orelse' inside array dimension cannot be used when the "
-				  "dimension spans preprocessor conditionals — the "
+				  "dimension spans preprocessor conditionals: the "
 				  "transpiler would emit tokens from all branches, "
 				  "producing invalid C; "
 				  "use 'cc -E' preprocessing or a temporary variable");
@@ -11164,7 +11164,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 							pparse_error_tok(decl.var_name,
 								  "nested function definitions cannot use "
 								  "defer/orelse (and are unsupported inside "
-								  "functions using defer) — move the function "
+								  "functions using defer): move the function "
 								  "outside or use a function pointer");
 					}
 				}
@@ -12611,7 +12611,7 @@ static void p1_verify_cfg(void) {
 		if (unverifiable_jump) {
 			const char *jump_kind = fm->has_computed_goto ? "computed goto" : "asm goto";
 			static const char fmt[] = "%s cannot be used in a function that "
-						  "contains %s — the jump target cannot be "
+						  "contains %s: the jump target cannot be "
 						  "verified at compile time";
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {

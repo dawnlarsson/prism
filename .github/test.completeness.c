@@ -6395,6 +6395,74 @@ static int cm_cc_accepts(const char *code) {
 	return rc == 0 ? 1 : 0;
 }
 
+/* ── trap-aware execution ─────────────────────────────────────────────
+ *
+ * `cm_exec` reports a child's exit status through `run_command_status`, which
+ * ends at `prism_spawn_wait`, which collapses every !WIFEXITED outcome to -1.
+ * A program killed by a signal and a harness that failed to spawn anything are
+ * therefore the same value. That is fine for tiers whose programs are meant to
+ * exit cleanly, and useless for bounds checking, where trapping IS the
+ * behaviour under test. It is why the bounds tiers had 15 executed cells
+ * against 1,851 static ones.
+ *
+ * `cm_exec_trap` spawns the binary directly, with no intervening shell, and
+ * keeps the raw wait status. No shell also means no 128+N remapping, so a
+ * program that genuinely exits 133 stays distinguishable from one killed by
+ * signal 5.
+ *
+ * Which signal a trap raises is a per-target detail, not a prism guarantee:
+ * `__builtin_trap` lowers to `brk #1000` on aarch64 (SIGTRAP) and `ud2` on
+ * x86-64 (SIGILL), and a target without a trap instruction may route through
+ * abort (SIGABRT). The oracle therefore asks only whether the child died by
+ * signal, and the tiers pair every trap cell with an in-bounds cell that must
+ * exit 0 - which is what keeps "died by signal" from being satisfiable by an
+ * unrelated crash. */
+#define CM_X_TRAPPED (-3000) /* died by any signal */
+#define CM_X_INFRA (-1000)   /* transpile failed */
+#define CM_X_CCFAIL (-1001)  /* emitted C did not compile */
+#define CM_X_TEMP (-1002)    /* could not create temp file */
+
+static int cm_exec_trap(const char *src, PrismFeatures feat) {
+	PrismResult r = cm_txf(src, feat);
+	if (!cm_ok(&r) || !r.output) {
+		prism_free(&r);
+		return CM_X_INFRA;
+	}
+	char *path = create_temp_file(r.output);
+	prism_free(&r);
+	if (!path) return CM_X_TEMP;
+
+	char bin[PATH_MAX];
+	int fd = test_mkstemp(bin, "cm_trap_");
+	if (fd < 0) {
+		unlink(path);
+		free(path);
+		return CM_X_TEMP;
+	}
+	close(fd);
+	unlink(bin);
+
+	char cmd[PATH_MAX * 2 + 80];
+	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -w -o %s %s >/dev/null 2>&1", bin, path);
+	if (run_command_status(cmd) != 0) {
+		unlink(path);
+		free(path);
+		return CM_X_CCFAIL;
+	}
+
+	char *argv[] = {bin, NULL};
+	int status = 0;
+	int rc = prism_spawn_wait_raw(argv, "/dev/null", "/dev/null", &status);
+	unlink(bin);
+	unlink(path);
+	free(path);
+
+	if (rc != 0) return CM_X_TEMP;
+	if (WIFSIGNALED(status)) return CM_X_TRAPPED;
+	if (WIFEXITED(status)) return WEXITSTATUS(status);
+	return CM_X_TEMP;
+}
+
 /* Transpile → cc → run. Exit codes: child status, or -1000/-1001/-1002 on fail. */
 static int cm_exec(const char *src, PrismFeatures feat) {
 	PrismResult r = cm_txf(src, feat);
@@ -7242,6 +7310,100 @@ static void cm_gen_passthrough(void) {
 	    {"static const char *gs = \"xyz\";", "r = (int)gs[2];"},
 	    {"struct G { int a; int b[2]; }; static struct G gg = {1,{2,3}};", "r = gg.b[1] * 9;"},
 	    {"static const int gk[3] = {5,10,15};", "r = gk[1] + gk[0];"},
+	    /* preprocessor: every one of these is expanded by cc -E before Prism
+	       sees a token, so a divergence means Prism disturbed the
+	       preprocessed stream rather than mis-expanding anything */
+	    {"#define K 23", "r = K;"},
+	    {"#define ADD(a,b) ((a)+(b))", "r = ADD(20, 4);"},
+	    {"#define SQ(x) ((x)*(x))", "int n = 5; r = SQ(n) - 100;"},
+	    {"#define STR(x) #x", "const char *t = STR(abc); r = (int)t[1];"},
+	    {"#define CAT(a,b) a##b", "int xy = 41; r = CAT(x,y);"},
+	    {"#define VA(...) sum(0, __VA_ARGS__, -1)\nstatic int sum(int f, ...){(void)f;return 42;}",
+	     "r = VA(1,2,3);"},
+	    {"#define ON 1\n#if ON\n#define PICK 15\n#else\n#define PICK 99\n#endif", "r = PICK;"},
+	    {"#define A0 7\n#define A1 A0\n#define A2 A1", "r = A2 * 3;"},
+	    {"#define TMP 5\n#undef TMP\n#define TMP 9", "r = TMP;"},
+	    {"#define EMPTY", "EMPTY r = 26; EMPTY"},
+
+	    /* integer conversion and promotion: the corners where a stray cast or
+	       a lost qualifier changes the answer without changing the shape */
+	    {"", "signed char c = -3; r = (int)(c + 40);"},
+	    {"", "unsigned char uc = 250; r = (int)(uc / 4);"},
+	    {"", "short sh = -1; unsigned short ush = (unsigned short)sh; r = (int)(ush >> 9);"},
+	    {"", "unsigned u = 3; int i = -1; r = ((long long)i < (long long)u) ? 12 : 34;"},
+	    {"", "int i = -8; r = (int)((unsigned)i >> 28);"},
+	    {"", "long long v = -5; r = (int)((v % 3) + 20);"},
+	    {"", "unsigned u = 0u; u--; r = (int)(u & 0x1f);"},
+	    {"", "int a = 1; r = (int)(sizeof(a + 1L) == sizeof(long) ? 19 : 3);"},
+	    {"", "unsigned x = 0xFFu; r = (int)(x ^ 0xF0u);"},
+	    {"", "int n = 1; r = (n << 5) | (n << 1);"},
+
+	    /* floating point: same compiler and flags on both sides, so any
+	       difference is Prism reshaping the expression */
+	    {"", "float f = 1.5f; double d = 2.25; r = (int)(f * d * 8);"},
+	    {"", "double d = 10.0/4.0; r = (int)(d * 10);"},
+	    {"", "double d = -3.7; r = (int)(-d) + 20;"},
+	    {"", "long double ld = 2.5L; r = (int)(ld * 10);"},
+
+	    /* functions: by-value aggregates, varargs, pointers to functions,
+	       and a static local that must persist across calls */
+	    {"struct P { int a, b; };\nstatic int usep(struct P p){ return p.a * p.b; }",
+	     "struct P p = {6,7}; r = usep(p);"},
+	    {"struct P { int a, b; };\nstatic struct P mk(int v){ struct P p; p.a = v; p.b = v+1; return p; }",
+	     "struct P p = mk(5); r = p.a + p.b;"},
+	    {"#include <stdarg.h>\nstatic int vsum(int n, ...){ va_list ap; va_start(ap, n); int t=0;"
+	     " for(int i=0;i<n;i++) t += va_arg(ap,int); va_end(ap); return t; }",
+	     "r = vsum(4, 1, 2, 3, 4);"},
+	    {"static int bump(void){ static int c = 10; c += 5; return c; }",
+	     "bump(); bump(); r = bump();"},
+	    {"static int f1(int x){return x+1;}\nstatic int f2(int x){return x*2;}",
+	     "int (*tab[2])(int) = {f1, f2}; r = tab[0](9) + tab[1](6);"},
+	    {"static int deep(int n){ return n ? deep(n-1) + 2 : 1; }", "r = deep(8);"},
+	    {"static int apply(int (*g)(int), int v){ return g(v); }\nstatic int trip(int x){return x*3;}",
+	     "r = apply(trip, 9);"},
+
+	    /* aggregates Prism has to walk without rewriting */
+	    {"struct FAM { int n; int d[]; };", "struct FAM *q = (struct FAM*)(int[4]){3,7,8,9};"
+	     " r = q->d[0] + q->d[2];"},
+	    {"", "struct S { int x; } s = (struct S){44}; r = s.x;"},
+	    {"", "int *p = (int[3]){1,2,3}; r = p[0] + p[2] * 10;"},
+	    {"struct N { struct { int a; struct { int b; } in; } o; };",
+	     "struct N n = {{1,{2}}}; r = n.o.a + n.o.in.b * 25;"},
+	    {"", "struct A { int v[2]; }; struct A a[2] = {{{1,2}},{{3,4}}}; r = a[1].v[0] + a[0].v[1];"},
+	    {"union U { double d; long long l; };", "union U u; u.l = 0; u.d = 1.0; r = (u.l != 0) ? 37 : 1;"},
+	    {"", "struct Q { char c; int i; double d; }; r = (int)(sizeof(struct Q) >= 16 ? 29 : 2);"},
+
+	    /* qualifiers, alignment, and the sizeof/offsetof family */
+	    {"#include <stddef.h>\nstruct O { char a; int b; };",
+	     "r = (int)offsetof(struct O, b) + 20;"},
+	    {"", "r = (int)_Alignof(double) + 18;"},
+	    {"", "_Alignas(16) int a[4] = {1,2,3,4}; r = a[3] * 6;"},
+	    {"static int rd(const int *restrict p){ return *p; }", "int x = 47; r = rd(&x);"},
+	    {"static inline int inl(int x){ return x + 4; }", "r = inl(21);"},
+	    {"", "volatile int v = 0; for (int i=0;i<5;i++) v += 3; r = v;"},
+
+	    /* _Generic and statement expressions: both are erased or rewritten by
+	       Prism's own machinery elsewhere, so passthrough must leave them be */
+	    {"", "int i = 0; r = _Generic(i, int: 24, double: 1, default: 2);"},
+	    {"", "double d = 0; r = _Generic(d, int: 1, double: 28, default: 2);"},
+	    {"", "int a = 3; r = _Generic(&a, int*: 31, int: 1, default: 2);"},
+	    {"", "r = ({ int t = 6; t * 7; });"},
+	    {"", "int n = 2; r = ({ int acc = 0; for (int i=0;i<n;i++) acc += 10; acc + 5; });"},
+
+	    /* control flow shapes that move the instruction pointer sideways */
+	    {"", "int n = 0; int i = 0; sw: switch (i) { case 0: n += 1; case 1: n += 2; case 2: n += 4; }"
+	     " if (++i < 3) goto sw; r = n;"},
+	    {"", "int n = 0; for (int i=0;i<8;i++) { if (i&1) continue; if (i>5) break; n += i; } r = n + 20;"},
+	    {"", "int i = 0, n = 0; while (1) { n++; if (n > 6) break; if (i++ > 100) break; } r = n * 3;"},
+	    {"", "int n = 0; { { { n = 13; } } } r = n * 2;"},
+	    {"", "int c = 0; for (int i=0;i<3;i++){ for (int j=0;j<3;j++){ if (j==2) goto out; c++; } } out: r = c + 30;"},
+
+	    /* string and memory library calls: Prism must not disturb the
+	       declarations these pull in from system headers */
+	    {"#include <string.h>", "const char *t = \"prism\"; r = (int)strlen(t) * 8;"},
+	    {"#include <string.h>", "char b[8]; memset(b, 0, sizeof b); memcpy(b, \"ab\", 2); r = b[0] + b[1];"},
+	    {"#include <string.h>", "r = strcmp(\"abc\", \"abc\") == 0 ? 46 : 1;"},
+	    {"#include <stdio.h>", "char b[16]; int k = snprintf(b, sizeof b, \"%d\", 407); r = k * 15 + b[0] - '0';"},
 	};
 
 	CmStats st = {0};
@@ -8076,6 +8238,793 @@ static void cm_gen_ice_stmt_expr(void) {
 /* Formerly the env-gated `completeness_open` suite.  There is no staging area
  * any more: a tier is either in the default run or it does not exist.  Red here
  * means a product bug to fix, not a tier to gate off. */
+/* ── executed bounds-check boundary ───────────────────────────────────
+ *
+ * Every cell below was measured against the shipping binary before being
+ * written down, because a tier whose expectations came from reading the spec
+ * tests the spec, not the compiler. Three outcome classes, and the tier is a
+ * statement about where the feature's edge sits:
+ *
+ *   WRAP      in-bounds runs clean, one-past dies by signal.
+ *   REJECT    prism refuses at transpile time. `*(a+i)` and `i[a]` are
+ *             equivalent to subscripts under C 6.5.2.1 but bypass the
+ *             last-emitted matcher, so they fail closed with a diagnostic
+ *             rather than silently emitting an unchecked access (SPEC 987-988).
+ *   UNCHECKED both arms exit 0. Recording these is the point: a decayed
+ *             parameter has no size to check against, and if prism ever
+ *             learns to wrap ptr-to-array, this cell goes red and someone
+ *             reclassifies it on purpose instead of never noticing.
+ *
+ * Pairing each trap cell with an in-bounds cell is what keeps the oracle
+ * honest. "Died by signal" on its own would be satisfied by any crash. */
+#define CM_B_WRAP 0
+#define CM_B_REJECT 1
+#define CM_B_UNCHECKED 2
+
+static void cm_gen_runtime_bounds_trap(void) {
+	static const struct {
+		const char *name;
+		const char *prog; /* %d receives the index */
+		int n;		  /* length: in-bounds is n-1, one-past is n */
+		int cls;
+	} cells[] = {
+	    {"local-int", "int main(void){int a[4]={0};volatile int i=%d;return a[i];}", 4, CM_B_WRAP},
+	    {"local-char", "int main(void){char a[4]={0};volatile int i=%d;return a[i];}", 4, CM_B_WRAP},
+	    {"local-double",
+	     "int main(void){double a[4]={0};volatile int i=%d;return (int)a[i];}", 4, CM_B_WRAP},
+	    {"local-struct",
+	     "struct S{int x,y;};int main(void){struct S a[4]={{0,0}};volatile int i=%d;return "
+	     "a[i].x;}",
+	     4, CM_B_WRAP},
+	    {"local-ptr-elem",
+	     "int main(void){int*a[4]={0};volatile int i=%d;return a[i]!=0;}", 4, CM_B_WRAP},
+	    {"local-2d-inner",
+	     "int main(void){int a[2][4]={{0}};volatile int i=%d;return a[1][i];}", 4, CM_B_WRAP},
+	    {"local-2d-outer",
+	     "int main(void){int a[4][2]={{0}};volatile int i=%d;return a[i][1];}", 4, CM_B_WRAP},
+	    {"static-local",
+	     "int main(void){static int a[4];volatile int i=%d;return a[i];}", 4, CM_B_WRAP},
+	    {"file-scope", "int a[4];int main(void){volatile int i=%d;return a[i];}", 4, CM_B_WRAP},
+	    {"vla",
+	     "int main(void){volatile int n=4;int a[n];for(int k=0;k<n;k++)a[k]=0;volatile int "
+	     "i=%d;return a[i];}",
+	     4, CM_B_WRAP},
+	    {"len-1", "int main(void){int a[1]={0};volatile int i=%d;return a[i];}", 1, CM_B_WRAP},
+	    {"nested-block",
+	     "int main(void){volatile int i=%d;{int a[4]={0};return a[i];}}", 4, CM_B_WRAP},
+	    {"loop-body",
+	     "int main(void){int r=0;for(int q=0;q<1;q++){int a[4]={0};volatile int "
+	     "i=%d;r=a[i];}return r;}",
+	     4, CM_B_WRAP},
+
+	    {"ptr-arith-deref",
+	     "int main(void){int a[4]={0};volatile int i=%d;return *(a+i);}", 4, CM_B_REJECT},
+	    {"commutative-idx",
+	     "int main(void){int a[4]={0};volatile int i=%d;return i[a];}", 4, CM_B_REJECT},
+	    {"addr-first-elem",
+	     "int main(void){int a[4]={0};volatile int i=%d;return *(&a[0]+i);}", 4, CM_B_REJECT},
+
+	    {"decayed-param",
+	     "int g(int a[4],volatile int i){return a[i];}int main(void){int b[4]={0};volatile int "
+	     "i=%d;return g(b,i);}",
+	     4, CM_B_UNCHECKED},
+	    {"static-param",
+	     "int g(int a[static 4],volatile int i){return a[i];}int main(void){int "
+	     "b[4]={0};volatile int i=%d;return g(b,i);}",
+	     4, CM_B_UNCHECKED},
+	    {"ptr-to-array",
+	     "int main(void){int a[4]={0};int(*p)[4]=&a;volatile int i=%d;return (*p)[i];}", 4,
+	     CM_B_UNCHECKED},
+	};
+
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	char src[900];
+
+	for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); c++) {
+		for (int arm = 0; arm < 2; arm++) { /* 0 = in-bounds, 1 = one-past */
+			int idx = arm ? cells[c].n : cells[c].n - 1;
+			snprintf(src, sizeof(src), cells[c].prog, idx);
+			int rc = cm_exec_trap(src, f);
+			st.cells++;
+
+			if (cells[c].cls == CM_B_REJECT) {
+				if (rc != CM_X_INFRA)
+					cm_note(&st, "%s idx=%d: expected transpile reject, got %d",
+						cells[c].name, idx, rc);
+				continue;
+			}
+			if (rc == CM_X_CCFAIL || rc == CM_X_TEMP || rc == CM_X_INFRA) {
+				cm_note(&st, "%s idx=%d: infra %d", cells[c].name, idx, rc);
+				continue;
+			}
+			int want_trap = (arm == 1 && cells[c].cls == CM_B_WRAP);
+			if (want_trap && rc != CM_X_TRAPPED)
+				cm_note(&st, "%s: one-past idx=%d did not trap (rc %d)",
+					cells[c].name, idx, rc);
+			else if (!want_trap && rc == CM_X_TRAPPED)
+				cm_note(&st, "%s: idx=%d trapped but should not", cells[c].name, idx);
+		}
+	}
+	cm_report("gen/runtime-bounds-trap", &st);
+}
+
+/* ── executed zero-init ───────────────────────────────────────────────
+ *
+ * The emitted memset is easy to see in the output text and impossible to judge
+ * there: a substring oracle cannot tell a memset that covers the object from
+ * one that stops short of the trailing padding, misses a union's largest
+ * member, or skips a bitfield storage unit. Each cell dirties the stack, then
+ * declares the aggregate, then reads every byte back through an unsigned char
+ * pointer and returns the count that were not zero. Expected exit status is 0.
+ *
+ * `dirty()` writes 0xAA over a stack region larger than anything declared here
+ * and is marked noinline so the frame is actually reused. Without it the cells
+ * would pass on a stack that happened to already be zero, which is the usual
+ * way a zero-init test turns vacuous. */
+#define CM_ZI_PRE                                                                                    \
+	"__attribute__((noinline)) static void dirty(void){volatile unsigned char "                  \
+	"j[512];for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}\n"                                         \
+	"static int nz(const void*p,unsigned long n){const unsigned char*b=p;int "                   \
+	"k=0;for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}\n"
+
+static void cm_gen_runtime_zeroinit(void) {
+	static const struct {
+		const char *name;
+		const char *types; /* file-scope type declarations */
+		const char *decl;  /* the object under test, named v */
+	} cells[] = {
+	    {"struct-padding", "struct P{char a;int b;char c;};", "struct P v;"},
+	    {"struct-nested", "struct I{char a;long b;};struct N{char x;struct I i;char y;};",
+	     "struct N v;"},
+	    {"union-mixed", "union U{char s[7];int n;double d;};", "union U v;"},
+	    {"bitfield", "struct B{unsigned x:3;unsigned y:5;int tail;};", "struct B v;"},
+	    {"bitfield-straddle", "struct B2{unsigned a:1;unsigned b:31;unsigned c:2;};",
+	     "struct B2 v;"},
+	    {"array-of-struct", "struct S{char a;int b;};", "struct S v[3];"},
+	    {"array-2d", "", "int v[3][4];"},
+	    {"ptr-member", "struct PM{char a;void*p;char b;};", "struct PM v;"},
+	    {"long-double", "", "long double v;"},
+	    {"scalar-int", "", "int v;"},
+	    {"scalar-ptr", "", "char *v;"},
+	    {"char-array", "", "char v[13];"},
+	    {"struct-in-union", "struct SU{char a;int b;};union UU{struct SU s;char c;};",
+	     "union UU v;"},
+	    {"array-of-union", "union AU{int n;char c[9];};", "union AU v[2];"},
+	    {"anon-member", "struct AM{char a;struct{int x;char y;};long z;};", "struct AM v;"},
+	    {"enum-member", "enum E{E0,E1};struct EM{char a;enum E e;char b;};", "struct EM v;"},
+	};
+
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	char src[1200];
+
+	for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); c++) {
+		snprintf(src, sizeof(src),
+			 "%s%s\nint main(void){dirty();%s return nz(&v,sizeof v);}\n", CM_ZI_PRE,
+			 cells[c].types, cells[c].decl);
+		st.cells++;
+		int rc = cm_exec_trap(src, f);
+		if (rc != 0)
+			cm_note(&st, "%s: %d bytes not zeroed (rc %d)", cells[c].name,
+				rc > 0 ? rc : 0, rc);
+	}
+	cm_report("gen/runtime-zeroinit", &st);
+}
+
+/* ── executed auto-static ─────────────────────────────────────────────
+ *
+ * Auto-static had 539 static cells and none that ran anything, which left the
+ * half that matters untested. The existing tiers check that prism REFUSES to
+ * promote in the seventeen cases SPEC 6.9 lists. Nothing checked that when it
+ * does promote, the program still computes what it computed before.
+ *
+ * The oracle is differential: build each program twice, once with auto-static
+ * on and once with -fno-auto-static, and require the same exit status. Each
+ * program folds the array's contents into that status, so a promotion that
+ * corrupted an initializer, dropped an element, or moved the wrong object
+ * changes the answer.
+ *
+ * Address identity is deliberately never compared. SPEC 6.9 documents it as
+ * the one legitimate difference between the two modes (C11 6.5.9p6 does not
+ * guarantee distinct addresses for objects with non-overlapping lifetimes), so
+ * a cell that compared &v across recursion depths would fail by design and
+ * would be reported as a prism bug by whoever saw it next. */
+static void cm_gen_runtime_autostatic(void) {
+	/* `promotes` is measured against the shipping binary, not read off the
+	 * spec, and both zeroes below are prism declining correctly:
+	 *   volatile-member  SPEC 6.9 condition 5, a volatile field must not
+	 *                    reach .rodata or volatile access is defeated.
+	 *   const-ptr-array  the array is `const int *const`, which 6.9 allows,
+	 *                    but the initializer is {&a,&b}: address constants,
+	 *                    not the literal tokens the promotion requires.
+	 * Recording them as cells rather than deleting them means a future change
+	 * that starts promoting either one turns this tier red and gets looked at,
+	 * instead of silently moving a documented boundary. */
+	static const struct {
+		const char *name;
+		const char *prog;
+		int promotes;
+	} cells[] = {
+	    {"sbox-sum",
+	     "int main(void){const unsigned char t[8]={1,2,3,4,5,6,7,8};int s=0;for(int "
+	     "k=0;k<8;k++)s+=t[k];return s%%251;}", 1},
+	    {"nested-init",
+	     "int main(void){const int t[2][3]={{1,2,3},{4,5,6}};int s=0;for(int k=0;k<2;k++)for(int "
+	     "j=0;j<3;j++)s+=t[k][j];return s;}", 1},
+	    {"designated",
+	     "int main(void){const int t[6]={[1]=7,[4]=9};int s=0;for(int "
+	     "k=0;k<6;k++)s+=t[k];return s;}", 1},
+	    {"partial-init",
+	     "int main(void){const int t[5]={1,2};int s=0;for(int k=0;k<5;k++)s+=t[k];return s;}", 1},
+	    {"string-array",
+	     "int main(void){const char t[]=\"abc\";int s=0;for(int "
+	     "k=0;k<3;k++)s+=t[k];return s%%251;}", 1},
+	    {"enum-init",
+	     "enum{A=3,B=5};int main(void){const int t[2]={A,B};return t[0]+t[1];}", 1},
+	    {"recursive-frame",
+	     "static int rec(int d){const int t[4]={1,2,3,4};int s=0;for(int "
+	     "k=0;k<4;k++)s+=t[k];return d?s+rec(d-1):s;}int main(void){return rec(3)%%251;}", 1},
+	    {"const-ptr-array",
+	     "int main(void){static const int a=1,b=2;const int*const t[2]={&a,&b};return "
+	     "*t[0]+*t[1];}", 0},
+	    {"struct-array",
+	     "struct S{int x,y;};int main(void){const struct S t[2]={{1,2},{3,4}};return "
+	     "t[0].x+t[0].y+t[1].x+t[1].y;}", 1},
+	    {"volatile-member",
+	     "struct V{volatile int x;int y;};int main(void){const struct V "
+	     "t[2]={{1,2},{3,4}};return t[0].y+t[1].y;}", 0},
+	    {"typedef-const",
+	     "typedef const int ci;int main(void){ci t[4]={2,4,6,8};int s=0;for(int "
+	     "k=0;k<4;k++)s+=t[k];return s;}", 1},
+	    {"loop-local",
+	     "int main(void){int s=0;for(int q=0;q<3;q++){const int t[3]={1,2,3};s+=t[q];}return s;}", 1},
+	    {"shadowed",
+	     "int main(void){const int t[2]={9,9};{const int t[2]={1,2};return t[0]+t[1]+0*t[1];}}", 1},
+	    {"negative-vals",
+	     "int main(void){const int t[4]={-1,-2,3,4};int s=0;for(int "
+	     "k=0;k<4;k++)s+=t[k];return s+10;}", 1},
+	    {"wide-elems",
+	     "int main(void){const long long t[3]={100000LL,200000LL,300000LL};long long s=0;for(int "
+	     "k=0;k<3;k++)s+=t[k];return (int)(s%%251);}", 1},
+	};
+
+	CmStats st = {0};
+	PrismFeatures on = prism_defaults();
+	PrismFeatures off = prism_defaults();
+	off.auto_static = false;
+
+	for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); c++) {
+		char src[1200];
+		snprintf(src, sizeof(src), cells[c].prog);
+		st.cells++;
+
+		int a = cm_exec_trap(src, on);
+		int b = cm_exec_trap(src, off);
+		if (a < 0 || b < 0) {
+			cm_note(&st, "%s: infra (on %d, off %d)", cells[c].name, a, b);
+			continue;
+		}
+		if (a != b) {
+			cm_note(&st, "%s: auto-static changed behaviour (on %d, off %d)",
+				cells[c].name, a, b);
+			continue;
+		}
+		/* Guard against the differential passing because nothing was
+		 * promoted in either build: at least one cell must actually
+		 * differ in emitted text, or this tier proves nothing. */
+		/* Behavioural agreement is necessary but not sufficient: two builds
+		 * that emitted the same text would agree trivially. Check the text
+		 * moved exactly where promotion was measured to fire. */
+		PrismResult ra = cm_txf(src, on), rb = cm_txf(src, off);
+		if (!cm_ok(&ra) || !cm_ok(&rb) || !ra.output || !rb.output) {
+			cm_note(&st, "%s: re-transpile failed", cells[c].name);
+		} else {
+			int moved = strcmp(ra.output, rb.output) != 0;
+			if (moved != cells[c].promotes)
+				cm_note(&st, "%s: promotion %s but expected %s", cells[c].name,
+					moved ? "fired" : "did not fire",
+					cells[c].promotes ? "to fire" : "not to");
+		}
+		prism_free(&ra);
+		prism_free(&rb);
+	}
+	cm_report("gen/runtime-autostatic", &st);
+}
+
+/* Read a whole file into a NUL-terminated heap buffer, or NULL. */
+static char *cm_slurp(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return NULL;
+	size_t cap = 8192, len = 0;
+	char *b = malloc(cap);
+	if (!b) {
+		fclose(f);
+		return NULL;
+	}
+	size_t n;
+	while ((n = fread(b + len, 1, cap - len - 1, f)) > 0) {
+		len += n;
+		if (len + 1 >= cap) {
+			size_t nc = cap * 2;
+			char *nb = realloc(b, nc);
+			if (!nb) break;
+			b = nb;
+			cap = nc;
+		}
+	}
+	b[len] = '\0';
+	fclose(f);
+	return b;
+}
+
+/* ── CLI feature-flag polarity ────────────────────────────────────────
+ *
+ * Through 1.1.5 the flag table was asymmetric: -fbounds-check and
+ * -fflatten-headers had positive forms, the other eight features accepted only
+ * -fno-X. A build inheriting -fno-zeroinit from a parent makefile had no way to
+ * turn it back on for one target, and -fzeroinit fell through to the C
+ * compiler, which rejected it as an unrecognized option naming a flag the user
+ * believed was Prism's.
+ *
+ * Both directions are checked here. Every feature must round-trip -fno-X then
+ * -fX back to its default, and the near-miss GCC flags must still reach CC
+ * untouched: -fdefer-pop shares a prefix with -fdefer, -fno-strict-aliasing
+ * takes the "no-" branch, and matching either one would break real builds. */
+static void cm_gen_flag_polarity(void) {
+	static const char *feats[] = {"defer",	  "zeroinit",	     "orelse",
+				      "line-directives", "safety",	     "flatten-headers",
+				      "auto-unreachable", "auto-static",     "bounds-check",
+				      "link-pragma"};
+	/* Real compiler flags Prism must NOT claim, including two chosen to
+	 * collide with the matcher if it ever loosens to a prefix test. */
+	static const char *foreign[] = {"-fdefer-pop", "-fno-strict-aliasing", "-fPIC",
+					"-fno-omit-frame-pointer", "-fshort-enums"};
+
+	CmStats st = {0};
+	char cmd[PATH_MAX * 2 + 256], src[PATH_MAX], bin[PATH_MAX], dirbuf[PATH_MAX];
+	char *dir = test_mkdtemp(dirbuf, "cm_flagpol_");
+	if (!dir) {
+		cm_note(&st, "could not create temp dir");
+		cm_report("gen/flag-polarity", &st);
+		return;
+	}
+	snprintf(bin, sizeof(bin), "%s/prism_flagpol", dir);
+	if (!build_test_prism_binary(bin, "flag-polarity: build prism binary")) {
+		cm_report("gen/flag-polarity", &st);
+		return;
+	}
+	snprintf(src, sizeof(src), "%s/f.c", dir);
+	FILE *f = fopen(src, "w");
+	if (!f) {
+		cm_note(&st, "could not write temp source");
+		cm_report("gen/flag-polarity", &st);
+		return;
+	}
+	fputs("int main(void){int v;return v;}\n", f);
+	fclose(f);
+
+	for (size_t i = 0; i < sizeof(feats) / sizeof(feats[0]); i++)
+		for (int pol = 0; pol < 3; pol++) {
+			const char *form = pol == 0 ? "-f%s" : (pol == 1 ? "-fno-%s" : "-fno-%s -f%s");
+			char flag[96];
+			if (pol == 2)
+				snprintf(flag, sizeof(flag), "-fno-%s -f%s", feats[i], feats[i]);
+			else
+				snprintf(flag, sizeof(flag), form, feats[i]);
+			snprintf(cmd, sizeof(cmd),
+				 "'%s' -w -fsyntax-only %s '%s' >/dev/null 2>&1", bin, flag,
+				 src);
+			st.cells++;
+			if (run_command_status(cmd) != 0)
+				cm_note(&st, "%s: prism rejected its own flag", flag);
+		}
+
+	/* Exit status cannot answer this half. A flag Prism wrongly consumes is
+	 * simply dropped, the compile still succeeds, and the check passes while
+	 * the user's -fdefer-pop silently stops taking effect. Ask
+	 * --prism-verbose what was actually handed to CC instead. Verified by
+	 * mutation: loosening the `defer` match to a 5-byte prefix leaves the
+	 * status-based version green and turns this one red. */
+	char vout[PATH_MAX];
+	snprintf(vout, sizeof(vout), "%s/verbose.txt", dir);
+	for (size_t i = 0; i < sizeof(foreign) / sizeof(foreign[0]); i++) {
+		snprintf(cmd, sizeof(cmd),
+			 "'%s' --prism-verbose -w -fsyntax-only %s '%s' >'%s' 2>&1", bin,
+			 foreign[i], src, vout);
+		st.cells++;
+		run_command_status(cmd);
+		char *seen = cm_slurp(vout);
+		if (!seen || !strstr(seen, foreign[i]))
+			cm_note(&st, "%s: consumed by prism, never reaches CC", foreign[i]);
+		free(seen);
+	}
+	/* The mirror: every flag Prism owns must be absent from the CC line, or
+	 * the C compiler sees an option it does not know. */
+	for (size_t i = 0; i < sizeof(feats) / sizeof(feats[0]); i++) {
+		char own[64];
+		snprintf(own, sizeof(own), "-f%s", feats[i]);
+		snprintf(cmd, sizeof(cmd),
+			 "'%s' --prism-verbose -w -fsyntax-only %s '%s' >'%s' 2>&1", bin, own,
+			 src, vout);
+		st.cells++;
+		run_command_status(cmd);
+		char *seen = cm_slurp(vout);
+		if (seen && strstr(seen, own))
+			cm_note(&st, "%s: leaked through to CC", own);
+		free(seen);
+	}
+	unlink(vout);
+	unlink(src);
+	remove(bin);
+	remove(dir);
+	cm_report("gen/flag-polarity", &st);
+}
+
+/* ── driver surfaces that no test executed ────────────────────────────
+ *
+ * `install`, `--prism-verify` and @file response files were three of the four
+ * areas behind the 1,318-line zero-coverage figure in the 1.1.5 notes: real
+ * shipping code that every release went out without running once. They are
+ * awkward to test, which is why they were skipped, and each has a way in:
+ *
+ *   install         honours $PREFIX, so it can be pointed at a temp dir
+ *                   instead of /usr/local/bin.
+ *   --prism-verify  re-transpiles its own output and demands a fixed point;
+ *                   the check below feeds it every feature at once so a
+ *                   keyword leaking through any of them would be caught.
+ *   @file           parsed by Prism itself before CC ever sees it, and the
+ *                   1.1.5 fix for backslash-eating on Windows had no
+ *                   regression test at all.
+ *
+ * Every case asserts an outcome, not merely absence of a crash: the installed
+ * binary is executed and must transpile, and the malformed inputs must fail
+ * rather than be quietly accepted. */
+static void cm_gen_driver_surfaces(void) {
+	CmStats st = {0};
+	char dirbuf[PATH_MAX], bin[PATH_MAX], src[PATH_MAX], rsp[PATH_MAX], cmd[PATH_MAX * 3];
+	char *dir = test_mkdtemp(dirbuf, "cm_driver_");
+	if (!dir) {
+		cm_note(&st, "could not create temp dir");
+		cm_report("gen/driver-surfaces", &st);
+		return;
+	}
+	snprintf(bin, sizeof(bin), "%s/prism_drv", dir);
+	if (!build_test_prism_binary(bin, "driver-surfaces: build prism binary")) {
+		cm_report("gen/driver-surfaces", &st);
+		return;
+	}
+
+	/* One source using defer, orelse, zero-init, bounds-check and auto-static
+	 * together, so --prism-verify has every feature to re-check at once. */
+	snprintf(src, sizeof(src), "%s/all.c", dir);
+	FILE *f = fopen(src, "w");
+	if (!f) {
+		cm_note(&st, "could not write source");
+		cm_report("gen/driver-surfaces", &st);
+		return;
+	}
+	fputs("static void sink(int x){(void)x;}\n"
+	      "int run(int n){\n"
+	      "  const int tbl[4]={1,2,3,4};\n"
+	      "  int acc;\n"
+	      "  defer sink(acc);\n"
+	      "  int v = n orelse 1;\n"
+	      "  acc = tbl[v & 3];\n"
+	      "  return acc;\n"
+	      "}\n"
+	      "int main(void){return run(2)==3?0:1;}\n",
+	      f);
+	fclose(f);
+
+	struct {
+		const char *what;
+		const char *fmt;
+		int want_zero; /* 1 = must succeed, 0 = must fail */
+	} runs[] = {
+	    {"verify-flag", "'%s' --prism-verify -w -fsyntax-only '%s'", 1},
+	    {"verify-env", "PRISM_VERIFY=1 '%s' -w -fsyntax-only '%s'", 1},
+	    {"verify-no-safety", "'%s' --prism-verify -fno-safety -w -fsyntax-only '%s'", 1},
+	    {"verify-no-line-directives",
+	     "'%s' --prism-verify -fno-line-directives -w -fsyntax-only '%s'", 1},
+	    {"verify-flatten", "'%s' --prism-verify -fflatten-headers -w -fsyntax-only '%s'", 1},
+	};
+	for (size_t i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
+		snprintf(cmd, sizeof(cmd), runs[i].fmt, bin, src);
+		strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
+		st.cells++;
+		int rc = run_command_status(cmd);
+		if ((rc == 0) != (runs[i].want_zero != 0))
+			cm_note(&st, "%s: rc %d", runs[i].what, rc);
+	}
+
+	/* Response files. Prism expands @file itself; a mistake here either drops
+	 * arguments silently or, as on Windows through 1.1.4, eats path
+	 * separators. */
+	struct {
+		const char *what;
+		const char *body;
+		int want_zero;
+	} rsps[] = {
+	    {"rsp-basic", "-w\n-fsyntax-only\n", 1},
+	    {"rsp-crlf", "-w\r\n-fsyntax-only\r\n", 1},
+	    {"rsp-blank-lines", "-w\n\n\n-fsyntax-only\n\n", 1},
+	    {"rsp-trailing-space", "-w \n-fsyntax-only \n", 1},
+	    {"rsp-no-final-newline", "-w\n-fsyntax-only", 1},
+	    {"rsp-prism-flag", "-w\n-fsyntax-only\n-fno-zeroinit\n", 1},
+	    {"rsp-space-separated", "-w -fsyntax-only\n", 1},
+	};
+	for (size_t i = 0; i < sizeof(rsps) / sizeof(rsps[0]); i++) {
+		snprintf(rsp, sizeof(rsp), "%s/a%zu.rsp", dir, i);
+		FILE *rf = fopen(rsp, "wb");
+		if (!rf) continue;
+		fputs(rsps[i].body, rf);
+		fclose(rf);
+		snprintf(cmd, sizeof(cmd), "'%s' @'%s' '%s' >/dev/null 2>&1", bin, rsp, src);
+		st.cells++;
+		int rc = run_command_status(cmd);
+		if ((rc == 0) != (rsps[i].want_zero != 0))
+			cm_note(&st, "%s: rc %d", rsps[i].what, rc);
+		unlink(rsp);
+	}
+
+	/* A response file naming a path that does not exist must fail loudly.
+	 * Silently continuing would let a build drop half its arguments. */
+	snprintf(cmd, sizeof(cmd), "'%s' @'%s/does_not_exist.rsp' '%s' >/dev/null 2>&1", bin, dir,
+		 src);
+	st.cells++;
+	if (run_command_status(cmd) == 0)
+		cm_note(&st, "missing response file was accepted");
+
+	/* A path containing a space must survive expansion. */
+	{
+		char spdir[PATH_MAX], spsrc[PATH_MAX];
+		snprintf(spdir, sizeof(spdir), "%s/sp ace", dir);
+		mkdir(spdir, 0755);
+		snprintf(spsrc, sizeof(spsrc), "%s/x.c", spdir);
+		FILE *sf = fopen(spsrc, "w");
+		if (sf) {
+			fputs("int main(void){int v;return v;}\n", sf);
+			fclose(sf);
+			snprintf(rsp, sizeof(rsp), "%s/sp.rsp", dir);
+			FILE *rf = fopen(rsp, "w");
+			if (rf) {
+				fprintf(rf, "-w\n-fsyntax-only\n\"%s\"\n", spsrc);
+				fclose(rf);
+				snprintf(cmd, sizeof(cmd), "'%s' @'%s' >/dev/null 2>&1", bin, rsp);
+				st.cells++;
+				if (run_command_status(cmd) != 0)
+					cm_note(&st, "quoted path with a space was not expanded");
+			}
+		}
+	}
+
+	/* install, redirected away from /usr/local/bin by $PREFIX. The installed
+	 * copy is then run, because a corrupted or truncated write would still
+	 * leave a file at the right path. */
+	{
+		char prefix[PATH_MAX], installed[PATH_MAX];
+		snprintf(prefix, sizeof(prefix), "%s/pfx", dir);
+		snprintf(installed, sizeof(installed), "%s/bin/prism", prefix);
+
+		snprintf(cmd, sizeof(cmd), "PREFIX='%s' '%s' install >/dev/null 2>&1", prefix, bin);
+		st.cells++;
+		if (run_command_status(cmd) != 0) {
+			cm_note(&st, "install failed");
+		} else {
+			st.cells++;
+			if (access(installed, X_OK) != 0) {
+				cm_note(&st, "install produced no executable at %s", installed);
+			} else {
+				snprintf(cmd, sizeof(cmd), "'%s' -w -fsyntax-only '%s' >/dev/null 2>&1",
+					 installed, src);
+				st.cells++;
+				if (run_command_status(cmd) != 0)
+					cm_note(&st, "installed binary cannot transpile");
+				/* Installing again must be recognised as a no-op rather
+				 * than a copy of the running file onto itself, which is
+				 * ETXTBSY on Linux. Each spelling below names the same
+				 * inode as the destination but writes it differently, so
+				 * a textual comparison passes the first and fails the
+				 * rest. Verified by mutation: reverting the check to
+				 * strcmp leaves the plain absolute case green and turns
+				 * the other three red. */
+				char alt[PATH_MAX], link[PATH_MAX];
+				snprintf(link, sizeof(link), "%s/linked_prism", dir);
+				if (symlink(installed, link) != 0) link[0] = '\0';
+				const char *spellings[4];
+				int nsp = 0;
+				spellings[nsp++] = installed;
+				snprintf(alt, sizeof(alt), "%s/bin/../bin/prism", prefix);
+				spellings[nsp++] = alt;
+				if (link[0]) spellings[nsp++] = link;
+				for (int k = 0; k < nsp; k++) {
+					snprintf(cmd, sizeof(cmd),
+						 "PREFIX='%s' '%s' install 2>/dev/null | "
+						 "grep -q 'Already installed'",
+						 prefix, spellings[k]);
+					st.cells++;
+					if (run_command_status(cmd) != 0)
+						cm_note(&st,
+							"reinstall via %s was not recognised as "
+							"already installed",
+							spellings[k]);
+					st.cells++;
+					if (access(installed, X_OK) != 0) {
+						cm_note(&st, "reinstall via %s destroyed the binary",
+							spellings[k]);
+						break;
+					}
+				}
+				if (link[0]) unlink(link);
+			}
+		}
+	}
+
+	cm_report("gen/driver-surfaces", &st);
+}
+
+/* ── library API as an embedder sees it ───────────────────────────────
+ *
+ * The suite calls prism_transpile_source thousands of times through cm_txf,
+ * so the entry point is far from cold, but nothing checked the properties an
+ * embedder actually depends on: that one call cannot influence the next.
+ * 1.1.5 moved 39 fields out of PParseContext into a prism.c-owned PrismState,
+ * and the arena, the source-defines array and several counters live across
+ * calls, so cross-call contamination is the failure mode worth hunting.
+ *
+ * Three shapes of it are checked. Transpiling A, then something else, then A
+ * again must reproduce A byte for byte. A call that FAILS must not poison the
+ * next one, which is the sharper case: an error unwinds by longjmp, and 1.1.5
+ * fixed exactly this class when in_defer_emit stayed set after a
+ * pparse_error skipped its restore. And a feature configuration must give the
+ * same answer whichever order the configurations are tried in. */
+static void cm_gen_lib_api(void) {
+	static const char *A =
+	    "static void s(int x){(void)x;}\n"
+	    "int fa(int n){const int t[4]={1,2,3,4};int acc;defer s(acc);"
+	    "int v=n orelse 1;acc=t[v&3];return acc;}\n";
+	static const char *B =
+	    "int fb(int n){int m[2][3];raw int r;int q=n orelse 2;(void)r;return m[q&1][q%3];}\n";
+
+	/* Each must be rejected, and each takes a different diagnostic path out. */
+	static const struct {
+		const char *name;
+		const char *src;
+	} bad[] = {
+	    {"return-in-defer", "int f(void){defer { return 1; } return 0;}\n"},
+	    {"ptr-arith-deref", "int f(void){int a[4];volatile int i=0;return *(a+i);}\n"},
+	    {"defer-missing-semi", "void g(void);int f(void){defer g()\nreturn 0;}\n"},
+	    {"commutative-subscript", "int f(void){int a[4];volatile int i=0;return i[a];}\n"},
+	    {"file-scope-defer", "defer f();\nint main(void){return 0;}\n"},
+	};
+
+	CmStats st = {0};
+	PrismFeatures d = prism_defaults();
+
+	char *base = NULL;
+	PrismResult r0 = cm_txf(A, d);
+	if (cm_ok(&r0) && r0.output) base = strdup(r0.output);
+	prism_free(&r0);
+	if (!base) {
+		cm_note(&st, "baseline transpile failed");
+		cm_report("gen/lib-api", &st);
+		return;
+	}
+
+	/* An unrelated transpile between two identical ones must not change the
+	 * second. */
+	for (int rep = 0; rep < 3; rep++) {
+		PrismResult rb = cm_txf(B, d);
+		prism_free(&rb);
+		PrismResult ra = cm_txf(A, d);
+		st.cells++;
+		if (!cm_ok(&ra) || !ra.output || strcmp(ra.output, base) != 0)
+			cm_note(&st, "output drifted after an unrelated transpile (rep %d)", rep);
+		prism_free(&ra);
+	}
+
+	/* A rejected input must leave nothing behind. */
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		PrismResult rbad = cm_txf(bad[i].src, d);
+		st.cells++;
+		if (cm_ok(&rbad)) cm_note(&st, "%s: accepted, expected a diagnostic", bad[i].name);
+		/* A failed result must carry a message, or the embedder has nothing
+		 * to show its user. */
+		st.cells++;
+		if (!cm_ok(&rbad) && (!rbad.error_msg || !rbad.error_msg[0]))
+			cm_note(&st, "%s: rejected with an empty error message", bad[i].name);
+		/* An embedder reports the location, so it has to be populated. */
+		st.cells++;
+		if (!cm_ok(&rbad) && rbad.error_line <= 0)
+			cm_note(&st, "%s: rejected with error_line %d", bad[i].name,
+				rbad.error_line);
+		prism_free(&rbad);
+
+		PrismResult after = cm_txf(A, d);
+		st.cells++;
+		if (!cm_ok(&after) || !after.output || strcmp(after.output, base) != 0)
+			cm_note(&st, "%s: contaminated the following transpile", bad[i].name);
+		prism_free(&after);
+	}
+
+	/* Feature configurations, each tried in both directions. A configuration
+	 * that only works when it runs first is a state bug, not a feature. */
+	PrismFeatures cfg[6];
+	const char *cname[6] = {"defaults",   "no-defer",  "no-orelse",
+				"no-zeroinit", "no-bounds", "no-auto-static"};
+	for (int i = 0; i < 6; i++) cfg[i] = prism_defaults();
+	cfg[1].defer = false;
+	cfg[2].orelse = false;
+	cfg[3].zeroinit = false;
+	cfg[4].bounds_check = false;
+	cfg[5].auto_static = false;
+
+	char *firstrun[6] = {0};
+	for (int i = 0; i < 6; i++) {
+		PrismResult r = cm_txf(A, cfg[i]);
+		if (cm_ok(&r) && r.output) firstrun[i] = strdup(r.output);
+		prism_free(&r);
+	}
+	for (int pass = 0; pass < 2; pass++)
+		for (int k = 0; k < 6; k++) {
+			int i = pass ? 5 - k : k; /* forwards, then backwards */
+			PrismResult r = cm_txf(A, cfg[i]);
+			st.cells++;
+			if (!firstrun[i] || !cm_ok(&r) || !r.output ||
+			    strcmp(r.output, firstrun[i]) != 0)
+				cm_note(&st, "config %s drifted on pass %d", cname[i], pass);
+			prism_free(&r);
+		}
+	for (int i = 0; i < 6; i++) free(firstrun[i]);
+
+	/* Soft keywords. Every Prism keyword is a legal C identifier, and code
+	 * that predates Prism is full of variables called `raw`. Declaring one
+	 * must suppress the keyword meaning for that name. */
+	static const struct {
+		const char *name;
+		const char *src;
+		const char *must_contain;
+	} soft[] = {
+	    {"defer-as-var", "void f(void){int defer=5;defer;(void)defer;}\n", "defer"},
+	    {"orelse-as-var", "void f(void){int orelse=5;(void)orelse;}\n", "orelse"},
+	    {"raw-as-var", "void f(void){int raw=5;(void)raw;}\n", "raw"},
+	    {"defer-as-param", "void f(int defer){(void)defer;}\n", "defer"},
+	    {"raw-as-member", "struct S{int raw;};int f(struct S s){return s.raw;}\n", "raw"},
+	};
+	for (size_t i = 0; i < sizeof(soft) / sizeof(soft[0]); i++) {
+		PrismResult r = cm_txf(soft[i].src, d);
+		st.cells++;
+		if (!cm_ok(&r) || !r.output || !strstr(r.output, soft[i].must_contain))
+			cm_note(&st, "%s: identifier did not survive", soft[i].name);
+		prism_free(&r);
+	}
+
+	/* `defer;` with no declaration in scope is accepted as an empty defer:
+	 * the keyword is consumed and an empty statement is scheduled at scope
+	 * exit, which is why the call below is emitted ahead of it. Nothing is
+	 * deferred. Pinned rather than endorsed. Prism rejects `defer g()` for a
+	 * missing semicolon, so accepting a defer with no body at all is the
+	 * inconsistent case; if that is ever tightened to a diagnostic, this cell
+	 * is where it shows up. */
+	{
+		PrismResult r = cm_txf("void g(void);void f(void){defer; g();}\n", d);
+		st.cells++;
+		if (!cm_ok(&r)) {
+			cm_note(&st, "bare `defer;` now rejected: intended? update this cell");
+		} else if (r.output) {
+			const char *g = strstr(r.output, "g();");
+			const char *tail = g ? strstr(g, ";") : NULL;
+			if (!g || !tail)
+				cm_note(&st, "bare `defer;` no longer lowers to an empty defer");
+		}
+		prism_free(&r);
+	}
+
+	free(base);
+	cm_report("gen/lib-api", &st);
+}
+
 void run_completeness_open_tests(void) {
 	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");
 	/* The compile-and-run oracles live on this second suite thread rather
@@ -8096,5 +9045,11 @@ void run_completeness_open_tests(void) {
 	cm_gen_defer_edges();
 	cm_gen_defer_wide();
 	cm_gen_defer_reject();
+	cm_gen_runtime_bounds_trap();
+	cm_gen_runtime_zeroinit();
+	cm_gen_runtime_autostatic();
+	cm_gen_flag_polarity();
+	cm_gen_driver_surfaces();
+	cm_gen_lib_api();
 #endif
 }

@@ -17,7 +17,7 @@ The most common `goto cleanup` pattern in C isn't "undo everything"; it's "undo 
 Current defer inlines the cleanup body at every `return`/`goto`/`break`/scope-exit site. With 5 defers and 10 returns, that's 50 inlined cleanup statements, cold code polluting the hot path, bloating the instruction cache, and inflating binary size.
 
 ```c
-// Current emission — cleanup duplicated at every exit:
+// Current emission, cleanup duplicated at every exit:
 if (bad) { free(buf); fclose(f); return -1; }     // inlined
 if (worse) { free(buf); fclose(f); return -2; }   // inlined again
 { fclose(f); return buf; }                          // inlined again
@@ -59,7 +59,7 @@ int *parse_file(const char *path) {
 }
 ```
 
-### Example: emitted code (defer 2.0 goto-patch)
+### Example: emitted code: defer 2.0 goto-patch
 
 ```c
 int *parse_file(const char *path) {
@@ -74,11 +74,11 @@ int *parse_file(const char *path) {
     __prism_rv = buf;
     goto __prism_defer_1;
 
-    // — cold cleanup patch (end of function) —
+    // --- cold cleanup patch (end of function) ---
 __prism_err_2:              // error channel entry point
-    free(buf);              // defer(err) — LIFO
+    free(buf);              // defer(err), LIFO
 __prism_defer_1:            // always-defer entry point
-    fclose(f);              // defer — LIFO
+    fclose(f);              // defer, LIFO
     return __prism_rv;
 }
 ```
@@ -105,11 +105,11 @@ __prism_defer_1:            // always-defer entry point
    
    // Goto-patch (LIFO):
    __prism_err:
-       D;             // defer(err) — most recent
-       C;             // defer — always (interleaved)
+       D;             // defer(err), most recent
+       C;             // defer, always (interleaved)
        B;             // defer(err)
    __prism_defer:
-       A;             // defer — always (only the non-err defers below the lowest err)
+       A;             // defer, always (only the non-err defers below the lowest err)
        return __prism_rv;
    ```
 5. **Scope nesting:** Defers inside nested `{ }` blocks create sub-chains that fire when that scope's `}` is reached (same as current), using local goto labels
@@ -134,7 +134,7 @@ The goto-patch model trades a `goto` + label round-trip for code deduplication. 
 ```c
 void locked_operation(mutex_t *m) {
     mutex_lock(m);
-    defer_inline mutex_unlock(m);   // one instruction — cheaper to inline than to goto
+    defer_inline mutex_unlock(m);   // one instruction, cheaper to inline than to goto
 
     if (bad) return;                // emits: { mutex_unlock(m); return; }
     if (worse) return;              // emits: { mutex_unlock(m); return; }
@@ -178,10 +178,10 @@ void process_files(const char **paths, int n) {
 
         process(f, buf);
 
-        defer_flush;            // fires: free(buf), fclose(f) — LIFO, inlined here
+        defer_flush;            // fires: free(buf), fclose(f) in LIFO order, inlined here
         // buf and f are now cleaned up, loop continues fresh
     }
-    // no defers pending here — all consumed by defer_flush
+    // no defers pending here, all consumed by defer_flush
 }
 ```
 
@@ -197,7 +197,7 @@ void pipeline(void) {
 
     if (!init(scratch, result)) return(err:) ;   // goto-patch: free(result), free(scratch)
 
-    // Setup phase complete — release setup resources, keep result
+    // Setup phase complete, release setup resources, keep result
     defer_flush(setup);         // fires: free(scratch) only, inlined here
     // scratch is freed, result survives
 
@@ -222,7 +222,7 @@ FILE *f = fopen(path, "r");
 char *buf = malloc(4096);
 process(f, buf);
 { free(buf); fclose(f); }       // inlined, LIFO
-// defers consumed — return has nothing to fire
+// defers consumed, return has nothing to fire
 ```
 
 No goto, no labels, no resume point. The cleanup is inlined directly because the developer explicitly requested it. The end-of-function goto-patch stays clean: only `return`-triggered defers generate goto jumps.
@@ -260,7 +260,7 @@ Scoped defers already fire at `}`. But scope-based cleanup has two problems:
 
 ---
 
-## 2. Taint Qualifiers (`-ftaint`)
+## 2. Taint Qualifiers: `-ftaint`
 
 **Problem:** Direct dereference of untrusted pointers is a systemic bug class across C codebases: not just the Linux kernel (`__user`), but network daemons (recv buffers), embedded systems (MMIO registers), database engines (mmap'd pages), sandboxes (guest memory), and IPC (shared memory). Today, catching these requires either a separate static analysis tool (Sparse) or runtime instrumentation (ASAN). Most projects use neither.
 
@@ -320,7 +320,7 @@ The assignment `char *p = buf;` is the error, not the later `*p`. This eliminate
 untrusted char *buf;
 char *p = default_ptr;
 if (cond) { p = buf; }   // ERROR fires HERE: taint stripped at assignment
-char c = *p;              // irrelevant — already caught above
+char c = *p;              // irrelevant, already caught above
 ```
 
 No CFG needed. The error fires at the assignment site, not the dereference site. This is simpler and catches the alias bypass that a dereference-only check misses.
@@ -362,7 +362,7 @@ Extends existing infrastructure:
 
 ---
 
-## 3. Built-in `min` / `max` / `clamp` (`-fminmax`)
+## 3. Built-in `min` / `max` / `clamp`: `-fminmax`
 
 **Problem:** The standard C `#define min(x, y) ((x) < (y) ? (x) : (y))` evaluates arguments twice. Side effects (++, function calls) cause double-evaluation bugs. The Linux kernel's safe `min()` macro is 50+ lines of `_Generic`/`typeof`/statement-expression soup. Every C project either has this bug or has its own ugly workaround.
 
@@ -401,7 +401,7 @@ If the source already `#define`s `min`/`max`/`clamp`, Prism defers to the user's
 
 ---
 
-## 4. Compiler Attribute Normalization (`-fnormalize-attrs`)
+## 4. Compiler Attribute Normalization: `-fnormalize-attrs`
 
 **Problem:** GCC, Clang, MSVC, and C23 all use different syntax for the same compiler attributes. Cross-platform C projects litter their headers with `#ifdef` chains.
 
@@ -423,7 +423,7 @@ Prism already handles `_Noreturn` / `[[noreturn]]` / `__attribute__((noreturn))`
 
 ---
 
-## 5. `sizeof` Array Parameter Decay Check (`-fsizeof-decay`)
+## 5. `sizeof` Array Parameter Decay Check: `-fsizeof-decay`
 
 **Problem:** When an array is passed as a function parameter, it decays to a pointer. `sizeof(arr)` then returns the pointer size, not the array size, a silent, catastrophic bug that every C beginner hits and many experienced developers still miss. GCC has `-Wsizeof-array-argument` but it's not in `-Wall`.
 
@@ -460,20 +460,20 @@ void ok(int *arr, size_t n) {
 - Token check: `sizeof` + `(` + tagged-ident + `)` is a trivial pattern
 - Zero false positives: the C standard guarantees array parameters decay to pointers
 
-### Why this matters
+### Consequences of the current behaviour
 
 This is possibly the most common C bug that compilers don't warn about loudly enough. Stack Overflow has thousands of questions about it. It causes buffer overflows, truncated reads, and wrong-size allocations, all silently.
 
 ---
 
-## 6. Mandatory Control-Flow Braces (`-fmandate-braces`)
+## 6. Mandatory Control-Flow Braces: `-fmandate-braces`
 
 **Problem:** Braceless `if`/`for`/`while` bodies are the root cause of the Apple `goto fail` vulnerability (CVE-2014-1266). A developer adds a second indented statement expecting it to belong to the `if`, but it executes unconditionally.
 
 ```c
 if (condition)
     check_something();
-    do_critical_thing();   // always executes — indentation is a lie
+    do_critical_thing();   // always executes, indentation is a lie
 ```
 
 **Design:** When enabled, any braceless control-flow body is a hard error.
@@ -498,7 +498,7 @@ error: braceless control flow is forbidden (-fmandate-braces);
 
 ---
 
-## 7. Strict Implicit Fallthrough Ban (`-fno-fallthrough`)
+## 7. Strict Implicit Fallthrough Ban: `-fno-fallthrough`
 
 **Problem:** Missing `break` in `switch` cases causes silent execution bleed-through. This is one of the most common C bugs, CWE-484 (Omitted Break Statement in Switch). GCC/Clang have `-Wimplicit-fallthrough` but it's not universally in `-Wall`, and MSVC lacks it entirely.
 
@@ -506,7 +506,7 @@ error: braceless control flow is forbidden (-fmandate-braces);
 switch (state) {
     case INIT:
         start_engine();
-        // forgot break — falls through silently
+        // forgot break, falls through silently
     case RUNNING:
         update_engine();   // executes when state == INIT too
         break;
@@ -556,7 +556,7 @@ Phase 1D tracks case/default positions. The backward scan for terminators is the
 
 ---
 
-## 8. Forward-Only `goto` Enforcement (`-fstrict-goto`)
+## 8. Forward-Only `goto` Enforcement: `-fstrict-goto`
 
 **Problem:** Backward `goto` creates unstructured loops that defeat human comprehension, static analysis, and code review. In modern C, `goto` is considered acceptable only for forward jumps to cleanup labels. Backward `goto` is spaghetti code. Use a real loop construct.
 
@@ -564,7 +564,7 @@ Phase 1D tracks case/default positions. The backward scan for terminators is the
 retry:
     result = try_operation();
     if (result == RETRY)
-        goto retry;        // ERROR: backward goto — use while/for loop
+        goto retry;        // ERROR: backward goto, use while/for loop
 ```
 
 **Design:** When enabled, any `goto` that jumps to a label appearing earlier in the function is a hard error.
@@ -601,7 +601,7 @@ Zero new scanning logic required. The label direction check already exists in `p
 
 Tiers 1 and 2 (fixed-size local arrays and VLAs) have shipped as `-fbounds-check`; see **SPEC.md §6.10**. The remaining work is tracked here.
 
-### Tier 3: Function parameters (annotation)
+### Tier 3: Function parameters: annotation
 
 Array parameters decay to pointers: the size is lost. The developer annotates the bound:
 
@@ -743,7 +743,7 @@ void process(void) {
 // Emitted:
 void process(void) {
     const int N = 10;
-    int arr[10];          // fixed array — no VLA overhead
+    int arr[10];          // fixed array, no VLA overhead
 }
 ```
 
@@ -781,7 +781,7 @@ On match: substitute the `TK_NUM` value for the `TK_IDENT` in the dimension.
 
 ---
 
-## 15. Out-of-Line Assembly Extraction (`-fnaked-asm`)
+## 15. Out-of-Line Assembly Extraction: `-fnaked-asm`
 
 ### Problem
 
@@ -810,7 +810,7 @@ int main(void) {
 
 ### Prism's Dual Output
 
-#### 1. Emitted C File (`main.c.tmp`)
+#### 1. Emitted C File: `main.c.tmp`
 
 Prism completely strips the assembly block and replaces it with a standard ISO C forward declaration. This guarantees 100% portability to any C compiler. The backend compiler treats it as an opaque external function, preventing it from flushing registers to RAM or panicking about clobbers.
 
@@ -825,7 +825,7 @@ int main(void) {
 }
 ```
 
-#### 2. Synthesized Assembly File (Backend-Aware)
+#### 2. Synthesized Assembly File: Backend-Aware
 
 Prism uses its existing compiler detection (`cc_is_msvc`, `cc_is_clang`) to wrap the exact strings the user wrote in the correct native assembler directives.
 

@@ -1,9 +1,9 @@
 # Prism Transpiler Specification
 
-**Version:** 1.1.5
+**Version:** 1.1.6
 **Status:** Implemented: every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (14,538+ platform-inclusive checks; 14,281/14,281 in the audited Darwin/Clang run, 14,350/14,350 on Arch/GCC, and 14,287/14,287 on Arch/Clang; self-host stage1==stage2; zero failures on release and `PRISM_DEBUG` builds).
 
-This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
+This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described for the C abstract machine independently of any implementation strategy.
 
 ---
 
@@ -30,11 +30,11 @@ The transpiler operates in two passes:
 
 ---
 
-## 2. Tokenizer (Pass 0)
+## 2. Tokenizer: Pass 0
 
 Defined in `parse.c`. Produces a flat pool of `PParseToken` structs.
 
-### PParseToken structure (24 bytes, hot path)
+### PParseToken structure: 24 bytes, hot path
 
 | Field | Type | Description |
 |---|---|---|
@@ -80,7 +80,7 @@ The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_a
 - **GNU `__attribute__((noreturn))` / `__attribute__((__noreturn__))` / `__attribute__((cold, noreturn))`:** All `PPARSE_TK_IDENT` tokens between the inner `((` and matching `)` are scanned for `noreturn` or `__noreturn__`. This handles comma-separated attribute lists where noreturn is not the first attribute.
 - **MSVC `__declspec(noreturn)` / `__declspec(__noreturn__)`:** All `PPARSE_TK_IDENT` tokens between `(` and matching `)` are scanned for `noreturn` or `__noreturn__`.
 
-### C23 extended float literal suffixes (emission)
+### C23 extended float literal suffixes: emission
 
 C23 binary and extended-suffixed floating constants (e.g. `1.0f32x`, `1.0f128`, `1.0f16`) are emitted **verbatim** in Pass 2. They are not rewritten to a different standard suffix, so type and value (including `_Generic` and exact model) are preserved for a C23-capable backend. **Rationale:** mapping e.g. `f128` to `L` or `f16` to `f` can change the type of the constant and change or lose precision (e.g. `long double` is not IEEE 754 binary128 on all platforms).
 
@@ -94,7 +94,7 @@ Pass 1 is a series of phases executed sequentially. Each phase augments the data
 
 ### 3.0 Infrastructure
 
-#### PParseToken annotation field (`ann`)
+#### PParseToken annotation field: `ann`
 
 The `uint16_t ann` field in the PParseToken struct stores Pass 1 annotation flags. Accessed via the `pparse_ann(tok)` macro (expands to `(tok)->ann`). Zeroed by `pparse_new_token()` on allocation: this prevents stale `|=`-applied flags (`P1_IS_DECL`, `P1_OE_BRACKET`, `P1_OE_DECL_INIT`) from leaking across consecutive `prism_transpile_*()` calls when the token pool is reused.
 
@@ -114,7 +114,7 @@ Flag definitions:
 | `P1_UNEVAL_BRACKET` | 10 | `[` is inside an unevaluated operand (`sizeof`/`typeof`/`offsetof`/…) or a static-storage initializer |
 | `P1_IS_ORELSE_KW` | 11 | This `orelse` token is the Prism keyword, not an identifier, baked by Phase 1 classification; Pass 2 trusts the bit |
 
-**Cache discipline:** Pass 2 only reads `tok->ann` when a token's tag matches `PPARSE_TT_STRUCTURAL`, `PPARSE_TT_IF|PPARSE_TT_LOOP|PPARSE_TT_SWITCH`, or `PPARSE_TT_ORELSE`. The fast path (~70–80% of tokens) never reads the annotation.
+**Cache discipline:** Pass 2 only reads `tok->ann` when a token's tag matches `PPARSE_TT_STRUCTURAL`, `PPARSE_TT_IF|PPARSE_TT_LOOP|PPARSE_TT_SWITCH`, or `PPARSE_TT_ORELSE`. The fast path (~70 to 80% of tokens) never reads the annotation.
 
 #### Scope tree
 
@@ -122,17 +122,17 @@ Flat array indexed by `scope_id`. One entry per `{` in the translation unit.
 
 ```
 PParseScopeInfo {
-    parent_id      : uint16_t    — enclosing scope (0 = file scope)
-    open_tok_idx   : uint32_t    — token index of '{'
-    close_tok_idx  : uint32_t    — token index of matching '}'
-    is_struct      : bool :1     — struct/union/enum body
+    parent_id      : uint16_t  // enclosing scope (0 = file scope)
+    open_tok_idx   : uint32_t  // token index of '{'
+    close_tok_idx  : uint32_t  // token index of matching '}'
+    is_struct      : bool :1  // struct/union/enum body
     is_loop        : bool :1
     is_switch      : bool :1
-    is_func_body   : bool :1     — depth-1 '{' of a function definition
-    is_stmt_expr   : bool :1     — GNU statement expression ({...})
+    is_func_body   : bool :1  // depth-1 '{' of a function definition
+    is_stmt_expr   : bool :1  // GNU statement expression ({...})
     is_conditional : bool :1
-    is_init        : bool :1     — initializer brace: = { ... } (not a compound statement)
-    is_enum        : bool :1     — set when is_struct=true and the keyword is 'enum'
+    is_init        : bool :1  // initializer brace: = { ... } (not a compound statement)
+    is_enum        : bool :1  // set when is_struct=true and the keyword is 'enum'
 }
 ```
 
@@ -142,23 +142,23 @@ Ancestor check (`pparse_scope_is_ancestor_or_self`): O(depth) walk up `parent_id
 
 ```
 ScopeKind enum:
-    SCOPE_BLOCK       — { ... } block scope
-    SCOPE_INIT        — = { ... } initializer brace (does NOT increment block_depth)
-    SCOPE_FOR_PAREN   — for( ... ) — first ';' ends init, not stmt
-    SCOPE_CTRL_PAREN  — if/while/switch( ... )
-    SCOPE_GENERIC     — _Generic( ... )
-    SCOPE_TERNARY     — ? ... : — popped on matching ':'
+    SCOPE_BLOCK  // { ... } block scope
+    SCOPE_INIT  // = { ... } initializer brace (does NOT increment block_depth)
+    SCOPE_FOR_PAREN  // for( ... ); first ';' ends init, not stmt
+    SCOPE_CTRL_PAREN  // if/while/switch( ... )
+    SCOPE_GENERIC  // _Generic( ... )
+    SCOPE_TERNARY  // ? ... : ; popped on matching ':'
 ```
 
 ```
 ScopeNode {
-    defer_start_idx    : int       — index into defer stack at scope entry
-    kind               : uint8_t   — ScopeKind value
+    defer_start_idx    : int  // index into defer stack at scope entry
+    kind               : uint8_t  // ScopeKind value
     is_loop            : bool :1
     is_switch          : bool :1
     is_struct          : bool :1
-    is_stmt_expr       : bool :1   — GNU statement expression ({...})
-    is_ctrl_se         : bool :1   — stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
+    is_stmt_expr       : bool :1  // GNU statement expression ({...})
+    is_ctrl_se         : bool :1  // stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
 }
 ```
 
@@ -176,13 +176,13 @@ FuncMeta {
     ret_type_suffix_start  : PParseToken*
     ret_type_suffix_end    : PParseToken*
     returns_void           : bool
-    has_computed_goto      : bool     — function contains computed goto (*ptr)
-    entry_start            : int      — start index into p1_entries[]
-    entry_count            : int      — count of P1FuncEntry items
-    defer_name_set         : PParseHashMap  — exact set of captured names (union of all defer bodies)
-    defer_body_captures    : PParseHashMap  — pparse_idx(body) → PParseHashMap* (per-body capture sets)
-    label_hash             : int*     — open-addressing hash table: name → entry index (-1=empty)
-    label_hash_mask        : int      — power-of-2 mask for label_hash probing
+    has_computed_goto      : bool  // function contains computed goto (*ptr)
+    entry_start            : int  // start index into p1_entries[]
+    entry_count            : int  // count of P1FuncEntry items
+    defer_name_set         : PParseHashMap  // exact set of captured names (union of all defer bodies)
+    defer_body_captures    : PParseHashMap  // pparse_idx(body) → PParseHashMap* (per-body capture sets)
+    label_hash             : int*  // open-addressing hash table: name → entry index (-1=empty)
+    label_hash_mask        : int  // power-of-2 mask for label_hash probing
 }
 ```
 
@@ -199,10 +199,10 @@ P1FuncEntry {
     token_index  : uint32_t
     tok          : PParseToken*
     union {
-        label  { name, len, exits }                                — for P1K_LABEL, P1K_GOTO (exits: pre-computed scope exits for P1K_GOTO)
+        label  { name, len, exits }  // for P1K_LABEL, P1K_GOTO (exits: pre-computed scope exits for P1K_GOTO)
         decl   { has_init, is_vla, has_raw, is_static_storage,
-                 shape, zero_kind, body_close_idx }                — for P1K_DECL (body_close_idx: braceless body end position, 0 = not braceless)
-        kase   { switch_scope_id }                                 — for P1K_CASE
+                 shape, zero_kind, body_close_idx }  // for P1K_DECL (body_close_idx: braceless body end position, 0 = not braceless)
+        kase   { switch_scope_id }  // for P1K_CASE
     }
 }
 ```
@@ -219,7 +219,7 @@ P1ShadowEntry {
     len         : int
     scope_id    : uint16_t
     token_index : uint32_t
-    prev_index  : int         — chain to previous shadow for same name (-1 = none)
+    prev_index  : int  // chain to previous shadow for same name (-1 = none)
 }
 ```
 
@@ -290,7 +290,7 @@ Each `PParseTypedefEntry` records:
 
 **After Phase 1 completes, the typedef table is immutable.** No `pparse_typedef_add_entry` calls occur in Pass 2.
 
-#### Typedef lookup (range-based scoping)
+#### Typedef lookup: range-based scoping
 
 `pparse_typedef_lookup(tok)` walks the chain for a name and returns the first **non-struct-tag** entry in scope. When no ordinary entry matches, it falls back to the first matching struct tag entry. This preference ordering enforces ISO C11 §6.2.3 namespace separation: when both `typedef int Foo;` and `struct Foo { ... };` coexist at the same scope, `pparse_typedef_lookup` returns the typedef entry (with `PPARSE_TDF_TYPEDEF`), not the struct tag. When only a struct tag exists (e.g. `Inner` inside `struct Outer { struct Inner hw; }`), the struct tag is returned as fallback, preserving `PPARSE_TDF_HAS_VOL_MEMBER` and `PPARSE_TDF_VLA` access via `pparse_typedef_flags`.
 
@@ -306,7 +306,7 @@ pparse_idx(tok) < entry.scope_close_idx
 
 This range-based check eliminates runtime scope unwinding. There is no `active_shadow_idx` cache: the range check is sufficient.
 
-#### pparse_tag_lookup (C namespace isolation)
+#### pparse_tag_lookup: C namespace isolation
 
 `pparse_tag_lookup(tok)` walks the same `prev_index` hash chain as `pparse_typedef_lookup` but filters for `e->is_struct_tag` entries only. This enforces ISO C11 §6.2.3 namespace separation: struct/union/enum tags exist in a different namespace from ordinary identifiers. When `pparse_type_specifier` encounters `struct Foo`, it calls `pparse_tag_lookup(sue_tag)` instead of `pparse_typedef_flags(sue_tag)` to read `is_vla` and `has_volatile_member` directly from the tag entry. This prevents an ordinary variable named `Foo` (which creates a `PPARSE_TDK_SHADOW` in the unified hash chain) from hiding the struct tag's VLA/volatile properties. The `typeof(struct Tag)` handler in `pparse_type_specifier` also uses `pparse_tag_lookup` (via `saw_sue` tracking) to resolve struct tag volatile/VLA info when the tag name also exists as an ordinary typedef.
 
@@ -498,7 +498,7 @@ Runs after all Phase 1 sub-phases complete. Gated by `PPARSE_F_DEFER | PPARSE_F_
 
 Forward gotos past `raw`-marked declarations are skipped (safe: user explicitly opted out of initialization safety), **except VLAs:** `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization. Declarations with static storage duration (`static`, `extern`, `_Thread_local`, `thread_local`, `__thread`) are also exempt: their initialization occurs at program/thread startup, not at the declaration point, so jumping past them does not leave the variable indeterminate.
 
-**cfg_check_range:** Goto–label analysis scans skipped declarations in **three passes**: VLA declarations first (always error); then declarations with an explicit initializer (always error, independent of `-fno-zeroinit`); then, only if `PPARSE_F_ZEROINIT`, declarations that rely on implicit zero-initialization. VLA always wins over an earlier scalar-with-initializer in the same token range (so `-fno-safety` cannot downgrade the scalar to a mere warning and hide the VLA hard error).
+**cfg_check_range:** Goto-label analysis scans skipped declarations in **three passes**: VLA declarations first (always error); then declarations with an explicit initializer (always error, independent of `-fno-zeroinit`); then, only if `PPARSE_F_ZEROINIT`, declarations that rely on implicit zero-initialization. VLA always wins over an earlier scalar-with-initializer in the same token range (so `-fno-safety` cannot downgrade the scalar to a mere warning and hide the VLA hard error).
 
 **Assign-first heuristic for goto-over-uninit:** In the third pass (auto-zero-init), the check now applies a flow-aware refinement: when the only skipped declaration is plain `int x;` (no user initializer, no VLA), the verifier scans tokens forward from the goto's target label past the trailing `:` (tracking brace depth), looking for the **first identifier reference** matching the skipped variable's name. If that first reference is followed by a single-character `=` (a plain assignment that *writes* before any read), the jump is accepted: the user has taken over initialization at the label site, and there is no indeterminate read regardless of whether Prism's auto-zero-init was bypassed. Compound assignments (`+=`, `-=`, `==`, `<=`, etc.) and any non-`=` token after the identifier (subscript, member access, call, comparison) count as a read of an indeterminate value and the goto remains rejected. This makes idioms like `goto L; int x; ... L: x = compute(); use(x);` work without requiring the user to hoist the declaration.
 
@@ -528,7 +528,7 @@ A sequential token walk. Emits transformed C.
 
 ### Fast path
 
-Tokens with no `tag` bits set and `!at_stmt_start` (~70–80% of tokens) are emitted directly via `emit_tok`. This path never reads `tok->ann`.
+Tokens with no `tag` bits set and `!at_stmt_start` (~70 to 80% of tokens) are emitted directly via `emit_tok`. This path never reads `tok->ann`.
 
 ### Slow path dispatch
 
@@ -556,7 +556,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | Line directive state | Last emitted line number for `#line` directive deduplication |
 | `CtrlState` | Braceless control flow tracking: `pending`, `pending_for_paren`, `parens_just_closed`, `brace_depth`. Set for `PPARSE_TT_IF`, `PPARSE_TT_SWITCH`, and `PPARSE_TT_LOOP` keywords: `PPARSE_TT_LOOP` is gated by `pparse_feat(PPARSE_F_DEFER \| PPARSE_F_ZEROINIT)` (fires when *either* feature is enabled), since braceless-body declarations after `while`/`do` need `brace_wrap` for zero-init. |
 
-### Misleading-indentation hygiene (`emit_tok`)
+### Misleading-indentation hygiene: `emit_tok`
 
 Clang warns when a declaration is glued onto the same visual line as a prior `;` or `}` without a line break (control-flow arm vs next statement). Pass 2 inserts a **newline** before emitting a token that starts a declaration-like spell when:
 
@@ -694,7 +694,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 - **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies, GNU statement expressions in declaration-orelse value fallbacks (including parenthesized forms such as `orelse (({ ... }))`), empty orelse actions: `orelse ;` and `orelse ,` in bare statements (`p1d_validate_bare_orelse`, including every depth-0 chain member: `x = f() orelse g() orelse;` is rejected, never lowered to an empty expression) and in declaration initializers (`p1d_scan_init_orelse`), anonymous struct/union multi-declarator splits (when bracket orelse or typeof/VLA memset would force type re-emission, `p1d_check_multi_decl_constraints`), bare orelse with cast-expression assignment target (e.g. `(int)x = 0 orelse 5;`: the LHS is not a modifiable lvalue). The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
 - **Phase 1 (storage rejection):** `orelse` in the initializer of a `static`, `extern`, or `_Thread_local`/`thread_local` variable is rejected with a hard error (`reject_decl_orelse_storage`, called from `p1d_validate_decl_orelse`). The orelse transformation splits the declaration into a runtime assignment that re-executes on every function entry, which destroys C's persistence semantics (C11 §6.7.9p4). The same helper rejects `orelse` in a C23 `constexpr` initializer, which mandates a compile-time constant (ISO C23 §6.7.1p14). `constexpr` also implies `const`, so `pparse_has_effective_const_qual` returns true when `has_constexpr` is set, ensuring the const orelse path is never bypassed. Pass 2's copies of both checks are `PRISM_DEBUG` assertions.
 - **Pass 2 catch-all (`PRISM_DEBUG`):** Any `orelse` token that survives to the main emit loop without being consumed by a handler (bracket, decl-init, bare, typeof, walk_balanced) trips a debug-build assertion. Phase 1's statement-level and context rejections own these cases in release builds; the assertion exists to surface any Phase 1 coverage hole under the debug suite run.
-- **Pass 2 typeof dispatch:** `typeof(expr orelse fallback)` outside declaration contexts (e.g., inside `sizeof()`, casts) is caught by `PPARSE_TT_TYPEOF` checks that route through `try_typeof_orelse` → `walk_balanced_orelse`, ensuring the inner orelse is transformed to a ternary before any catch-all fires. The check is present in: (1) the main Pass 2 emit loop, (2) `walk_balanced`'s inner loop, (3) `emit_statements` (both EMIT_NORMAL and EMIT_DEFER_BODY modes), (4) `emit_orelse_fallback_value`, (5) `emit_bare_orelse_impl`'s inline fallback loops (compound-literal ternary path and last-link if/else path), (6) `emit_raw_verbatim_to_semicolon` (raw declaration bail-out), and as defense-in-depth in (7) `emit_range_ex` (covers `emit_range`/`emit_range_no_prep`/`emit_balanced_range`), (8) `emit_expr_to_stop`, and (9) `emit_expr_to_semicolon`. Sites (7)–(9) are defense-in-depth only: balanced groups containing typeof are always inside `(...)` which enters `walk_balanced` before reaching the flat emit path.
+- **Pass 2 typeof dispatch:** `typeof(expr orelse fallback)` outside declaration contexts (e.g., inside `sizeof()`, casts) is caught by `PPARSE_TT_TYPEOF` checks that route through `try_typeof_orelse` → `walk_balanced_orelse`, ensuring the inner orelse is transformed to a ternary before any catch-all fires. The check is present in: (1) the main Pass 2 emit loop, (2) `walk_balanced`'s inner loop, (3) `emit_statements` (both EMIT_NORMAL and EMIT_DEFER_BODY modes), (4) `emit_orelse_fallback_value`, (5) `emit_bare_orelse_impl`'s inline fallback loops (compound-literal ternary path and last-link if/else path), (6) `emit_raw_verbatim_to_semicolon` (raw declaration bail-out), and as defense-in-depth in (7) `emit_range_ex` (covers `emit_range`/`emit_range_no_prep`/`emit_balanced_range`), (8) `emit_expr_to_stop`, and (9) `emit_expr_to_semicolon`. Sites (7)-(9) are defense-in-depth only: balanced groups containing typeof are always inside `(...)` which enters `walk_balanced` before reaching the flat emit path.
 
 **Feature flag:** `-fno-orelse` disables.
 
@@ -788,7 +788,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 
 **Type specifier control-flow keyword ban:** `pparse_scan_paren_for_vla` (the shared scanner for `typeof(...)` and `_Atomic(...)` contents) rejects `defer`, `goto`, `return`, `break`, and `continue` keywords inside the parenthesized type expression with a hard error. These keywords interact with Prism's transpilation state (defer registration, goto-crossing analysis, unreachable injection) during emission. Because type specifiers may be emitted multiple times: const orelse fallback emits the type twice, multi-declarator splits re-emit the type for continuation declarations: control-flow keywords inside them would be processed repeatedly, causing double defer registration, duplicate goto-crossing checks, or corrupted scope state. The ban fires early in Phase 1 (during `pparse_type_specifier`) before any emission occurs, covering all downstream duplication paths uniformly. Under `-fno-safety`, this error is downgraded to a warning (suppressed in library mode), allowing code such as glibc's `INLINE_SYSCALL` macros that expand `__typeof__(({...return...}))` to pass through.
 
-### 6.8 Auto-Unreachable (`-fno-auto-unreachable`, default on)
+### 6.8 Auto-Unreachable: `-fno-auto-unreachable`, default on
 
 **Semantics:** After emitting a call to a function classified as noreturn, Prism injects `__builtin_unreachable();` (or `__assume(0);` for MSVC). This propagates Prism's transitive noreturn knowledge into the backend compiler, enabling tail-call optimization, dead code elimination, and register pressure relief.
 
@@ -805,7 +805,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 
 **Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 
-### 6.9 Auto-Static Constant Arrays (`-fno-auto-static`, default on)
+### 6.9 Auto-Static Constant Arrays: `-fno-auto-static`, default on
 
 #### Problem
 
@@ -845,11 +845,11 @@ The only observable change is **address identity**: without `static`, recursive 
 | C11 §6.7.3p7: `volatile` accesses have side effects | Enforced: skip when `volatile` qualifier present, when struct/union has volatile members, or when volatile is hidden behind a typedef |
 | C11 §6.7.6.1: pointer-to-const vs const-array distinction | Enforced: `const int *arr[3]` (mutable array of const-pointers) skipped; only arrays where the array itself is immutable qualify |
 
-#### Eligibility criteria (all must hold)
+#### Eligibility criteria: all must hold
 
 1. Block scope (`block_depth > 0`): file-scope arrays already have static storage
 2. Not inside a control-flow condition (`!in_ctrl_paren()`): `static` is illegal in for-init and C23 if/switch-init clauses (C11 §6.8.5p3)
-3. Explicit `const` qualifier on the type (`pparse_decl_has_explicit_const`: `type->has_const`, declarator `const`, or const typedef) — not `pparse_has_effective_const_qual`, which also treats bare `typeof` as const for orelse temps and would wrongly auto-static mutable `typeof(int[N])` arrays
+3. Explicit `const` qualifier on the type (`pparse_decl_has_explicit_const`: `type->has_const`, declarator `const`, or const typedef): not `pparse_has_effective_const_qual`, which also treats bare `typeof` as const for orelse temps and would wrongly auto-static mutable `typeof(int[N])` arrays
 4. No `volatile` qualifier (`!type->has_volatile`): changing storage duration of a `volatile` object may change abstract-machine behavior (C11 §6.7.3p7: volatile accesses are side effects)
 5. No `volatile` members in the struct/union type (`!type->has_volatile_member`): placing a struct with a `volatile` field into `.rodata` defeats volatile access semantics
 6. No volatile hidden in typedefs: scans type tokens with `pparse_is_volatile_typedef()` and `pparse_has_volatile_member_typedef()` to catch `typedef volatile int vint; const vint arr[3]` and `typedef struct { volatile int x; } VS; const VS arr[1]`
@@ -899,7 +899,7 @@ Eliminates hidden `memcpy` calls for:
 
 `-fno-auto-static` on the command line, or `features.auto_static = false` in library mode.
 
-### 6.10 Bounds Checking (`-fbounds-check`, default-on)
+### 6.10 Bounds Checking: `-fbounds-check`, default-on
 
 #### Problem
 
@@ -922,7 +922,7 @@ The check applies uniformly to both fixed-size local arrays (`int arr[100]`) and
 Emitted once per translation unit at the top of the preamble:
 
 ```c
-// GCC/Clang/TCC — `unsigned long long` is guaranteed ≥ 64 bits on C99+,
+// GCC/Clang/TCC, `unsigned long long` is guaranteed ≥ 64 bits on C99+,
 // so it fits `size_t` on every supported target. `__SIZE_TYPE__` is *not*
 // used because `-fpreprocessed` / `-x cpp-output` suppresses macro
 // expansion; `unsigned long` would truncate on LLP64 (MinGW / Clang-on-
@@ -984,7 +984,7 @@ Array variables are registered in a dedicated parser-owned bounds table by a Pha
 | `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
 | `gArr[i]` for a complete file-scope array | Yes | Complete file-scope arrays are registered; incomplete outer dimensions are not |
 | `arr[i]` inside `raw { ... }` | N/A: `raw` suppresses Prism transformations at parse time | |
-| `idx[arr]`, `len[b]`, `2[arr]`, `idx[&arr[0]]`, `idx[(&arr[0])]`, or any form where a **tracked** local array name appears **bare** (not itself subscripted) inside the subscript (index) and the left-hand base is not that array — including derived-pointer index forms `&arr` / `&arr[…]` with or without outer parentheses | **Compile error** | Commutative / hidden-array subscripts cannot be checked with the v1 `last_emitted` model; must be rewritten (e.g. `arr[idx]`) or use `-fno-bounds-check` for that expression. **Rationale:** ISO C 6.5.2.1: `E1[E2]` is defined in terms of `*((E1)+(E2))`; silently wrapping only `arr[i]` would miss `idx[(1 ? a : b)]`-style bypasses. A tracked array name that is itself subscripted in the index (`ptr[arr[0].field]`) is not a bypass: the inner subscript gets its own recursive bounds check. Detection of `&`/`*` derived forms scans the full index span (`pparse_bounds_span_derives_array`), so bare `i[&a[0]]` and parenthesized `i[(&a[0])]` both reject. |
+| `idx[arr]`, `len[b]`, `2[arr]`, `idx[&arr[0]]`, `idx[(&arr[0])]`, or any form where a **tracked** local array name appears **bare** (not itself subscripted) inside the subscript (index) and the left-hand base is not that array, including derived-pointer index forms `&arr` / `&arr[…]` with or without outer parentheses | **Compile error** | Commutative / hidden-array subscripts cannot be checked with the v1 `last_emitted` model; must be rewritten (e.g. `arr[idx]`) or use `-fno-bounds-check` for that expression. **Rationale:** ISO C 6.5.2.1: `E1[E2]` is defined for `*((E1)+(E2))`; silently wrapping only `arr[i]` would miss `idx[(1 ? a : b)]`-style bypasses. A tracked array name that is itself subscripted in the index (`ptr[arr[0].field]`) is not a bypass: the inner subscript gets its own recursive bounds check. Detection of `&`/`*` derived forms scans the full index span (`pparse_bounds_span_derives_array`), so bare `i[&a[0]]` and parenthesized `i[(&a[0])]` both reject. |
 | `*(arr + i)`, `*(&arr[0] + i)`, `*(*(m + i) + j)` and other pointer-arithmetic dereferences whose `(...)` operand contains a tracked array name and a top-level `+` / `-` | **Compile error** (warning under `-fno-safety`) | Pointer-arithmetic dereferences are semantically equivalent to subscripts (ISO C 6.5.2.1) but bypass the v1 subscript matcher. Detection is in `try_bounds_check_deref_add`: it requires unary `*` (discriminated from binary `*` by inspecting the previous token, peeking inside `(...)` for type keywords on `)` to distinguish casts from values), a balanced `(...)` body containing a top-level `+` or `-`, and a tracked array name inside (`bounds_find_array_ident`). The error message is "pointer-arithmetic dereference with tracked array base cannot be verified (rewrite as array[index])". The rewrite to `arr[i]` is recommended; `-fno-bounds-check` for the TU or `-fno-safety` (downgrade to warning + raw emit) are escape hatches. |
 
 
@@ -1030,7 +1030,7 @@ On by default (Prism's philosophy is opt-out, not opt-in). Disable with `-fno-bo
 
 When `warn_safety` is enabled (`-fno-safety`), CFG violations (goto skipping defers/declarations, switch/case bypassing defers) are downgraded from errors to warnings. VLA skip violations remain hard errors regardless. Under `-fbounds-check`, commutative-subscript bypass diagnostics (`idx[arr]`, `(idx)[arr]`, `idx[(...,arr)]`, brute-scan fallback) are likewise downgraded to warnings and the expression is emitted raw (unwrapped): the user opted out of safety for this subscript. Under `-fzeroinit`, unbraced declarations directly in a `switch` body, case/default labels inside nested blocks that bypass zero-initialization, and case/default labels that bypass a declaration with an initializer (C99 §6.8.4.2p4 undefined-if-jumped-into) are also downgraded to warnings (Lemon-generated parsers emit the first; `coroutine`/protothread macros and binutils bfd `compress.c`/`elf64-x86-64.c` emit the latter two). Declarator / unevaluated-operand rejections remain hard errors (they are structural, not safety, issues).
 
-### longjmp error recovery (library mode)
+### longjmp error recovery: library mode
 
 In `PRISM_LIB_MODE`, `pparse_error_tok` triggers `longjmp(pparse_ctx->error_jmp)` instead of `exit(1)`. All arena-allocated structures are reclaimed by `pparse_tokenizer_teardown(false)`. PParseToken annotations (`ann` field) survive arena resets (same lifecycle as token pool).
 
@@ -1212,7 +1212,7 @@ void          prism_thread_cleanup(void);
 
 `prism_transpile_source` transpiles already-preprocessed source text without invoking `cc -E`. Useful for IDE integrations that preprocess separately.
 
-### Macro boundaries (preprocessor contract & optional markers)
+### Macro boundaries: preprocessor contract & optional markers
 
 **Why Prism does not “see” macro expansions today.** In the normal CLI pipeline, Prism reads the host compiler’s **preprocessed** translation unit (`cc -E` output). All object-like and function-like macros have already been replaced by their expansions. Standard preprocessors do **not** emit a portable, machine-readable trace of *which* macro produced *which* token span inside that `.i` text. Prism therefore has no automatic, faithful map from expanded tokens back to macro names without either (a) owning or wrapping the preprocessor, or (b) relying on implementation-specific debugging hooks. That is a fundamental boundary, not a tokenizer oversight.
 
@@ -1235,7 +1235,7 @@ void          prism_thread_cleanup(void);
 
 This satisfies the “tag expansions” intent **without** requiring Prism to run its own cpp: the macro author places the sentinels **once** in the `#define` replacement; every expansion copies them around the hidden structure.
 
-### Macro taint table (design)
+### Macro taint table: design
 
 **Idea.** Keep a **side structure** parallel to the preprocessed character buffer: half-open byte ranges `[start, end)` that were contributed by a macro expansion. During tokenization (or immediately after), each token’s `start`/`end` pointers resolve to buffer offsets; a lookup returns which macro(s) “tainted” that span. Nested expansions produce **nested** intervals; the natural query is **innermost range wins** (stack or interval tree keyed by offset).
 
@@ -1362,7 +1362,7 @@ These are inherently runtime and cannot move to Pass 1:
 
 # Part II: Formal Language Specification
 
-This part defines the syntax, constraints, and semantics of Prism's language extensions to C. All descriptions are framed in terms of the C abstract machine as defined by ISO/IEC 9899. No reference is made to implementation strategies, internal data structures, or transpilation passes.
+This part defines the syntax, constraints, and semantics of Prism's language extensions to C. All descriptions are framed for the C abstract machine as defined by ISO/IEC 9899. No reference is made to implementation strategies, internal data structures, or transpilation passes.
 
 Unless otherwise stated, all standard C terms (*block scope*, *scalar type*, *lvalue*, *side effect*, *object*, *storage duration*) carry their ISO C definitions.
 

@@ -242,8 +242,8 @@ static pthread_mutex_t g_spawn_mtx = PTHREAD_MUTEX_INITIALIZER;
 // non-NULL, the child's stdout/stderr is redirected to those files (created
 // O_WRONLY|O_CREAT|O_TRUNC, mode 0644).  Returns the child's exit status
 // (>=0, 127 if exec failed inside posix_spawn), -1 on infrastructure error.
-static int prism_spawn_wait(char *const argv[], const char *stdout_path,
-			    const char *stderr_path) {
+static int prism_spawn_wait_raw(char *const argv[], const char *stdout_path,
+				const char *stderr_path, int *raw_status) {
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
 	if (stdout_path)
@@ -263,6 +263,14 @@ static int prism_spawn_wait(char *const argv[], const char *stdout_path,
 	int status = 0;
 	while (waitpid(pid, &status, 0) == -1)
 		if (errno != EINTR) return -1;
+	if (raw_status) *raw_status = status;
+	return 0;
+}
+
+static int prism_spawn_wait(char *const argv[], const char *stdout_path,
+			    const char *stderr_path) {
+	int status = 0;
+	if (prism_spawn_wait_raw(argv, stdout_path, stderr_path, &status) != 0) return -1;
 	if (!WIFEXITED(status)) return -1;
 	return WEXITSTATUS(status);
 }
@@ -357,6 +365,13 @@ static void *suite_thread(void *arg) {
 #endif
 
 int main(void) {
+#ifndef _WIN32
+	/* The bounds tiers deliberately run programs that trap, thousands of
+	 * times. Children inherit this limit, so without it a full run would
+	 * write thousands of core files and can fill the CI disk. Set once,
+	 * before any suite thread exists. */
+	setrlimit(RLIMIT_CORE, &(struct rlimit){0, 0});
+#endif
 	TestSuite suites[] = {
 		{"windows",  run_windows_tests},
 		{"safe",     run_safe_tests},

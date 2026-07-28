@@ -18,7 +18,7 @@ remaining executable artifacts run in CI.
 
 | Claim | Status |
 |---|---|
-| `defer_walk` order/stop properties P1–P5 | Proved for the stated finite-state abstraction; bounded real-code equivalence plus the small-model induction below |
+| `defer_walk` order/stop properties P1 to P5 | Proved for the stated finite-state abstraction; bounded real-code equivalence plus the small-model induction below |
 | End-to-end `defer` parsing/emission | Bounded exhaustive differential verification (`torture`) plus runtime and CFG products |
 | `orelse` classification and semantics | Bounded combinatorial/metamorphic/differential verification; not formally proved |
 | Parse termination/crash-freedom for arbitrary input | Fuzzed and watchdog-checked in debug builds; not formally proved |
@@ -50,7 +50,7 @@ P3 per-scope all-or-none, P4 suffix-closure (unwound scopes form a contiguous
 inner suffix), P5 mode stop-scope correctness. Written from the SPEC, not from
 prism.c. Divergence between the two is a finding, whichever side is wrong.
 
-### 2. `test.machine.c`: exhaustive machine equivalence (suite: `machine`)
+### 2. `test.machine.c`: exhaustive machine equivalence: suite: `machine`
 Drives the **real** `defer_walk` in-TU (same `scope_push_kind` / `defer_add`
 entry points Pass 2 uses, real tokens, real output buffer) over **every**
 abstract scope stack up to depth 5 (the full 14-symbol per-level alphabet of
@@ -58,7 +58,7 @@ scope kinds × loop/switch flags × defer counts) under every exit mode and
 every `DEFER_TO_DEPTH` stop depth (including the unreachable-defensive
 `stop == blocks+1`). 5,101,371 drives per run assert:
 - emission order == `dm_expected` (model ≡ code),
-- P1–P5 hold on the raw emissions,
+- P1 to P5 hold on the raw emissions,
 - dry-run parity (`has_defers_for` == emission nonempty), the gate Pass 2
   uses before emitting,
 - the shadow lazy-drain window and its mode gate (including the verified
@@ -73,7 +73,7 @@ carried integers. Its behavior is therefore a finite-state transduction over
 the descriptor alphabet, and every distinct (mode × descriptor ×
 carried-state-class) transition occurs by depth 3. The transition-coverage
 certificate (locked at 94 pairs / 3 stop relations) is *saturated*: depth 5
-adds **zero** new pairs over depth 4 (337,787 drives) — which is why depth 5
+adds **zero** new pairs over depth 4 (337,787 drives); which is why depth 5
 is the default: it *demonstrates* saturation instead of assuming it, for 2.2s.
 Bounded exhaustion at
 depth ≥ 4 therefore covers every transition of the machine, and correctness
@@ -81,18 +81,18 @@ for unbounded depth follows by induction on the stack: each iteration's
 postcondition is the next one's precondition. A future depth-dependent branch
 in `defer_walk` breaks the locked count.
 
-### 3. `cbmc_defer.c`: symbolic model check (standalone; run on demand)
-CBMC proves P1–P5 over the model for **nondeterministic** stacks up to depth 8
+### 3. `cbmc_defer.c`: symbolic model check: standalone; run on demand
+CBMC proves P1 to P5 over the model for **nondeterministic** stacks up to depth 8
 with *symbolic* defer counts and stop depths, no enumeration gaps. The same
 file compiles standalone as an exhaustive checker (5,101,371 cases) on hosts
 without CBMC. Proof chain: CBMC certifies the model; `test.machine.c`
 certifies model ≡ real code on the full bounded alphabet; the small-model
-lemma lifts both. Run manually (not a CI job — CBMC install cost is not worth a
+lemma lifts both. Run manually (not a CI job, CBMC install cost is not worth a
 per-push gate given `test.machine.c` already exhausts the model in CI):
 `cbmc --unwind 40 --unwinding-assertions .github/cbmc_defer.c`, or the plain-cc
 exhaustive fallback `cc -O2 .github/cbmc_defer.c -o /tmp/c && /tmp/c`.
 
-### 4. `test.alphabet.c`: tag-alphabet totality for T2 (suite: `alphabet`)
+### 4. `test.alphabet.c`: tag-alphabet totality for T2: suite: `alphabet`
 The Phase-1 classifier decides from a finite context alphabet whose head is
 the 32-bit `TT_` tag of the token preceding a paren/bracket group. The
 historical bug class, "orelse/CF inside *context nobody enumerated*"
@@ -110,7 +110,7 @@ cell: *accepted ⇒ zero surviving `orelse` tokens*.
 > reject. CF keywords in case parens are backend-loud by construction (C
 > keywords cannot parse as expressions), so passthrough there is safe.
 
-### 5. `test.insertion.c`: every-boundary insertion sweep for T2 (suite: `insertion`)
+### 5. `test.insertion.c`: every-boundary insertion sweep for T2: suite: `insertion`
 For a corpus of ~40 TUs spanning C grammar positions (declarations,
 designators incl. GNU ranges, bitfields, attributes, K&R defs, digraphs,
 preprocessor directives, asm slots, statement expressions, …), `orelse` and
@@ -128,7 +128,7 @@ Anything else (divergent survivors, a non-idempotent transform, accept/reject
 disagreement between the two pipelines, or an in-process crash) fails the
 suite.
 
-### 5b. `test.contexts.c`: combinatorial context-closure sweep for T2/T3 (suite: `contexts`)
+### 5b. `test.contexts.c`: combinatorial context-closure sweep for T2/T3: suite: `contexts`
 The historical bug class was not just unenumerated atomic positions but
 unenumerated **composed** contexts ("attr between dims", "_Atomic-typeof
 dims", "designator orelse in a statement expression"). Hand-picked lists
@@ -141,7 +141,7 @@ defer/orelse payload form through all of them:
   bitfields, _Generic, K&R defs, …) × every payload;
 - **composed-2**: 14 expression→expression wrappers composed **pairwise**
   (196 shapes) planted in 3 sites, plus **composed-3** triple composition
-  (~33k cells) — unconditional, 0.6s;
+  (~33k cells), unconditional, 0.6s;
 - **feature-polarity**: every atomic cell re-swept under orelse-only and
   defer-only feature sets (SPEC's cross-feature invariant: disabling one
   extension must never suppress the other's checking).
@@ -158,11 +158,11 @@ trichotomy as the insertion suite. ~45k transpiles per full run.
 > cleanup paste (the pre-existing accept-test only checked a substring and
 > missed it, now a hard reject with the braced form required).
 
-### 5c. `test.completeness.c`: T1′ transform/annotation completeness (suites: `completeness`, `completeness_exec`)
+### 5c. `test.completeness.c`: T1′ transform/annotation completeness: suites: `completeness`, `completeness_exec`
 T2/T3 lock *classifier* and *defer-machine* totality; they do not exhaust
 **transform/annotation** products. This suite does not hand-pick cells: it
 locks small **axis alphabets** and sweeps their Cartesian products with
-machine-decidable oracles (contexts/insertion aggregation style — many cells,
+machine-decidable oracles (contexts/insertion aggregation style: many cells,
 a handful of CHECKs + first-failure breadcrumb).
 
 Closed generative tiers (87 hunters, 8k+ cells): denser stmt-defer×wrap, orelse
@@ -182,14 +182,14 @@ attr-multidecl / raw-suppress / linemarker / illformed / goto-if-init are
 closed green. Contexts atomic heads densified (~2250 cells); insertion
 corpus expanded.
 
-**`completeness_exec`** carries the executed tiers — the compile-and-run
+**`completeness_exec`** carries the executed tiers, the compile-and-run
 oracles (`gen/cert-compile-run`, `gen/raw-identifier`) that hand the emitted C
 to the backend and run it. They sit on a second suite thread because they are
 latency-bound on process spawns, not CPU-bound. Rule: hunt findings extend an
-*axis*, not a one-off smoke; and every tier runs in every run — there are no
+*axis*, not a one-off smoke, and every tier runs in every run. There are no
 environment gates anywhere in the suite.
 
-### 6. `--prism-verify` / `PRISM_VERIFY=1`: translation validation (T2, per compile)
+### 6. `--prism-verify` / `PRISM_VERIFY=1`: translation validation: T2, per compile
 After emitting, prism re-runs its **entire pipeline** on the emitted C. The
 certificate has two arms, both sound and both demonstrated to fire:
 - **re-transpile succeeds**: output #1 must be valid C that re-survives every
@@ -213,7 +213,7 @@ checker rejects; the original already passed in pass 1). CI runs the full
 14,000+-test suite under `PRISM_VERIFY=1`, and prism verifies its **own**
 13k-line self-host transpilation.
 
-### 6b. Identifier-namespace non-regression (suite: `contexts`, tier `ident-namespaces`)
+### 6b. Identifier-namespace non-regression: suite: `contexts`, tier `ident-namespaces`
 The "cleaner rejection" fixes (stray-`defer`/`orelse` in declarator, argument,
 dimension, `sizeof`/`_Static_assert` contexts) must never mistake a legitimate
 identifier for a stray keyword. This tier uses `defer`/`orelse` as a declared
@@ -222,7 +222,7 @@ variable) inside those policed contexts and asserts **non-rejection** (28
 uses, 0 false rejects). It is the discriminating check that the rejection
 tightening did not over-reach into valid programs.
 
-### 7. Termination watchdogs: T1 (PRISM_DEBUG builds)
+### 7. Termination watchdogs: T1: PRISM_DEBUG builds
 The Phase-1 prescan and Pass-2 walks carry debug-only progress watchdogs
 (budget `256·tokens + 65536` outer iterations). A cursor-stall bug becomes a
 diagnostic instead of a hang. Release builds compile them out. Crash-freedom
@@ -231,7 +231,7 @@ remains fuzz-covered (csmith differential + AFL++ with ASan/UBSan,
 in-process, where any crash fails the suite. The machine and insertion
 harnesses run ASan-clean.
 
-### 8. `gen_torture.py` exhaustive tier: end-to-end T3 (suite: `torture`)
+### 8. `gen_torture.py` exhaustive tier: end-to-end T3: suite: `torture`
 Beyond the seeded random "storm" units, the generator now emits a **complete
 product**: wrapper {none, block, for, while, do, switch} × outer defers
 {0,1,2} × inner defers {0,1,2} × exit {end, return, break, continue,
@@ -241,9 +241,9 @@ lowering with its own scope walker) and executed with LIFO/trace/return/
 eval-parity assertions. This carries the machine-level exhaustion through the
 full concrete pipeline: parse → classify → emit → compile → run.
 
-### 9. `test.runtime.c`: executed-semantics blind spots (suite: `runtime`)
+### 9. `test.runtime.c`: executed-semantics blind spots: suite: `runtime`
 Targets the runtime-semantic gaps a coverage audit found thin or absent, with
-robust VALUE and EVALUATION-COUNT oracles (deliberately not trace-order, whose
+strict VALUE and EVALUATION-COUNT oracles (deliberately not trace-order, whose
 hand-computed expectations are error-prone): bare-assignment and decl-init
 primary-evaluated-exactly-once; chain left-to-right short-circuit with exact
 eval counts; bracket-dimension runtime size + primary eval; **volatile /
@@ -269,7 +269,7 @@ suite and in `gen_torture.py`.
 ## How the pieces compose
 
 ```
-        SPEC Part II  ──written into──►  defer_model.h (dm_expected, P1–P5)
+        SPEC Part II  ──written into──►  defer_model.h (dm_expected, P1 to P5)
                                               │
               CBMC (symbolic, nondet) ────────┤ certifies model
                                               │
@@ -283,7 +283,7 @@ suite and in `gen_torture.py`.
    watchdogs + fuzz ────────── termination and crash-freedom backstops
 ```
 
-## Trust base and proof boundary (what is *not* proven here)
+## Trust base and proof boundary: what is *not* proven here
 
 The backend C compiler; the system preprocessor; correctness of the full C
 grammar/context abstraction outside the enumerated products; the assumption

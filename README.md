@@ -5,7 +5,7 @@
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
-Prism is a lightweight and fast transpiler that makes C safer and faster without changing how you write it.
+Prism is a transpiler that makes C safer and faster without changing how you write it. One source file, no dependencies beyond a C compiler.
 
 - **13685+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C:** OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
@@ -27,8 +27,8 @@ Prism is a proper transpiler, not a preprocessor macro.
 cc prism.c -flto -s -O3 -o prism && ./prism install
 ```
 
-### Windows (MSVC)
-Open a **Developer Command Prompt** (or run `vcvars64.bat`) and build:
+### Windows with MSVC
+Open a **Developer Command Prompt** or run `vcvars64.bat`, then build:
 ```sh
 cl /Fe:prism.exe prism.c /O2 /D_CRT_SECURE_NO_WARNINGS /nologo
 ```
@@ -47,7 +47,7 @@ Real codebases written using Prism as the compiler.
 **The problem:** C requires manual cleanup at every exit point. Each new resource adds cleanup to *every* error path. Miss one and you leak.
 
 ```c
-// Standard C — cleanup grows with every new resource
+// Standard C: cleanup grows with every new resource
 int compile(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -125,9 +125,9 @@ Defers execute in **LIFO order** (last defer runs first) at scope exit, whether 
 **The problem:** Uninitialized reads are the #1 source of C vulnerabilities. Compilers don't require initialization, and `-Wall` only catches obvious cases.
 
 ```c
-// Standard C — compiles fine, undefined behavior at runtime
+// Standard C: compiles fine, undefined behavior at runtime
 int sum_positive(int *arr, int n) {
-    int total;  // uninitialized — could be anything
+    int total;  // uninitialized: could be anything
     for (int i = 0; i < n; i++)
         if (arr[i] > 0) total += arr[i];
     return total;  // UB: total was never set if no positives
@@ -222,7 +222,7 @@ int *s = find()    orelse goto cleanup;
 FILE *f = fopen(path, "r") orelse {
     log_error("failed to open %s", path);
     return -1;
-}
+};          // the declaration still needs its terminating ';'
 ```
 
 **Fallback value:** substitute a default:
@@ -259,7 +259,7 @@ The reason: `orelse` works by testing `!value`, which is well-defined for scalar
 Struct and union **pointers** work fine:
 
 ```c
-struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
+struct Vec2 *p = get_vec2() orelse return -1;  // OK: pointer is scalar
 ```
 
 > **Note:** Prism detects struct/union types through explicit keywords
@@ -293,7 +293,7 @@ void unsafe() {
 skip:
     printf("%d", x);
 }
-// Error: goto 'skip' would skip over variable declaration 'x'
+// Error: goto 'skip' would skip over this variable declaration (bypasses initialization)
 ```
 
 The same analysis covers `switch`/`case`, jumping from one case into a nested block that has zero-initialized declarations or active defers is rejected:
@@ -303,13 +303,30 @@ void bad_switch(int n) {
     switch (n) {
         case 1: {
             defer cleanup();
-            // ...
-        }
         case 2:  // Error: defer skipped by switch fallthrough
+            break;
+        }
+    }
+}
+```
+
+The label has to sit *inside* the block for this to be a hazard. Closing the
+block before the next case is accepted, because the defer has already fired:
+
+```c
+void ok_switch(int n) {
+    switch (n) {
+        case 1: {
+            defer cleanup();   // runs at this '}'
+        }
+        case 2:
             break;
     }
 }
 ```
+
+A bare `defer` directly under a case label is rejected separately, with
+`defer in switch case requires braces`.
 
 ### Defer in Forbidden Contexts
 
@@ -318,7 +335,7 @@ Prism rejects `defer` in functions that use non-local control flow:
 ```c
 void bad() {
     jmp_buf buf;
-    defer cleanup();  // Error: defer forbidden with setjmp
+    defer cleanup();  // Error: defer cannot be used in functions that call setjmp/longjmp/pthread_exit
     if (setjmp(buf)) return;
 }
 ```
@@ -369,12 +386,16 @@ Prism automatically promotes `const` arrays with literal initializers from stack
 
 ```c
 void encrypt(uint8_t *block) {
-    const uint8_t sbox[256] = {0x63, 0x7c, 0x77, ...};
-    //                       ^^^^^^
-    // Without Prism: 256 bytes copied from .rodata to the stack on every call.
-    // With Prism: promoted to 'static const' — zero-cost direct read from .rodata.
+    const uint8_t sbox[8] = { 0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5 };
+    // Without Prism: the table is copied to the stack on every call.
+    // With Prism: emitted as 'static const', read directly from .rodata.
+    block[0] = sbox[block[0] & 7];
 }
 ```
+
+`prism transpile` shows the promotion: the emitted declaration reads
+`static const uint8_t sbox[8]`. A 256-entry AES table costs 256 stack bytes and
+a copy per call without it.
 
 This eliminates hidden `memcpy` calls for cryptographic tables, lookup arrays, dispatch tables, and string constant arrays.
 
@@ -392,7 +413,7 @@ The transformation is conservative. It only fires when all of these hold:
 Prism wraps array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps. **This is on by default.** Prism's philosophy is opt-out, not opt-in: you chose Prism for safety, not to configure it.
 
 ```c
-void process(void) {
+void process(int i, int j, int k, int m) {
     int arr[100];
     int n = get_count();
     int vla[n];
@@ -415,7 +436,8 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 **What's checked:**
 - Fixed-size local arrays: `int arr[100]; arr[i]`
 - Local VLAs: `int vla[n]; vla[i]`
-- Outer dimension of local multi-dim arrays: `m[i][j]` checks `i`
+- File-scope and block-scope `static` arrays
+- Every dimension of a multi-dim array: `m[i][j]` checks both `i` and `j`, and `m[i][j][k]` checks all three
 - Nested subscripts in index expressions: both outer and inner are wrapped in `arr[m[i]]`
 - Declaration initializers and function-call arguments
 
@@ -424,10 +446,9 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 - Struct/union member subscripts: `s.arr[i]`, `p->arr[i]`: field size ≠ any same-named local
 - Unary address-of: `&arr[i]`: C permits one-past-end addresses (index == length is legal)
 - Pointer subscripts (`p[i]` where `p` is `int *`)
-- Array parameters (they decay to pointers in C)
+- Array parameters: `void f(int a[4])` declares a pointer, not an array (C11 §6.7.6.3p7), so there is no length to check against. This includes `int a[static 4]`, where C does promise at least 4 elements but Prism does not yet use that promise
+- Pointer-to-array dereference: `int (*p)[4]; (*p)[i]` and `p[0][i]` carry their length in the type but are not currently wrapped
 - `raw { ... }` blocks (Prism transformations are fully suppressed)
-- File-scope / extern arrays (current limitation; kernel-style globals ship unchecked)
-- Inner dimensions of multi-dim subscripts (v1 limitation)
 
 The check is a single predicted-not-taken branch per subscript; the backend compiler constant-folds the `sizeof` ratio for fixed arrays and often eliminates the whole check when it can prove the index is in range.
 
@@ -452,7 +473,16 @@ prism main.c helper.cpp -o mixed
 
 ## Preprocessor Cache
 
-Prism shells out to `cc -E` before transpiling, and that spawn dominates its runtime — 39–99% of wall time. Prism caches the preprocessor's output and skips the spawn whenever nothing it read has changed, which is roughly a **2x end-to-end speedup** on a warm cache.
+Prism shells out to `cc -E` before transpiling, and that spawn dominates its
+runtime: 39% to 99% of wall time, depending on how much the file includes. Run
+`prism --prism-prof transpile file.c` to see the split on your own source. On a
+four-line file that includes `stdio.h`, `stdlib.h` & `string.h`, the cold
+numbers are `preprocess=14.090ms` against `total=15.632ms`, or 90% of the run.
+
+Prism caches the preprocessor's output and skips the spawn whenever nothing it
+read has changed. The same file warm reports `preprocess=0.097ms total=1.177ms`.
+End to end, including the backend compile, that is a **2x speedup** on a warm
+cache.
 
 It is on by default and needs no configuration.
 
@@ -468,7 +498,7 @@ prism --prism-cache-clear     # delete every cached entry
 | `PRISM_PP_CACHE_MAX_MB` | `1024` | size cap; oldest entries evicted first |
 | `PRISM_PP_CACHE_MAX_DAYS` | `14` | age cap |
 
-**How an entry is invalidated.** The cache key covers the exact preprocessor argv, the resolved compiler binary's size and timestamp, and the include-affecting environment (`CPATH`, `SDKROOT`, …) — so upgrading your compiler or changing a flag misses. An entry is only reused if *every file that contributed to it* still has the same size, mtime (to nanosecond resolution where the platform provides it) and ctime. That dependency list is recovered from the `# N "file"` linemarkers in the preprocessed output itself, so editing any transitive header invalidates the entry without prism needing a `.d` sidecar.
+**How an entry is invalidated.** The cache key covers the exact preprocessor argv, the resolved compiler binary's size and timestamp, and the include-affecting environment (`CPATH`, `SDKROOT`, and the rest), so upgrading your compiler or changing a flag misses. An entry is only reused if *every file that contributed to it* still has the same size, mtime (to nanosecond resolution where the platform provides it) and ctime. That dependency list is recovered from the `# N "file"` linemarkers in the preprocessed output itself, so editing any transitive header invalidates the entry without prism needing a `.d` sidecar.
 
 Every uncertainty resolves to a miss rather than a hit: unresolvable paths, filesystems too coarse to distinguish a same-second rewrite, and sources mentioning `__DATE__`, `__TIME__` or `__TIMESTAMP__` (whose expansion is not a function of the inputs) are never cached.
 
@@ -518,7 +548,7 @@ Prism-generated temporaries are namespaced `__prism_*` and easy to ignore in
 it, and `-fno-line-directives` makes the debugger show the transpiled lines
 instead, useful when debugging Prism's own output.
 
-## Static Analysis (CppCheck, clang-tidy, …)
+## Static analysis with CppCheck and clang-tidy
 
 `prism check` wraps any analyzer the same way `CC=prism` wraps your compiler:
 prepend it to the command you already run. Source args are transpiled to
@@ -562,7 +592,7 @@ immediately overwrite a variable. Suppress that id or read it as intentional.
 Prism uses a GCC-compatible interface. Most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.5 - Robust C transpiler
+Prism v1.1.6 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
        prism [options] run src.c [-- prog_args...]
@@ -585,13 +615,17 @@ Prism Flags (consumed, not passed to CC):
   -fno-flatten-headers   Disable header flattening
   -fno-auto-unreachable  Disable __builtin_unreachable after noreturn calls
   -fno-auto-static       Disable auto-static for const arrays with literal inits
-  -fno-bounds-check      Disable runtime bounds checks on local/param array subscripts
+  -fno-bounds-check      Disable runtime bounds checks on local, static and file-scope array subscripts
   -fno-link-pragma       Ignore #pragma link directives in source
+  (each -fno-X above also accepts -fX to re-enable it)
   --prism-cc=<compiler>  Use specific compiler
   --prism-verbose        Show commands
   --prism-prof           Print per-phase timing breakdown
   --prism-verify         Translation validation: re-transpile emitted C,
                          require a fixed point (also: PRISM_VERIFY env)
+  --prism-cache-info     Show the preprocessor cache location and size
+  --prism-cache-clear    Delete all cached preprocessor output
+  --prism-emit[=<file>]  Write transpiled C to stdout, or to <file>
   --                     Separator: remaining args are passed to the binary in `run` mode
 
 All other flags are passed through to CC.
@@ -608,12 +642,18 @@ Link Pragma (source-embedded linker flags):
   #pragma link <platform> <names...>
     platform: * | macos | macos_arm64 | macos_x86_64 | linux | linux_arm64
               linux_x86_64 | linux_riscv64 | windows | windows_x86_64 | windows_arm64
-    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, else -l<name>
+    name:     plain name (e.g. `Cocoa`, `m`): macOS => -framework, else -l<name>
               or a literal flag starting with `-` (e.g. `-lm`, `-framework Foo`)
 
 Apache 2.0 license (c) Dawn Larsson 2026
 https://github.com/dawnlarsson/prism
 ```
+
+### `--prism-emit`
+
+`prism --prism-emit src.c` writes the transpiled C to stdout, the same output
+`prism transpile` produces. `prism --prism-emit=out.c src.c` writes it to
+`out.c` instead.
 
 ### Drop-in Compiler Overlay
 
