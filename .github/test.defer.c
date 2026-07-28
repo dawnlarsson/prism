@@ -74,7 +74,16 @@ static void _noise_goto_same_scope_helper(void) {
 	{
 		defer log_append("D");
 		log_append("B");
-		goto _Pragma("GCC diagnostic push") same_scope;
+		/* The pragma sits between statements, not inside one. `goto
+		 * _Pragma("...") label;` is not valid C: _Pragma destringizes to a
+		 * #pragma directive, and a directive cannot appear between `goto`
+		 * and its label. GCC rejects it in one-pass mode with the same
+		 * "expected identifier or '*' before '#pragma'" that the two-pass
+		 * route gives, so there is nothing here for Prism to support. The
+		 * point of the test is pragma noise around a same-scope goto, which
+		 * this still exercises. */
+		_Pragma("GCC diagnostic push")
+		goto same_scope;
 		log_append("X");
 	same_scope:
 		_Pragma("GCC diagnostic pop")

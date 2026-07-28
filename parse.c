@@ -11115,6 +11115,20 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				}
 				PParseToken *grp_open = ps->tok;
 				ps->tok = pparse_next(_pc, group_close);
+				/* The token before whatever follows is the group's CLOSE, not
+				 * its open. p1d_prev was set to the open paren before the jump
+				 * and has to be advanced, or the next statement sees `(` as its
+				 * predecessor. That mattered for `if (x) defer f();`:
+				 * is_defer_kw bails on a `(` predecessor (call/cast position),
+				 * so the braceless body's defer was never recognised as the
+				 * keyword, never annotated P1_IS_DEFER_KW, and
+				 * p1d_validate_defer never ran. The result was silent
+				 * acceptance of a defer with no scope to unwind. The `)` case
+				 * a few lines into is_defer_kw already allows a control-
+				 * condition close, so handing it the real predecessor is all
+				 * that was needed. The driver never hit this because it does
+				 * not reach here; only the library entry points did. */
+				ps->p1d_prev = group_close;
 				/* if/while/for/switch condition close — not else/do body '('. */
 				if (pparse_match_ch(grp_open, '(') && pparse_ctrl_condition_kw_before_paren(grp_open)) {
 					ps->at_stmt_start = true;
