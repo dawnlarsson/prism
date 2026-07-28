@@ -535,7 +535,11 @@ enum // Feature flags
 	PPARSE_F_ORELSE = 32,
 	PPARSE_F_AUTO_UNREACHABLE = 64,
 	PPARSE_F_AUTO_STATIC = 128,
-	PPARSE_F_BOUNDS_CHECK = 256
+	PPARSE_F_BOUNDS_CHECK = 256,
+	/* Suppress Prism's own warnings. Generators that deliberately emit
+	 * thousands of the same diagnostic set this; tests that assert on a
+	 * warning leave it clear. */
+	PPARSE_F_QUIET = 512
 };
 
 struct PParseArenaBlock {

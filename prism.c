@@ -133,6 +133,7 @@ typedef struct {
 	bool zeroinit;
 	bool line_directives;
 	bool warn_safety;
+	bool quiet; /* suppress Prism's own warnings (not the backend's) */
 	bool flatten_headers;
 	bool orelse;
 	bool auto_unreachable;
@@ -482,6 +483,7 @@ PRISM_API PrismFeatures prism_defaults(void) {
 static uint32_t features_to_bits(PrismFeatures f) {
 	return (f.defer ? PPARSE_F_DEFER : 0) | (f.zeroinit ? PPARSE_F_ZEROINIT : 0) |
 	       (f.line_directives ? PPARSE_F_LINE_DIR : 0) | (f.warn_safety ? PPARSE_F_WARN_SAFETY : 0) |
+	       (f.quiet ? PPARSE_F_QUIET : 0) |
 	       (f.flatten_headers ? PPARSE_F_FLATTEN : 0) | (f.orelse ? PPARSE_F_ORELSE : 0) |
 	       (f.auto_unreachable ? PPARSE_F_AUTO_UNREACHABLE : 0) | (f.auto_static ? PPARSE_F_AUTO_STATIC : 0) |
 	       (f.bounds_check ? PPARSE_F_BOUNDS_CHECK : 0);
@@ -6495,7 +6497,8 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 		if (tag & PPARSE_TT_NORETURN_FN) {
 			uint32_t ti = pparse_idx(_pc, tok);
 			if (!(ti >= 1 && (pparse_token_pool[ti - 1].tag & PPARSE_TT_MEMBER))) {
-				if (pparse_feat(PPARSE_F_DEFER) && has_active_defers())
+				if (pparse_feat(PPARSE_F_DEFER) && has_active_defers() &&
+				    !pparse_feat(PPARSE_F_QUIET))
 					fprintf(
 					    stderr,
 					    "%s:%d: warning: '%.*s' referenced with active defers (defers "

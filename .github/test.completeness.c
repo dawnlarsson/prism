@@ -38,6 +38,12 @@ static PrismResult cm_tx(const char *src) {
 }
 
 static PrismResult cm_txf(const char *src, PrismFeatures f) {
+	/* Generators emit the same construct thousands of times, so Prism's own
+	 * warnings would bury the CI log: `sc_bulk.c` alone produces ~3,700 copies
+	 * of "referenced with active defers". Silence them here, where no cell
+	 * asserts on a warning. The defer suite, which does assert on that exact
+	 * text, uses prism_transpile_source directly and is unaffected. */
+	f.quiet = true;
 	return prism_transpile_source(src, "completeness.c", f);
 }
 
@@ -1367,6 +1373,7 @@ static void cm_gen_feature_cube(void) {
 	};
 	CmStats st = {0};
 	long cube_exec_seen = 0;
+	long cube_rejected = 0;
 	/* 2^7 = 128 feature masks (warn_safety is the 7th, absorbed from the cert
 	 * suite's -fno-safety hooks) × snips. */
 	for (unsigned mask = 0; mask < 128; mask++) {
@@ -1446,7 +1453,17 @@ static void cm_gen_feature_cube(void) {
 						 strstr(sn, "int g(void);") ? "int g(void){ return 1; }\n" : "");
 				}
 				int rc = strstr(sn, "int main(void)") ? cm_exec(sn, f) : cm_exec(prog, f);
-				if (rc <= -1000) {
+				if (rc == -1000) {
+					/* Prism refused to transpile this combination, which is a
+					 * verdict and not a failure: the accept/reject side is
+					 * what the leak checks above cover. Real example, and the
+					 * reason this branch exists: `switch (x) { int y; case 0:
+					 * ... }` with zero-init on. Prism rejects it because
+					 * initializing a declaration that sits before the first
+					 * case label is a bypass hazard. Counted so the number
+					 * stays visible rather than silently absorbed. */
+					cube_rejected++;
+				} else if (rc <= -1000) {
 					cm_note(&st, "cube mask=%u s=%zu: emitted C did not build (%d)",
 						mask, s, rc);
 				} else {
@@ -1488,8 +1505,9 @@ static void cm_gen_feature_cube(void) {
 	{
 		char nm[192];
 		snprintf(nm, sizeof(nm),
-			 "completeness[gen/feature-cube]: %ld cells, %ld bad, %ld executed%s%s",
-			 st.cells, st.bad, cube_exec_seen, st.bad ? " -- " : "",
+			 "completeness[gen/feature-cube]: %ld cells, %ld bad, %ld executed, %ld "
+			 "transpile-rejected%s%s",
+			 st.cells, st.bad, cube_exec_seen, cube_rejected, st.bad ? " -- " : "",
 			 st.bad ? st.first : "");
 		CHECK(st.bad == 0, nm);
 	}
@@ -9291,7 +9309,6 @@ static void cm_gen_lib_api(void) {
 	cm_report("gen/lib-api", &st);
 }
 
-#endif /* !_WIN32: POSIX-only executed tiers */
 
 /* ── zero-init leaves no reachable byte, per type ─────────────────────
  *
@@ -9666,6 +9683,8 @@ static void cm_gen_kw_identifier_ctx(void) {
 		}
 	cm_report("gen/kw-identifier-ctx", &st);
 }
+
+#endif /* !_WIN32: POSIX-only executed tiers */
 
 void run_completeness_open_tests(void) {
 	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");

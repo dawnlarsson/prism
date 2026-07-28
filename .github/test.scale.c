@@ -197,6 +197,10 @@ static PrismFeatures sc_features(int bounds_on) {
 	f.line_directives = false;
 	f.flatten_headers = false;
 	f.bounds_check = bounds_on != 0;
+	/* The scale corpus is thousands of generated `dieNNN()` calls with live
+	 * defers, so Prism's noreturn warning fires once per line and buries the
+	 * CI log. Nothing here asserts on a warning. */
+	f.quiet = true;
 	return f;
 }
 
