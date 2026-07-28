@@ -125,7 +125,7 @@ static void dm_build_real(const DmScope *st, int n, int kind_override) {
 		ScopeKind k = dm_real_kind(st[i].sym);
 		if (st[i].sym == DM_TRANSPARENT && kind_override >= 0) k = (ScopeKind)kind_override;
 		scope_push_kind(k);
-		ScopeNode *s = &scope_stack[pparse_ctx->scope_depth - 1];
+		ScopeNode *s = &scope_stack[emit_scope_depth - 1];
 		s->is_loop = (st[i].sym == DM_BLOCK_LOOP || st[i].sym == DM_CTRL_LOOP ||
 			      st[i].sym == DM_FOR_LOOP);
 		s->is_switch = (st[i].sym == DM_BLOCK_SWITCH || st[i].sym == DM_CTRL_SWITCH);
@@ -135,8 +135,8 @@ static void dm_build_real(const DmScope *st, int n, int kind_override) {
 }
 
 static void dm_teardown_real(void) {
-	pparse_ctx->scope_depth = 0;
-	pparse_ctx->block_depth = 0;
+	emit_scope_depth = 0;
+	emit_block_depth = 0;
 	defer_count = 0;
 	out_buf_pos = 0;
 }

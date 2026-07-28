@@ -271,21 +271,17 @@ static void test_swar_comment_buffer_safety(void) {
 	CHECK_EQ(r.status, PRISM_OK, "swar block comment: transpiles OK");
 	prism_free(&r);
 
-	/* File-based: page-boundary-aligned file ending in a comment */
+	/* Page-boundary-sized heap buffer ending in a comment. */
 	char big[4096 + 1];
 	memset(big, ' ', sizeof(big) - 1);
 	/* Place a line comment near the end so SWAR scans up to the boundary */
 	memcpy(big + 4080, "// end comment", 14);
 	big[4094] = '\n';
 	big[4095] = '\0';
-	char *path = create_temp_file(big);
-	if (path) {
-		PParseToken *tok = pparse_tokenize_file(path);
-		CHECK(tok != NULL, "swar page boundary: tokenizes OK");
-		pparse_tokenizer_teardown(false);
-		unlink(path);
-		free(path);
-	}
+	char *page = strdup(big);
+	PParseToken *tok = pparse_tokenize_buffer("swar_page_boundary.c", page);
+	CHECK(tok != NULL, "swar page boundary: tokenizes OK");
+	pparse_tokenizer_teardown(false);
 }
 
 static void test_preprocess_swar_padding_boundary(void) {

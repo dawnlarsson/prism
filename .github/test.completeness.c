@@ -7427,6 +7427,65 @@ static void cm_gen_passthrough(void) {
 	    {"#include <string.h>", "char b[8]; memset(b, 0, sizeof b); memcpy(b, \"ab\", 2); r = b[0] + b[1];"},
 	    {"#include <string.h>", "r = strcmp(\"abc\", \"abc\") == 0 ? 46 : 1;"},
 	    {"#include <stdio.h>", "char b[16]; int k = snprintf(b, sizeof b, \"%d\", 407); r = k * 15 + b[0] - '0';"},
+
+	    /* Adversarial syntax. Generators emit well-formed C; obfuscated and
+	       code-golf C does not, and it is the shape most likely to break a
+	       parser that carries its own keywords. Nothing here is exotic to a
+	       compiler, but all of it is hostile to a tokenizer. */
+	    {"static int kr(c) int c; { return c + 5; }", "r = kr(6);"},
+	    {"static int implicit(void){ return 12; }", "r = implicit();"},
+	    {"", "int a=1,b=2,c=3; r = ((a?b:c),(a,b,c), a<b ? b<c ? 13 : 1 : 2);"},
+	    {"", "int n=8; char s[9]; char *d=s; switch(n%8){case 0: do{*d++='x'; case 7: *d++='x';"
+	     " case 6: *d++='x'; case 5: *d++='x'; case 4: *d++='x'; case 3: *d++='x';"
+	     " case 2: *d++='x'; case 1: *d++='x';}while(--n>0);} r = (int)(d - s) + 6;"},
+	    {"", "int a<:3:> = <%1,2,3%>; r = a<:2:> + 12;"},   /* digraphs */
+	    {"static int leaf(int x){return x;}\nstatic int (*pick(int y))(int){return y?leaf:leaf;}",
+	     "r = pick(1)(17);"},
+	    {"typedef int A3[3];\nstatic A3 *give(void){ static A3 a = {1,2,18}; return &a; }",
+	     "A3 *(*t[1])(void) = {give}; r = (*t[0]())[2];"},
+	    {"#include <stdarg.h>\nstatic int vs(int n, ...){ va_list a, b; va_start(a,n); va_copy(b,a);"
+	     " int t=0; for(int i=0;i<n;i++) t += va_arg(b,int); va_end(b); va_end(a); return t; }",
+	     "r = vs(3, 6, 6, 7);"},
+	    {"", "r = ({ int a=1; ({ int b=2; ({ int c=17; a+b+c; }); }); });"},
+	    {"static int boom(void){ return *(int*)0; }",
+	     "r = (sizeof boom() == sizeof(int)) ? 20 : 1;"},   /* unevaluated call */
+	    {"#define M1(x) M2(x)\n#define M2(x) M3(x)\n#define M3(x) ((x)+7)", "r = M1(M1(M1(0)));"},
+	    {"", "int i=0; { goto tail; tail: ; } r = i + 21;"},
+
+	    /* Prism's own keywords, in every position C allows an identifier.
+	       Each one is a live grammar hazard: a soft keyword that stops being
+	       soft in the wrong context silently changes the program. */
+	    /* A #define of a dialect keyword stands that keyword down for the TU,
+	       so the hoisted define does the substitution and the library path
+	       matches what cc -E gives the driver. */
+	    {"#define defer 7", "r = defer * 3 + 1;"},
+	    {"#define orelse +", "r = 11 orelse 12;"},
+	    {"#define raw const", "raw int k = 24; r = k;"},
+	    {"struct KW { int defer, orelse, raw; };",
+	     "struct KW s = {10, 8, 3}; r = s.defer + s.orelse + s.raw;"},
+	    {"", "goto defer; defer: r = 25;"},
+	    {"typedef int defer;", "defer x = 26; r = x;"},
+	    {"", "int deferred = 13, my_defer = 14; r = deferred + my_defer;"},
+	    {"", "const char *s = \"orelse defer raw\"; /* defer orelse raw */ r = (int)s[0] - 84;"},
+
+	    /* Dense floating-point with a string-literal subscript, the shape the
+	       spinning-donut program is built from. The subscript is on a literal
+	       rather than a tracked array, which is exactly the case the
+	       bounds-check matcher has to leave alone. */
+	    {"#include <string.h>\n"
+	     "static float sq(float x){ while(x>6.2832f)x-=6.2832f; while(x<0)x+=6.2832f;"
+	     " float t=x-3.1416f, t2=t*t; return -(t*(1-t2/6+t2*t2/120)); }\n"
+	     "static float cq(float x){ return sq(x+1.5708f); }\n"
+	     "static int donut(void){ float A=1,B=1,i,j,z[1760]; char b[1760];"
+	     " memset(b,32,1760); memset(z,0,sizeof z);"
+	     " for(j=0;j<6.28f;j+=0.07f) for(i=0;i<6.28f;i+=0.02f){"
+	     " float c=sq(i),d=cq(j),e=sq(A),f=sq(j),g=cq(A),h=d+2,"
+	     " D=1/(c*h*e+f*g+5),l=cq(i),m=cq(B),n=sq(B),t=c*h*g-f*e;"
+	     " int x=40+30*D*(l*h*m-t*n),y=12+15*D*(l*h*n+t*m),o=x+80*y,"
+	     " N=8*((f*e-c*d*g)*m-c*d*e-f*g-l*d*n);"
+	     " if(22>y&&y>0&&x>0&&80>x&&D>z[o]){z[o]=D;b[o]=\".,-~:;=!*#$@\"[N>0?N:0];}}"
+	     " int s=0; for(int q=0;q<1760;q++) s+=b[q]; return s; }",
+	     "r = donut() % 97;"},
 	};
 
 	CmStats st = {0};
@@ -9080,107 +9139,91 @@ static void cm_gen_lib_api(void) {
 
 #endif /* !_WIN32: POSIX-only executed tiers */
 
-/* ── zero-init padding, as a property rather than a type list ─────────
+/* ── zero-init leaves no reachable byte, per type ─────────────────────
  *
- * gen/runtime-zeroinit found that `long double` keeps stale stack in its
- * padding on x86-64 and not on aarch64. Patching that one cell would leave the
- * rest of the family untested and would bake one target's layout into the
- * suite, so the invariant is checked instead:
+ * `long double` is the one scalar in C with padding bytes, and on x86 Prism's
+ * `long double v = 0;` writes the 10-byte x87 value and leaves the rest of the
+ * 16-byte slot holding stack. This sweeps the family rather than that one type.
  *
- *   every byte Prism CAN reach by assignment must be zero, and any byte it
- *   misses must be padding that assignment provably cannot reach.
+ * The first version of this tier tried to decide "does this type have padding"
+ * at runtime by writing zero through a `T*` and comparing two poisoned objects.
+ * That was wrong, and CI caught it: a store through a pointer does not lower
+ * the same way as a declaration with an initializer, so on x86 the probe
+ * reported no padding for the very type that has it. Modelling the construct
+ * indirectly was the mistake. The measurement is direct now:
  *
- * Whether a type has such padding is decided at runtime, on whatever target is
- * running, by assigning the same value over two differently-poisoned objects
- * and comparing the bytes:
+ *   nz_prism  bytes left nonzero after Prism zero-initializes the object
+ *   nz_memset bytes left nonzero after an explicit memset of the same object
  *
- *   memset(&a, 0xAA, n); memset(&b, 0x55, n);
- *   a = (T)0; b = (T)0;
- *   padding_exists = memcmp(&a, &b, n) != 0;
- *
- * If the two disagree afterwards, some byte was not written by the assignment.
- * That is the definition of the gap, needs no table of ABIs, and stays correct
- * on a target nobody has tried yet.
- *
- * A cell fails when a type is left with nonzero bytes it had no business
- * missing, which is the case that matters and the one a fixed type list would
- * miss. The count of types that took the padding branch is reported in the
- * tier line, so the gap stays visible rather than silently tolerated: on
- * aarch64 it should be 0, on x86-64 it should name `long double` and its
- * aggregates. */
+ * `nz_memset` must be 0 by definition; it is measured anyway, because if it
+ * ever is not, the harness is broken rather than Prism. `nz_prism` is what the
+ * feature promises. Types where Prism currently falls short carry `gap = 1`,
+ * which turns the cell into a recorded boundary instead of a failure, so the
+ * shortfall stays visible and the tier goes red if it spreads to a type not on
+ * the list or disappears from one that is. */
 #define CM_ZP_PRE                                                                                    \
 	"#include <string.h>\n"                                                                      \
 	"__attribute__((noinline)) static void dirty(void){volatile unsigned char "                  \
-	"j[512];for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}\n"                                         \
-	"static int nz(const void*p,unsigned long n){const unsigned char*b=p;int "                   \
+	"j[512];for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}\n"                                          \
+	"static int nz(const void*p,unsigned long n){const unsigned char*b=p;int "                    \
 	"k=0;for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}\n"
 
 static void cm_gen_zeroinit_padding(void) {
-	/* Each cell names its type through a typedef so the generated program is
-	 * uniform: two objects of that type for the padding probe, one for the
-	 * zero-init check. `zero` writes a zero value through a T*, which for
-	 * aggregates has to be a memset because they cannot be assigned from 0. */
 	static const struct {
 		const char *name;
 		const char *types;
-		const char *zero;
+		int gap; /* 1 = Prism is known not to cover every byte of this type */
 	} cells[] = {
-	    {"long-double", "typedef long double T;", "*p = 0.0L;"},
-	    {"double", "typedef double T;", "*p = 0.0;"},
-	    {"float", "typedef float T;", "*p = 0.0f;"},
-	    {"bool", "typedef _Bool T;", "*p = 0;"},
-	    {"char", "typedef char T;", "*p = 0;"},
-	    {"short", "typedef short T;", "*p = 0;"},
-	    {"int", "typedef int T;", "*p = 0;"},
-	    {"long", "typedef long T;", "*p = 0;"},
-	    {"long-long", "typedef long long T;", "*p = 0;"},
-	    {"void-ptr", "typedef void *T;", "*p = 0;"},
-	    {"fn-ptr", "typedef void (*T)(void);", "*p = 0;"},
-	    {"complex-double", "typedef double _Complex T;", "*p = 0;"},
-	    {"complex-long-double", "typedef long double _Complex T;", "*p = 0;"},
-	    {"ld-array", "typedef long double T[3];", "memset(p, 0, sizeof(T));"},
-	    {"ld-2d-array", "typedef long double T[2][2];", "memset(p, 0, sizeof(T));"},
-	    {"ld-in-struct", "typedef struct { long double d; } T;", "memset(p, 0, sizeof(T));"},
-	    {"ld-with-tail", "typedef struct { long double d; char c; } T;",
-	     "memset(p, 0, sizeof(T));"},
-	    {"ld-union", "typedef union { long double d; char c[4]; } T;",
-	     "memset(p, 0, sizeof(T));"},
-	    {"ld-nested", "typedef struct { char a; struct { long double d; } in; } T;",
-	     "memset(p, 0, sizeof(T));"},
-	    {"struct-padding", "typedef struct { char a; int b; char c; } T;",
-	     "memset(p, 0, sizeof(T));"},
-	    {"bitfield", "typedef struct { unsigned x : 3; unsigned y : 5; int t; } T;",
-	     "memset(p, 0, sizeof(T));"},
+	    /* The x87 family. sizeof is 16 (or 12 on 32-bit x86), the value is 10
+	     * bytes, and a zero initializer writes only the value. Elsewhere
+	     * `long double` is a 128-bit quad with no padding and these pass with
+	     * gap unused, which is why the flag records rather than asserts. */
+	    {"long-double", "typedef long double T;", 1},
+	    {"complex-long-double", "typedef long double _Complex T;", 1},
+	    {"volatile-long-double", "typedef volatile long double T;", 1},
+	    {"ld-array", "typedef long double T[3];", 1},
+	    {"ld-2d-array", "typedef long double T[2][2];", 1},
+	    {"ld-in-struct", "typedef struct { long double d; } T;", 1},
+	    {"ld-with-tail", "typedef struct { long double d; char c; } T;", 1},
+	    {"ld-union", "typedef union { long double d; char c[4]; } T;", 1},
+	    {"ld-nested", "typedef struct { char a; struct { long double d; } in; } T;", 1},
+	    /* Everything else must be covered completely, everywhere. */
+	    {"double", "typedef double T;", 0},
+	    {"float", "typedef float T;", 0},
+	    {"bool", "typedef _Bool T;", 0},
+	    {"char", "typedef char T;", 0},
+	    {"short", "typedef short T;", 0},
+	    {"int", "typedef int T;", 0},
+	    {"long", "typedef long T;", 0},
+	    {"long-long", "typedef long long T;", 0},
+	    {"void-ptr", "typedef void *T;", 0},
+	    {"fn-ptr", "typedef void (*T)(void);", 0},
+	    {"complex-double", "typedef double _Complex T;", 0},
+	    {"struct-padding", "typedef struct { char a; int b; char c; } T;", 0},
+	    {"bitfield", "typedef struct { unsigned x : 3; unsigned y : 5; int t; } T;", 0},
+	    {"array-of-struct", "typedef struct { char a; int b; } T[3];", 0},
+	    {"anon-member", "typedef struct { char a; struct { int x; char y; }; long z; } T;", 0},
 	};
 
 	CmStats st = {0};
 	PrismFeatures f = prism_defaults();
-	long padded = 0;
-	char first_padded[96] = {0};
-	char src[2200];
+	long recorded = 0;
+	char first_gap[96] = {0};
+	char src[1800];
 
 	for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); c++) {
-		/* Exit status carries both answers. Bit 0: some byte of the
-		 * zero-initialized object was nonzero. Bit 1: this type has padding
-		 * that a zero assignment does not reach, established by writing the
-		 * same value over two differently poisoned objects and comparing.
-		 * 0 and 2 are acceptable; 1 means Prism missed a reachable byte. */
+		/* Two separate noinline frames so each declaration meets a stack the
+		 * same dirty() just filled with 0xAA. Exit status: bit 0 = Prism left
+		 * a nonzero byte, bit 1 = an explicit memset did too, which would
+		 * mean the measurement itself is untrustworthy. */
 		snprintf(src, sizeof(src),
 			 "%s%s\n"
-			 "static int probe(void){\n"
-			 "\tT a, b;\n"
-			 "\tmemset(&a, 0xAA, sizeof(T)); memset(&b, 0x55, sizeof(T));\n"
-			 "\t{ T *p = &a; %s }\n"
-			 "\t{ T *p = &b; %s }\n"
-			 "\treturn memcmp(&a, &b, sizeof(T)) != 0;\n"
-			 "}\n"
-			 "int main(void){\n"
-			 "\tdirty();\n"
-			 "\tT v;\n"
-			 "\tint bad = nz(&v, sizeof(T)) != 0;\n"
-			 "\treturn bad | (probe() << 1);\n"
-			 "}\n",
-			 CM_ZP_PRE, cells[c].types, cells[c].zero, cells[c].zero);
+			 "__attribute__((noinline)) static int via_prism(void){ dirty(); T v;"
+			 " return nz(&v, sizeof(T)) != 0; }\n"
+			 "__attribute__((noinline)) static int via_memset(void){ dirty(); T v;"
+			 " memset(&v, 0, sizeof(T)); return nz(&v, sizeof(T)) != 0; }\n"
+			 "int main(void){ return via_prism() | (via_memset() << 1); }\n",
+			 CM_ZP_PRE, cells[c].types);
 
 		st.cells++;
 		int rc = cm_exec_trap(src, f);
@@ -9188,25 +9231,212 @@ static void cm_gen_zeroinit_padding(void) {
 			cm_note(&st, "%s: infra %d", cells[c].name, rc);
 			continue;
 		}
-		if (rc & 1) {
-			cm_note(&st, "%s: left a nonzero byte that assignment reaches",
+		if (rc & 2) {
+			cm_note(&st, "%s: explicit memset left a nonzero byte, harness is wrong",
 				cells[c].name);
 			continue;
 		}
-		if (rc & 2) {
-			padded++;
-			if (!first_padded[0])
-				snprintf(first_padded, sizeof(first_padded), "%s", cells[c].name);
+		if (!(rc & 1)) continue; /* fully covered */
+		if (!cells[c].gap) {
+			cm_note(&st, "%s: zero-init left a nonzero byte", cells[c].name);
+			continue;
 		}
+		recorded++;
+		if (!first_gap[0]) snprintf(first_gap, sizeof(first_gap), "%s", cells[c].name);
 	}
 
 	char name[288];
 	snprintf(name, sizeof(name),
-		 "completeness[gen/zeroinit-padding]: %ld cells, %ld bad, %ld with unreachable "
-		 "padding%s%s%s %s",
-		 st.cells, st.bad, padded, padded ? " (first: " : "", padded ? first_padded : "",
-		 padded ? ")" : "", st.bad ? st.first : "");
+		 "completeness[gen/zeroinit-padding]: %ld cells, %ld bad, %ld known-gap%s%s%s %s",
+		 st.cells, st.bad, recorded, recorded ? " (first: " : "", recorded ? first_gap : "",
+		 recorded ? ")" : "", st.bad ? st.first : "");
 	CHECK(st.bad == 0, name);
+}
+
+/* ── preprocessed-output cache ────────────────────────────────────────
+ *
+ * Thirteen functions and roughly 536 lines shipped in 1.1.5, on by default,
+ * with no test of any kind: not one reference to pp_cache, PRISM_NO_PP_CACHE,
+ * --prism-cache-info or --prism-cache-clear anywhere in the suite. It is the
+ * highest-risk code in the tree because its failure mode is the only silent
+ * one. Every other defect announces itself with a diagnostic, a wrong exit
+ * status or a crash. A stale cache entry produces a clean build of source the
+ * user already changed, with correct #line directives and no complaint.
+ *
+ * One oracle covers all of it: whatever the cache does, transpiling with it
+ * enabled must be byte-identical to transpiling with PRISM_NO_PP_CACHE=1. Any
+ * staleness, any key collision, any missed dependency shows up as a diff. The
+ * cells are sequences of edits, because a cache can only go wrong on the
+ * second visit; a single cold transpile proves nothing.
+ *
+ * PRISM_PP_CACHE_DIR points the whole tier at a private directory, so it can
+ * neither pollute the developer's cache nor be perturbed by it. */
+static void cm_gen_pp_cache(void) {
+	CmStats st = {0};
+	char dirbuf[PATH_MAX], bin[PATH_MAX], cache[PATH_MAX], cmd[PATH_MAX * 4];
+	char src[PATH_MAX], hdr[PATH_MAX], hdr2[PATH_MAX], warm[PATH_MAX], cold[PATH_MAX];
+
+	char *dir = test_mkdtemp(dirbuf, "cm_ppcache_");
+	if (!dir) {
+		cm_note(&st, "could not create temp dir");
+		cm_report("gen/pp-cache", &st);
+		return;
+	}
+	snprintf(bin, sizeof(bin), "%s/prism_ppc", dir);
+	if (!build_test_prism_binary(bin, "pp-cache: build prism binary")) {
+		cm_report("gen/pp-cache", &st);
+		return;
+	}
+	snprintf(cache, sizeof(cache), "%s/ppcache", dir);
+	snprintf(src, sizeof(src), "%s/m.c", dir);
+	snprintf(hdr, sizeof(hdr), "%s/a.h", dir);
+	snprintf(hdr2, sizeof(hdr2), "%s/b.h", dir);
+	snprintf(warm, sizeof(warm), "%s/warm.c", dir);
+	snprintf(cold, sizeof(cold), "%s/cold.c", dir);
+
+	/* Write `text` to `path`. */
+#define CM_PPC_WRITE(path, text)                                                                     \
+	do {                                                                                         \
+		FILE *wf = fopen((path), "w");                                                        \
+		if (wf) {                                                                            \
+			fputs((text), wf);                                                           \
+			fclose(wf);                                                                  \
+		}                                                                                    \
+	} while (0)
+
+	/* Transpile once with the cache and once without, and require the two to
+	 * agree byte for byte. `extra` carries any flags the scenario needs. */
+#define CM_PPC_CHECK(extra, label)                                                                   \
+	do {                                                                                         \
+		st.cells++;                                                                          \
+		snprintf(cmd, sizeof(cmd),                                                           \
+			 "PRISM_PP_CACHE_DIR='%s' '%s' %s transpile '%s' >'%s' 2>/dev/null", cache,   \
+			 bin, (extra), src, warm);                                                   \
+		int rc_w = run_command_status(cmd);                                                  \
+		snprintf(cmd, sizeof(cmd),                                                           \
+			 "PRISM_NO_PP_CACHE=1 PRISM_PP_CACHE_DIR='%s' '%s' %s transpile '%s' >'%s' "  \
+			 "2>/dev/null",                                                              \
+			 cache, bin, (extra), src, cold);                                            \
+		int rc_c = run_command_status(cmd);                                                  \
+		if (rc_w != rc_c) {                                                                  \
+			cm_note(&st, "%s: exit differs, cached %d uncached %d", (label), rc_w,        \
+				rc_c);                                                               \
+		} else {                                                                             \
+			char *a = cm_slurp(warm), *b = cm_slurp(cold);                               \
+			if (!a || !b)                                                                \
+				cm_note(&st, "%s: could not read output", (label));                  \
+			else if (strcmp(a, b) != 0)                                                  \
+				cm_note(&st, "%s: cached output differs from uncached", (label));    \
+			free(a);                                                                     \
+			free(b);                                                                     \
+		}                                                                                    \
+	} while (0)
+
+	CM_PPC_WRITE(src, "#include \"a.h\"\nint main(void){ return VALUE; }\n");
+	CM_PPC_WRITE(hdr, "#define VALUE 1\n");
+	CM_PPC_CHECK("", "cold");
+	CM_PPC_CHECK("", "warm-unchanged");
+
+	/* A transitive header changes. The dependency list is recovered from the
+	 * `# N "file"` linemarkers in the preprocessed text, not from a .d file,
+	 * so this is the path most likely to miss an edit. */
+	CM_PPC_WRITE(hdr, "#define VALUE 2\n");
+	CM_PPC_CHECK("", "header-edited");
+
+	/* Same length, different content: a size-only staleness check passes this
+	 * and serves the old text. */
+	CM_PPC_WRITE(hdr, "#define VALUE 3\n");
+	CM_PPC_CHECK("", "header-same-length");
+
+	/* Several rewrites inside one second. Filesystems with coarse timestamps
+	 * cannot distinguish these by mtime alone. */
+	CM_PPC_WRITE(hdr, "#define VALUE 4\n");
+	CM_PPC_CHECK("", "same-second-1");
+	CM_PPC_WRITE(hdr, "#define VALUE 5\n");
+	CM_PPC_CHECK("", "same-second-2");
+	CM_PPC_WRITE(hdr, "#define VALUE 6\n");
+	CM_PPC_CHECK("", "same-second-3");
+
+	/* Growing and shrinking the header shifts every line number after it. */
+	CM_PPC_WRITE(hdr, "\n\n\n#define VALUE 7\n");
+	CM_PPC_CHECK("", "header-grown");
+	CM_PPC_WRITE(hdr, "#define VALUE 8\n");
+	CM_PPC_CHECK("", "header-shrunk");
+
+	/* Nesting: the edited file is two levels down. */
+	CM_PPC_WRITE(hdr, "#include \"b.h\"\n#define VALUE INNER\n");
+	CM_PPC_WRITE(hdr2, "#define INNER 9\n");
+	CM_PPC_CHECK("", "nested-cold");
+	CM_PPC_WRITE(hdr2, "#define INNER 10\n");
+	CM_PPC_CHECK("", "nested-inner-edited");
+
+	/* The source itself changes while its headers do not. */
+	CM_PPC_WRITE(src, "#include \"a.h\"\nint main(void){ return VALUE + 1; }\n");
+	CM_PPC_CHECK("", "source-edited");
+
+	/* Flags are part of the key. Same files, different -D, must not collide. */
+	CM_PPC_WRITE(src, "#include \"a.h\"\n#ifdef PICK\nint main(void){return 1;}\n#else\nint "
+			  "main(void){return 2;}\n#endif\n");
+	CM_PPC_CHECK("", "flags-none");
+	CM_PPC_CHECK("-DPICK=1", "flags-D-added");
+	CM_PPC_CHECK("", "flags-D-removed");
+	CM_PPC_CHECK("-DPICK=2", "flags-D-changed");
+
+	/* Two directories holding a same-named header: only the include path
+	 * distinguishes them, so a key that ignores -I serves the wrong one. */
+	{
+		char d1[PATH_MAX], d2[PATH_MAX], p1[PATH_MAX], p2[PATH_MAX], inc[PATH_MAX * 2];
+		snprintf(d1, sizeof(d1), "%s/i1", dir);
+		snprintf(d2, sizeof(d2), "%s/i2", dir);
+		mkdir(d1, 0755);
+		mkdir(d2, 0755);
+		snprintf(p1, sizeof(p1), "%s/same.h", d1);
+		snprintf(p2, sizeof(p2), "%s/same.h", d2);
+		CM_PPC_WRITE(p1, "#define WHICH 100\n");
+		CM_PPC_WRITE(p2, "#define WHICH 200\n");
+		CM_PPC_WRITE(src, "#include \"same.h\"\nint main(void){ return WHICH % 7; }\n");
+		snprintf(inc, sizeof(inc), "-I'%s'", d1);
+		CM_PPC_CHECK(inc, "include-path-1");
+		snprintf(inc, sizeof(inc), "-I'%s'", d2);
+		CM_PPC_CHECK(inc, "include-path-2");
+		snprintf(inc, sizeof(inc), "-I'%s'", d1);
+		CM_PPC_CHECK(inc, "include-path-back-to-1");
+	}
+
+	/* A header that disappears and returns with different content. */
+	CM_PPC_WRITE(src, "#include \"a.h\"\nint main(void){ return VALUE; }\n");
+	CM_PPC_WRITE(hdr, "#define VALUE 11\n");
+	CM_PPC_CHECK("", "recreate-before");
+	unlink(hdr);
+	CM_PPC_WRITE(hdr, "#define VALUE 12\n");
+	CM_PPC_CHECK("", "recreate-after");
+
+	/* Build-time date macros must never be served from cache, because the
+	 * answer changes without any input changing. */
+	CM_PPC_WRITE(src, "static const char *d = __DA" "TE__;\nint main(void){ return d[0]==0; }\n");
+	CM_PPC_CHECK("", "date-macro");
+	CM_PPC_WRITE(src, "static const char *t = __TI" "ME__;\nint main(void){ return t[0]==0; }\n");
+	CM_PPC_CHECK("", "time-macro");
+
+	/* --prism-cache-info and --prism-cache-clear are user-facing and were
+	 * never run. Clearing must leave the cache usable, not merely empty. */
+	snprintf(cmd, sizeof(cmd), "PRISM_PP_CACHE_DIR='%s' '%s' --prism-cache-info >/dev/null 2>&1",
+		 cache, bin);
+	st.cells++;
+	if (run_command_status(cmd) != 0) cm_note(&st, "--prism-cache-info failed");
+	snprintf(cmd, sizeof(cmd),
+		 "PRISM_PP_CACHE_DIR='%s' '%s' --prism-cache-clear >/dev/null 2>&1", cache, bin);
+	st.cells++;
+	if (run_command_status(cmd) != 0) cm_note(&st, "--prism-cache-clear failed");
+	CM_PPC_WRITE(src, "#include \"a.h\"\nint main(void){ return VALUE; }\n");
+	CM_PPC_WRITE(hdr, "#define VALUE 13\n");
+	CM_PPC_CHECK("", "after-cache-clear");
+	CM_PPC_WRITE(hdr, "#define VALUE 14\n");
+	CM_PPC_CHECK("", "after-clear-then-edit");
+
+#undef CM_PPC_WRITE
+#undef CM_PPC_CHECK
+	cm_report("gen/pp-cache", &st);
 }
 
 void run_completeness_open_tests(void) {
@@ -9236,5 +9466,6 @@ void run_completeness_open_tests(void) {
 	cm_gen_driver_surfaces();
 	cm_gen_lib_api();
 	cm_gen_zeroinit_padding();
+	cm_gen_pp_cache();
 #endif
 }

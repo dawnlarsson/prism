@@ -69,9 +69,24 @@ c23done:
 	log_append("E");
 }
 
+static void _noise_goto_same_scope_helper(void) {
+	log_reset();
+	{
+		defer log_append("D");
+		log_append("B");
+		goto _Pragma("GCC diagnostic push") same_scope;
+		log_append("X");
+	same_scope:
+		_Pragma("GCC diagnostic pop")
+		log_append("E");
+	}
+}
+
 void test_defer_goto_c23_attr(void) {
 	_c23_attr_goto_helper();
 	CHECK_LOG("D2D1E", "defer goto with C23 attr on func");
+	_noise_goto_same_scope_helper();
+	CHECK_LOG("BED", "pragma-separated same-scope goto defers exactly once at scope exit");
 }
 #endif
 
