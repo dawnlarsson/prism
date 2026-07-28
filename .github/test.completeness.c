@@ -66,6 +66,12 @@ static void cm_report(const char *tier, CmStats *st) {
 	CHECK(st->bad == 0, name);
 }
 
+/* Forward decls for helpers used by tiers defined earlier than they are. */
+static int cm_already_ran(const char *out);
+static int cm_run_plain(const char *code);
+static int cm_exec(const char *src, PrismFeatures feat);
+static int cm_exec_matches_plain(const char *src, PrismFeatures f);
+
 /* Forward decls for tiers defined later in this file. */
 static void cm_gen_soft_ident(void);
 static void cm_gen_orelse_actions(void);
@@ -1360,6 +1366,7 @@ static void cm_gen_feature_cube(void) {
 		"const int k[2]={1,2}; (void)y; (void)x; (void)k; return 0; }",
 	};
 	CmStats st = {0};
+	long cube_exec_seen = 0;
 	/* 2^7 = 128 feature masks (warn_safety is the 7th, absorbed from the cert
 	 * suite's -fno-safety hooks) × snips. */
 	for (unsigned mask = 0; mask < 128; mask++) {
@@ -1373,6 +1380,82 @@ static void cm_gen_feature_cube(void) {
 		f.warn_safety = (mask >> 6) & 1;
 		for (size_t s = 0; s < sizeof(snips) / sizeof(snips[0]); s++) {
 			st.cells++;
+			/* Execute, do not just inspect the text. Every snippet is a
+			 * complete program, so the behaviour Prism produces must match
+			 * what plain cc produces from the same source: a feature that is
+			 * off must change nothing, and one that is on must not change an
+			 * answer the snippet did not ask it to change.
+			 *
+			 * Every runnable cell runs, every time. A suite that samples is
+			 * not certifying the cells it skipped, and a stride hides exactly
+			 * the combination nobody thought to check. The cost is wall
+			 * clock, which is the cheapest thing here to spend. */
+			/* No cm_already_ran here: it dedupes on source text, and the
+			 * source is identical across all 128 masks. The feature mask is
+			 * what varies, so deduping would collapse the sweep to one cell. */
+			/* A snippet whose feature is switched off keeps the keyword as a
+			 * plain identifier, so the emitted C is not meant to build. The
+			 * leak checks above already cover that direction; only the
+			 * feature-on cells have a program to run. */
+			bool runnable = (!strstr(snips[s], "defer") || f.defer) &&
+					(!strstr(snips[s], "orelse") || f.orelse) &&
+					/* `raw { … }` is a documented suppress region: nothing
+					 * inside it is lowered, so the keyword reaches the
+					 * backend and the output is not meant to build. */
+					!strstr(snips[s], "raw {");
+			if (runnable) {
+				/* Plain cc cannot be the reference here: the snippets use
+				 * defer and orelse, so the untransformed source does not
+				 * build and every cell would be skipped. Every snippet ends
+				 * in `return 0`, so the check is that the emitted program
+				 * builds and exits 0 under this feature mask. That is what
+				 * the leak checks above cannot see: text can look right and
+				 * the program still misbehave. */
+				/* The snippets are fragments: `void f(void){...}` with
+				 * `cleanup` and `g` declared but never defined, and no main.
+				 * Supply exactly the definitions this snippet declared, plus
+				 * a main that calls f, so the cell links and runs. */
+				char prog[1400];
+				const char *sn = snips[s];
+				snprintf(prog, sizeof(prog),
+					 "%s\n%s%s%sint main(void){ %sreturn 0; }\n", sn,
+					 strstr(sn, "void cleanup(void);") ? "void cleanup(void){}\n" : "",
+					 strstr(sn, "int *g(void);") ? "int *g(void){ static int v; return &v; }\n"
+								    : "",
+					 strstr(sn, "int g(void);") ? "int g(void){ return 1; }\n" : "",
+					 strstr(sn, "void f(void)") ? "" : "");
+				/* `die` is declared _Noreturn and never defined; supply one
+				 * that really does not return, and do not call f() for those
+				 * cells or the program exits non-zero by design. */
+				if (strstr(sn, "die(void);")) {
+					size_t L = strlen(prog);
+					snprintf(prog + L, sizeof(prog) - L, "%s", "");
+					snprintf(prog, sizeof(prog),
+						 "%s\n_Noreturn void die(void){ _Exit(0); }\n"
+						 "#include <stdlib.h>\nint main(void){ return 0; }\n",
+						 sn);
+				} else if (strstr(sn, "void f(void)")) {
+					size_t L = strlen(prog);
+					(void)L;
+					snprintf(prog, sizeof(prog),
+						 "%s\n%s%s%sint main(void){ f(); return 0; }\n", sn,
+						 strstr(sn, "void cleanup(void);") ? "void cleanup(void){}\n" : "",
+						 strstr(sn, "int *g(void);")
+						     ? "int *g(void){ static int v; return &v; }\n"
+						     : "",
+						 strstr(sn, "int g(void);") ? "int g(void){ return 1; }\n" : "");
+				}
+				int rc = strstr(sn, "int main(void)") ? cm_exec(sn, f) : cm_exec(prog, f);
+				if (rc <= -1000) {
+					cm_note(&st, "cube mask=%u s=%zu: emitted C did not build (%d)",
+						mask, s, rc);
+				} else {
+					cube_exec_seen++;
+					if (rc != 0)
+						cm_note(&st, "cube mask=%u s=%zu: exited %d, expected 0",
+							mask, s, rc);
+				}
+			}
 			PrismResult r = cm_txf(snips[s], f);
 			if (!r.output && r.status == PRISM_OK) {
 				cm_note(&st, "cube null out mask=%u s=%zu", mask, s);
@@ -1402,7 +1485,14 @@ static void cm_gen_feature_cube(void) {
 			prism_free(&r);
 		}
 	}
-	cm_report("gen/feature-cube", &st);
+	{
+		char nm[192];
+		snprintf(nm, sizeof(nm),
+			 "completeness[gen/feature-cube]: %ld cells, %ld bad, %ld executed%s%s",
+			 st.cells, st.bad, cube_exec_seen, st.bad ? " -- " : "",
+			 st.bad ? st.first : "");
+		CHECK(st.bad == 0, nm);
+	}
 }
 
 #ifndef _WIN32
@@ -1579,6 +1669,7 @@ static void cm_strip_raw(const char *src, char *out, size_t cap) {
 }
 
 static void cm_gen_raw_product(void) {
+	long raw_exec_seen = 0;
 	/* Declaration shapes: type specifier + declarator.  `n` is a parameter,
 	 * so the VLA row is the only variably-modified cell and nothing else in
 	 * the TU is a zero-init candidate — which is what makes O2 exact. */
@@ -1794,6 +1885,44 @@ static void cm_gen_raw_product(void) {
 							cm_note(&st,
 								"raw on a function definition is not a no-op f=%zu b=%zu q=%zu",
 								f, b, q);
+						else {
+							/* The text already matched; run both arms and
+							 * require the same behaviour too. Identical
+							 * output makes that redundant in principle and
+							 * not in practice: cx_norm_equal normalises
+							 * whitespace, so a difference it forgives could
+							 * still change the program. Cheap insurance on a
+							 * differential that failed 32 of 229 cells the
+							 * first time it was pointed at anything.
+							 *
+							 * A cell whose arms will not build is gated, not
+							 * failed: these are fragments and many have no
+							 * main and no definitions for what they declare,
+							 * which says nothing about raw. */
+							/* Every cell declares `void rp_h(void);` and
+							 * names its function `rp_fn`, and the decls are
+							 * self-contained, so a definition for rp_h plus a
+							 * main that calls rp_fn makes the cell link and
+							 * actually execute the generated body. rp_fn is
+							 * cast through (void) because its return type
+							 * varies across the fns table. */
+							static const char *tailfmt =
+							    "%s\nvoid rp_h(void){}\n"
+							    "int main(void){ (void)0; rp_fn(); return 0; }\n";
+							char pa[3000], pb[3000];
+							snprintf(pa, sizeof(pa), tailfmt, fsrc);
+							snprintf(pb, sizeof(pb), tailfmt, fref);
+							int xa = cm_exec(pa, prism_defaults());
+							int xb = cm_exec(pb, prism_defaults());
+							if (xa <= -1000 || xb <= -1000) gated++;
+							else {
+								raw_exec_seen++;
+								if (xa != xb)
+									cm_note(&st,
+										"raw changes behaviour f=%zu b=%zu q=%zu (raw %d, plain %d)",
+										f, b, q, xa, xb);
+							}
+						}
 					}
 					prism_free(&ra);
 					prism_free(&rb);
@@ -1801,8 +1930,9 @@ static void cm_gen_raw_product(void) {
 	}
 
 	char name[320];
-	snprintf(name, sizeof(name), "completeness[gen/raw-product]: %ld cells, %ld bad, %ld gated-out%s%s",
-		 st.cells, st.bad, gated, st.bad ? " -- " : "", st.bad ? st.first : "");
+	snprintf(name, sizeof(name),
+		 "completeness[gen/raw-product]: %ld cells, %ld bad, %ld executed, %ld gated-out%s%s",
+		 st.cells, st.bad, raw_exec_seen, gated, st.bad ? " -- " : "", st.bad ? st.first : "");
 	CHECK(st.bad == 0, name);
 }
 
@@ -6486,6 +6616,30 @@ static int cm_exec_trap(const char *src, PrismFeatures feat) {
 	return CM_X_TEMP;
 }
 
+/* Build `src` under `f`, run it, and require the exact behaviour plain cc gives
+ * the same source. Returns 1 if they agree, 0 if not, -1 if either side could
+ * not be built or run.
+ *
+ * This is the oracle that lets a compile-only tier start executing without
+ * anyone authoring an expected answer per cell. Where a Prism feature is
+ * switched off, the emitted program must do what the C compiler does with the
+ * untouched source; where a feature is on but the snippet does not use it, the
+ * same holds. No per-cell expectation, so it drops into existing generators
+ * unchanged.
+ *
+ * The plain-cc side is the gate: if the original does not build and run, the
+ * cell says nothing about Prism and is skipped rather than failed. Learned the
+ * hard way, three times: a snippet reading an uninitialized object returns
+ * stack garbage under cc and 0 under zero-init, which looks exactly like a
+ * transpiler bug and is not one. */
+static int cm_exec_matches_plain(const char *src, PrismFeatures f) {
+	int want = cm_run_plain(src);
+	if (want <= -1000) return -1;
+	int got = cm_exec(src, f);
+	if (got <= -1000) return -1;
+	return got == want;
+}
+
 /* Transpile → cc → run. Exit codes: child status, or -1000/-1001/-1002 on fail. */
 static int cm_exec(const char *src, PrismFeatures feat) {
 	PrismResult r = cm_txf(src, feat);
@@ -9439,6 +9593,80 @@ static void cm_gen_pp_cache(void) {
 	cm_report("gen/pp-cache", &st);
 }
 
+/* ── dialect keywords as ordinary identifiers, compiled and run ───────
+ *
+ * The kw x ctx matrix elsewhere checks that the spelling SURVIVES transpilation.
+ * That is necessary and not sufficient: `struct raw { int x; };` preserved the
+ * tag perfectly and still emitted `struct raw { int x = 0; };`, because scope
+ * classification tested `prev->kind == PPARSE_TK_IDENT` and a dialect keyword
+ * is PPARSE_TK_KEYWORD, so the body was never marked is_struct and its members
+ * were zero-initialized as if they were locals. Preserved, and not C.
+ *
+ * Every cell here is a complete program that must compile AND return 0. `raw`,
+ * `defer` and `orelse` are legal C identifiers and pre-Prism code is full of
+ * them, so each keyword is swept through every position C allows a name.
+ *
+ * No cell reads an uninitialized object. That matters more than it looks:
+ * under zero-init Prism returns 0 where plain cc returns stack garbage, so a
+ * cell with UB in it fails and looks exactly like a transpiler bug. Three did,
+ * while this tier was being written. */
+static void cm_gen_kw_identifier_ctx(void) {
+	static const char *kws[] = {"raw", "defer", "orelse"};
+	/* %s is the keyword. Each program returns 0 on success. */
+	static const struct {
+		const char *name;
+		const char *prog;
+	} ctxs[] = {
+	    {"struct-tag", "struct %s { int x; };\nint main(void){ struct %s s; s.x = 0; return s.x; }\n"},
+	    {"union-tag", "union %s { int a; int b; };\nint main(void){ union %s u; u.a = 0; return u.a; }\n"},
+	    {"enum-tag", "enum %s { K_%s = 3 };\nint main(void){ enum %s e = K_%s; return (int)e - 3; }\n"},
+	    {"typedef-name", "typedef struct { int v; } %s;\nint main(void){ %s s; s.v = 0; return s.v; }\n"},
+	    {"member", "struct S { int %s; };\nint main(void){ struct S s; s.%s = 0; return s.%s; }\n"},
+	    {"function-name", "static int %s(int x){ return x; }\nint main(void){ return %s(0); }\n"},
+	    {"parameter", "static int f(int %s){ return %s; }\nint main(void){ return f(0); }\n"},
+	    {"enum-constant", "enum E { %s = 5 };\nint main(void){ return %s - 5; }\n"},
+	    {"label", "int main(void){ goto %s; %s: return 0; }\n"},
+	    {"array", "int main(void){ int %s[4]; %s[2] = 0; return %s[2]; }\n"},
+	    {"fn-pointer", "static int g(int x){ return x; }\nint main(void){ int (*%s)(int) = g; return %s(0); }\n"},
+	    {"nested-tag", "struct Out { struct %s { int z; } in; };\nint main(void){ struct Out o; o.in.z = 0; return o.in.z; }\n"},
+	    {"fwd-decl-ptr",
+	     "struct %s;\nstruct %s { int v; };\nint main(void){ struct %s s; s.v = 0; struct %s *p = &s; return p->v; }\n"},
+	    {"return-type",
+	     "struct %s { int v; };\nstatic struct %s mk(void){ struct %s s; s.v = 0; return s; }\nint main(void){ return mk().v; }\n"},
+	    {"tag-and-var",
+	     "struct %s { int v; };\nint main(void){ struct %s %s; %s.v = 0; return %s.v; }\n"},
+	    {"anon-member",
+	     "struct %s { struct { int v; }; };\nint main(void){ struct %s s; s.v = 0; return s.v; }\n"},
+	    {"bitfield", "struct %s { unsigned %s : 3; int t; };\nint main(void){ struct %s s; s.%s = 0; s.t = 0; return (int)s.%s + s.t; }\n"},
+	    {"macro", "#define %s 0\nint main(void){ return %s; }\n"},
+	};
+
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	char src[900];
+
+	for (size_t k = 0; k < sizeof(kws) / sizeof(kws[0]); k++)
+		for (size_t c = 0; c < sizeof(ctxs) / sizeof(ctxs[0]); c++) {
+			/* The templates take the keyword up to six times; snprintf
+			 * ignores the surplus arguments a shorter one does not use. */
+			snprintf(src, sizeof(src), ctxs[c].prog, kws[k], kws[k], kws[k], kws[k],
+				 kws[k], kws[k]);
+			st.cells++;
+			int rc = cm_exec_trap(src, f);
+			if (rc == CM_X_INFRA)
+				cm_note(&st, "%s as %s: transpile rejected it", kws[k], ctxs[c].name);
+			else if (rc == CM_X_CCFAIL)
+				cm_note(&st, "%s as %s: emitted C does not compile", kws[k],
+					ctxs[c].name);
+			else if (rc == CM_X_TRAPPED)
+				cm_note(&st, "%s as %s: trapped at runtime", kws[k], ctxs[c].name);
+			else if (rc != 0)
+				cm_note(&st, "%s as %s: returned %d, expected 0", kws[k],
+					ctxs[c].name, rc);
+		}
+	cm_report("gen/kw-identifier-ctx", &st);
+}
+
 void run_completeness_open_tests(void) {
 	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");
 	/* The compile-and-run oracles live on this second suite thread rather
@@ -9467,5 +9695,6 @@ void run_completeness_open_tests(void) {
 	cm_gen_lib_api();
 	cm_gen_zeroinit_padding();
 	cm_gen_pp_cache();
+	cm_gen_kw_identifier_ctx();
 #endif
 }

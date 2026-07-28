@@ -6390,9 +6390,19 @@ static void pparse_build_scopes(PParseToken *start) {
 				si->is_conditional = true;
 			} else if (prev->tag & PPARSE_TT_SUE) {
 				si->is_struct = true;
-			} else if (prev->kind == PPARSE_TK_IDENT &&
+			} else if (pparse_is_valid_varname(prev) &&
 				   !(prev->tag &
 				     (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_LOOP | PPARSE_TT_SWITCH | PPARSE_TT_IF | PPARSE_TT_STORAGE))) {
+				/* The tag before `{` may be a dialect keyword: `struct raw
+				 * { int x; };` is ordinary C that predates Prism, and the
+				 * same holds for `defer` and `orelse`. Testing
+				 * kind == PPARSE_TK_IDENT excluded them, so the scope was
+				 * never marked is_struct, its members were treated as local
+				 * declarations, and zero-init emitted
+				 * `struct raw { int x = 0; };` which does not compile.
+				 * pparse_is_valid_varname is the predicate already used
+				 * everywhere else to mean "legal identifier here", and it
+				 * accepts soft keywords by design. */
 				PParseToken *sue = pparse_walk_back(pparse_idx(_pc, prev) - 1, PPARSE_WB_SKIP_ATTRS);
 				if (sue && (sue->tag & PPARSE_TT_SUE)) {
 					si->is_struct = true;
