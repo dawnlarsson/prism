@@ -8417,7 +8417,27 @@ static void cm_gen_runtime_zeroinit(void) {
 	    {"array-of-struct", "struct S{char a;int b;};", "struct S v[3];"},
 	    {"array-2d", "", "int v[3][4];"},
 	    {"ptr-member", "struct PM{char a;void*p;char b;};", "struct PM v;"},
-	    {"long-double", "", "long double v;"},
+	    /* `long double` is the one scalar in C with padding bytes, and Prism
+	     * zeroes scalars by assignment (`long double v = 0;`) while it zeroes
+	     * aggregates with a whole-object initializer. Where the type fills its
+	     * storage, as with aarch64's 128-bit quad, the two are the same. Where
+	     * it does not, as with x86-64's 80-bit x87 value in a 16-byte slot, the
+	     * assignment writes the value and leaves the remaining bytes holding
+	     * whatever was on the stack. __LDBL_MANT_DIG__ tells the two apart at
+	     * compile time: 113 for quad, 64 for x87 extended.
+	     *
+	     * The value is checked unconditionally because that is what zero-init
+	     * promises. The all-bytes check is applied only where no padding
+	     * exists, so this records the boundary rather than asserting past it.
+	     * Worth a decision though: those bytes are stale stack, readable via
+	     * memcmp or a byte-wise hash, and closing that is the point of the
+	     * feature. See the known gap in RELEASE_NOTES_1.1.6. */
+	    {"long-double-value", "", "long double v; return v != 0.0L;"},
+	    {"long-double-bytes", "",
+	     "long double v;\n"
+	     "#if defined(__LDBL_MANT_DIG__) && __LDBL_MANT_DIG__ == 64\n"
+	     "\t(void)v; return 0; /* x87 extended: 10 value bytes in 16, padding not covered */\n"
+	     "#endif\n"},
 	    {"scalar-int", "", "int v;"},
 	    {"scalar-ptr", "", "char *v;"},
 	    {"char-array", "", "char v[13];"},
@@ -9060,6 +9080,135 @@ static void cm_gen_lib_api(void) {
 
 #endif /* !_WIN32: POSIX-only executed tiers */
 
+/* ── zero-init padding, as a property rather than a type list ─────────
+ *
+ * gen/runtime-zeroinit found that `long double` keeps stale stack in its
+ * padding on x86-64 and not on aarch64. Patching that one cell would leave the
+ * rest of the family untested and would bake one target's layout into the
+ * suite, so the invariant is checked instead:
+ *
+ *   every byte Prism CAN reach by assignment must be zero, and any byte it
+ *   misses must be padding that assignment provably cannot reach.
+ *
+ * Whether a type has such padding is decided at runtime, on whatever target is
+ * running, by assigning the same value over two differently-poisoned objects
+ * and comparing the bytes:
+ *
+ *   memset(&a, 0xAA, n); memset(&b, 0x55, n);
+ *   a = (T)0; b = (T)0;
+ *   padding_exists = memcmp(&a, &b, n) != 0;
+ *
+ * If the two disagree afterwards, some byte was not written by the assignment.
+ * That is the definition of the gap, needs no table of ABIs, and stays correct
+ * on a target nobody has tried yet.
+ *
+ * A cell fails when a type is left with nonzero bytes it had no business
+ * missing, which is the case that matters and the one a fixed type list would
+ * miss. The count of types that took the padding branch is reported in the
+ * tier line, so the gap stays visible rather than silently tolerated: on
+ * aarch64 it should be 0, on x86-64 it should name `long double` and its
+ * aggregates. */
+#define CM_ZP_PRE                                                                                    \
+	"#include <string.h>\n"                                                                      \
+	"__attribute__((noinline)) static void dirty(void){volatile unsigned char "                  \
+	"j[512];for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}\n"                                         \
+	"static int nz(const void*p,unsigned long n){const unsigned char*b=p;int "                   \
+	"k=0;for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}\n"
+
+static void cm_gen_zeroinit_padding(void) {
+	/* Each cell names its type through a typedef so the generated program is
+	 * uniform: two objects of that type for the padding probe, one for the
+	 * zero-init check. `zero` writes a zero value through a T*, which for
+	 * aggregates has to be a memset because they cannot be assigned from 0. */
+	static const struct {
+		const char *name;
+		const char *types;
+		const char *zero;
+	} cells[] = {
+	    {"long-double", "typedef long double T;", "*p = 0.0L;"},
+	    {"double", "typedef double T;", "*p = 0.0;"},
+	    {"float", "typedef float T;", "*p = 0.0f;"},
+	    {"bool", "typedef _Bool T;", "*p = 0;"},
+	    {"char", "typedef char T;", "*p = 0;"},
+	    {"short", "typedef short T;", "*p = 0;"},
+	    {"int", "typedef int T;", "*p = 0;"},
+	    {"long", "typedef long T;", "*p = 0;"},
+	    {"long-long", "typedef long long T;", "*p = 0;"},
+	    {"void-ptr", "typedef void *T;", "*p = 0;"},
+	    {"fn-ptr", "typedef void (*T)(void);", "*p = 0;"},
+	    {"complex-double", "typedef double _Complex T;", "*p = 0;"},
+	    {"complex-long-double", "typedef long double _Complex T;", "*p = 0;"},
+	    {"ld-array", "typedef long double T[3];", "memset(p, 0, sizeof(T));"},
+	    {"ld-2d-array", "typedef long double T[2][2];", "memset(p, 0, sizeof(T));"},
+	    {"ld-in-struct", "typedef struct { long double d; } T;", "memset(p, 0, sizeof(T));"},
+	    {"ld-with-tail", "typedef struct { long double d; char c; } T;",
+	     "memset(p, 0, sizeof(T));"},
+	    {"ld-union", "typedef union { long double d; char c[4]; } T;",
+	     "memset(p, 0, sizeof(T));"},
+	    {"ld-nested", "typedef struct { char a; struct { long double d; } in; } T;",
+	     "memset(p, 0, sizeof(T));"},
+	    {"struct-padding", "typedef struct { char a; int b; char c; } T;",
+	     "memset(p, 0, sizeof(T));"},
+	    {"bitfield", "typedef struct { unsigned x : 3; unsigned y : 5; int t; } T;",
+	     "memset(p, 0, sizeof(T));"},
+	};
+
+	CmStats st = {0};
+	PrismFeatures f = prism_defaults();
+	long padded = 0;
+	char first_padded[96] = {0};
+	char src[2200];
+
+	for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); c++) {
+		/* Exit status carries both answers. Bit 0: some byte of the
+		 * zero-initialized object was nonzero. Bit 1: this type has padding
+		 * that a zero assignment does not reach, established by writing the
+		 * same value over two differently poisoned objects and comparing.
+		 * 0 and 2 are acceptable; 1 means Prism missed a reachable byte. */
+		snprintf(src, sizeof(src),
+			 "%s%s\n"
+			 "static int probe(void){\n"
+			 "\tT a, b;\n"
+			 "\tmemset(&a, 0xAA, sizeof(T)); memset(&b, 0x55, sizeof(T));\n"
+			 "\t{ T *p = &a; %s }\n"
+			 "\t{ T *p = &b; %s }\n"
+			 "\treturn memcmp(&a, &b, sizeof(T)) != 0;\n"
+			 "}\n"
+			 "int main(void){\n"
+			 "\tdirty();\n"
+			 "\tT v;\n"
+			 "\tint bad = nz(&v, sizeof(T)) != 0;\n"
+			 "\treturn bad | (probe() << 1);\n"
+			 "}\n",
+			 CM_ZP_PRE, cells[c].types, cells[c].zero, cells[c].zero);
+
+		st.cells++;
+		int rc = cm_exec_trap(src, f);
+		if (rc < 0) {
+			cm_note(&st, "%s: infra %d", cells[c].name, rc);
+			continue;
+		}
+		if (rc & 1) {
+			cm_note(&st, "%s: left a nonzero byte that assignment reaches",
+				cells[c].name);
+			continue;
+		}
+		if (rc & 2) {
+			padded++;
+			if (!first_padded[0])
+				snprintf(first_padded, sizeof(first_padded), "%s", cells[c].name);
+		}
+	}
+
+	char name[288];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/zeroinit-padding]: %ld cells, %ld bad, %ld with unreachable "
+		 "padding%s%s%s %s",
+		 st.cells, st.bad, padded, padded ? " (first: " : "", padded ? first_padded : "",
+		 padded ? ")" : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+}
+
 void run_completeness_open_tests(void) {
 	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");
 	/* The compile-and-run oracles live on this second suite thread rather
@@ -9086,5 +9235,6 @@ void run_completeness_open_tests(void) {
 	cm_gen_flag_polarity();
 	cm_gen_driver_surfaces();
 	cm_gen_lib_api();
+	cm_gen_zeroinit_padding();
 #endif
 }
