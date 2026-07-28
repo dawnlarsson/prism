@@ -30,7 +30,11 @@ static void bc_runtime_case(const char *src, int expected_exit, const char *labe
 		FILE *fp = fopen(out_path, "w");
 		if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
 		char cmd[1024];
-		snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+		/* Must be the same compiler Prism preprocessed with: the flattened
+		 * output carries that compiler's system headers, and mixing the two
+		 * halves fails on attributes only one of them knows. */
+		snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -o %s %s >/dev/null 2>&1",
+			 cm_cc_early(), bin, out_path);
 		snprintf(msg, sizeof(msg), "%s: compiles", label);
 		CHECK_EQ(run_command_status(cmd), 0, msg);
 		int status = run_command_status(bin);

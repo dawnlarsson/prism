@@ -1826,6 +1826,19 @@ static void cm_gen_raw_product(void) {
  * substring assertion cannot see.
  */
 #ifndef _WIN32
+/* The C compiler every cell shells out to.
+ *
+ * These were hardcoded to `cc`, which pins the whole executed half of the
+ * suite to whatever the platform calls its default compiler. That hides an
+ * entire class of defect: Prism emits C, and C that only one compiler accepts
+ * is still a Prism bug. Honouring $CC lets the same 1,000 executed cells be
+ * replayed against clang, a cross toolchain, or an older gcc, with no source
+ * change. shell_word_ok keeps a hostile $CC out of the command line. */
+static const char *cm_cc(void) {
+	const char *cc = getenv("CC");
+	return shell_word_ok(cc) ? cc : "cc";
+}
+
 static int cm_cc_accepts(const char *code);
 #endif
 
@@ -1988,7 +2001,7 @@ static int csd_defined(const char *code) {
 	char cmd[PATH_MAX + 96];
 	/* -w: GCC rejects clang's -Wno-everything, and a rejected flag would make
 	 * every cell read as "undefined" and the tier vacuously green. */
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -E -w %s >/dev/null 2>&1", path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -E -w %s >/dev/null 2>&1", cm_cc(), path);
 	int rc = run_command_status(cmd);
 	unlink(path);
 	free(path);
@@ -2006,7 +2019,7 @@ static int csd_compiles(const char *code) {
 	char *path = create_temp_file(code);
 	if (!path) return -1;
 	char cmd[PATH_MAX + 96];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", cm_cc(), path);
 	int rc = run_command_status(cmd);
 	unlink(path);
 	free(path);
@@ -2026,7 +2039,7 @@ static int csd_cc_roundtrip(const char *code) {
 		return -1;
 	}
 	char cmd[2 * PATH_MAX + 96];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -E -w %s -o %s 2>/dev/null", in, out);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -E -w %s -o %s 2>/dev/null", cm_cc(), in, out);
 	int rc = run_command_status(cmd);
 	unlink(in);
 	free(in);
@@ -2274,7 +2287,17 @@ static void cm_gen_raw_string(void) {
 				continue;
 			}
 #ifndef _WIN32
-			if (!cm_already_ran(r.output)) {
+			/* Prism recognises R"delim(...)delim" and hands it to the
+			 * backend unchanged, so whether the emitted C compiles is a
+			 * question about the backend, not about Prism. Raw string
+			 * literals are a GNU extension in C: accepted by
+			 * `gcc -std=gnu11`, rejected by `gcc -std=c11`, and rejected
+			 * by clang in every mode tried. Asserting unconditionally
+			 * here bakes a silent GCC dependency into 104 checks, which
+			 * is what `CC=clang` exposed. Same discipline as
+			 * gen/passthrough-equivalence: if the compiler will not take
+			 * the construct, the cell says nothing about Prism. */
+			if (!cm_already_ran(r.output) && cc_supports_raw_strings()) {
 				char cn[160], rn[160];
 				snprintf(cn, sizeof(cn), "raw-string[d%zu/c%zu]: emitted C compiles",
 					 d, c);
@@ -6387,7 +6410,7 @@ static int cm_cc_accepts(const char *code) {
 	char *path = create_temp_file(code);
 	if (!path) return -1;
 	char cmd[PATH_MAX + 96];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", cm_cc(), path);
 	int rc = run_command_status(cmd);
 	unlink(path);
 	free(path);
@@ -6443,7 +6466,7 @@ static int cm_exec_trap(const char *src, PrismFeatures feat) {
 	unlink(bin);
 
 	char cmd[PATH_MAX * 2 + 80];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -w -o %s %s >/dev/null 2>&1", bin, path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -w -o %s %s >/dev/null 2>&1", cm_cc(), bin, path);
 	if (run_command_status(cmd) != 0) {
 		unlink(path);
 		free(path);
@@ -6483,7 +6506,7 @@ static int cm_exec(const char *src, PrismFeatures feat) {
 	close(fd);
 	unlink(bin);
 	char cmd[PATH_MAX * 2 + 80];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -o %s %s >/dev/null 2>&1", cm_cc(), bin, path);
 	if (run_command_status(cmd) != 0) {
 		unlink(path);
 		free(path);
@@ -7209,7 +7232,7 @@ static int cm_run_plain(const char *code) {
 	close(fd);
 	unlink(bin);
 	char cmd[PATH_MAX * 2 + 80];
-	snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -w -o %s %s >/dev/null 2>&1", bin, path);
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -w -o %s %s >/dev/null 2>&1", cm_cc(), bin, path);
 	if (run_command_status(cmd) != 0) {
 		unlink(path);
 		free(path);
@@ -8238,6 +8261,16 @@ static void cm_gen_ice_stmt_expr(void) {
 /* Formerly the env-gated `completeness_open` suite.  There is no staging area
  * any more: a tier is either in the default run or it does not exist.  Red here
  * means a product bug to fix, not a tier to gate off. */
+/* Everything from here to the matching #endif is POSIX-only, and is called
+ * only from the #ifndef _WIN32 arm of run_completeness_open_tests. These tiers
+ * fork and inspect wait status, create temp directory trees, symlink, and run
+ * `install` against $PREFIX; MSVC has none of that. The guard has to wrap the
+ * DEFINITIONS and not just the calls, because the CM_X_* result codes live
+ * beside cm_exec_trap inside the same guard: leaving the bodies visible on
+ * Windows compiles them against macros that were never defined, which is
+ * exactly how this broke. */
+#ifndef _WIN32
+
 /* ── executed bounds-check boundary ───────────────────────────────────
  *
  * Every cell below was measured against the shipping binary before being
@@ -9024,6 +9057,8 @@ static void cm_gen_lib_api(void) {
 	free(base);
 	cm_report("gen/lib-api", &st);
 }
+
+#endif /* !_WIN32: POSIX-only executed tiers */
 
 void run_completeness_open_tests(void) {
 	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");

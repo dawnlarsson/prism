@@ -242,6 +242,12 @@ static pthread_mutex_t g_spawn_mtx = PTHREAD_MUTEX_INITIALIZER;
 // non-NULL, the child's stdout/stderr is redirected to those files (created
 // O_WRONLY|O_CREAT|O_TRUNC, mode 0644).  Returns the child's exit status
 // (>=0, 127 if exec failed inside posix_spawn), -1 on infrastructure error.
+/* $CC for helpers defined before test.completeness.c is included. */
+static const char *cm_cc_early(void) {
+	const char *cc = getenv("CC");
+	return (cc && *cc && !strpbrk(cc, " \t\"'\\$`;&|<>()[]{}*?!#~\n")) ? cc : "cc";
+}
+
 static int prism_spawn_wait_raw(char *const argv[], const char *stdout_path,
 				const char *stderr_path, int *raw_status) {
 	posix_spawn_file_actions_t fa;
@@ -302,7 +308,7 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 
 	char compile_cmd[PATH_MAX * 2 + 64];
 	snprintf(compile_cmd, sizeof(compile_cmd),
-		 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin_template, src_path);
+		 "%s -std=gnu11 -o %s %s >/dev/null 2>&1", cm_cc_early(), bin_template, src_path);
 	CHECK_EQ(run_command_status(compile_cmd), 0, compile_name);
 	if (access(bin_template, X_OK) == 0)
 		CHECK_EQ(run_command_status(bin_template), 0, run_name);
@@ -312,6 +318,53 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 	free(src_path);
 }
 #endif
+
+/* Preprocess with the same compiler the harness compiles the result with.
+ *
+ * prism_defaults() leaves .compiler NULL, so every one of the ~1,730 transpiles
+ * in the suite preprocessed with `cc` no matter what $CC said. Compiling that
+ * output with a different compiler mixes toolchains: glibc 2.35 spells
+ * __attribute__((__malloc__(fn, arg))), gcc's preprocessor bakes it into the
+ * flattened output, and clang 15 only knows the zero-argument __malloc__. The
+ * result looks like a Prism bug and is not one.
+ *
+ * Overriding the call rather than editing 1,730 sites, and only inside this
+ * translation unit: the real prism_defaults is already defined above, and
+ * library consumers are unaffected. */
+static PrismFeatures cm_defaults_cc(void) {
+	PrismFeatures f = prism_defaults();
+	const char *cc = getenv("CC");
+	if (cc && *cc && !strpbrk(cc, " \t\"'\\$`;&|<>()[]{}*?!#~\n")) f.compiler = cc;
+	return f;
+}
+#define prism_defaults() cm_defaults_cc()
+
+/* Does the configured backend preprocessor understand R"delim(...)delim"?
+ *
+ * Raw string literals are a GNU extension in C, not standard: accepted by
+ * `gcc -std=gnu11`, rejected by `gcc -std=c11`, by clang in every mode tried,
+ * and by MSVC. Tests that depend on the backend tokenising them were guarded
+ * with `#ifdef _WIN32`, which names one compiler that lacks the extension
+ * rather than the property being relied on, so they failed the moment $CC was
+ * pointed at clang. Probed once; the answer cannot change within a run. */
+static int cc_supports_raw_strings(void) {
+	static int cached = -1;
+	if (cached >= 0) return cached;
+	cached = 0;
+#ifndef _WIN32
+	char *p = create_temp_file("const char *s = R\"d(x)d\";\nint main(void){return s[0]==0;}\n");
+	if (p) {
+		char cmd[PATH_MAX + 96];
+		snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1",
+			 cm_cc_early(), p);
+		cached = run_command_status(cmd) == 0;
+		unlink(p);
+		free(p);
+	}
+#endif
+	return cached;
+}
+
 
 #include "test.windows.c"
 
