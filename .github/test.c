@@ -141,8 +141,19 @@ static char *create_temp_file(const char *content) {
 		free(path);
 		return NULL;
 	}
-	write(fd, content, strlen(content));
+	size_t len = strlen(content), off = 0;
+	while (off < len) {
+		ssize_t n = write(fd, content + off, len - off);
+		if (n > 0) off += (size_t)n;
+		else if (n < 0 && errno == EINTR) continue;
+		else break;
+	}
 	close(fd);
+	if (off != len) {
+		unlink(path);
+		free(path);
+		return NULL;
+	}
 	return path;
 }
 
@@ -436,12 +447,13 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 	close(bin_fd);
 	unlink(bin_template);
 
-	char compile_cmd[PATH_MAX * 2 + 64];
-	snprintf(compile_cmd, sizeof(compile_cmd),
-		 "%s -std=gnu11 -o %s %s >/dev/null 2>&1", cm_cc_early(), bin_template, src_path);
-	CHECK_EQ(run_command_status(compile_cmd), 0, compile_name);
-	if (access(bin_template, X_OK) == 0)
-		CHECK_EQ(run_command_status(bin_template), 0, run_name);
+	char *cc_argv[] = {(char *)cm_cc_early(), (char *)"-std=gnu11", (char *)"-o",
+			   bin_template, src_path, NULL};
+	CHECK_EQ(prism_spawn_wait(cc_argv, NULL, NULL), 0, compile_name);
+	if (access(bin_template, X_OK) == 0) {
+		char *run_argv[] = {bin_template, NULL};
+		CHECK_EQ(prism_spawn_wait(run_argv, NULL, NULL), 0, run_name);
+	}
 
 	unlink(bin_template);
 	unlink(src_path);

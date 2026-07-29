@@ -2585,19 +2585,7 @@ static PParseToken *handle_const_orelse_fallback(PParseToken *tok,
 	// Function pointers: return-type const lives in the type specifier and must
 	// be preserved;
 	bool strip_type_const = !decl->is_pointer && !decl->is_func_ptr;
-	bool has_const_typedef = false;
-	if (strip_type_const) {
-		for (PParseToken *t = type_start; t != type->end; t = pparse_next(_pc, t)) {
-			if (pparse_is_const_typedef(t)) {
-				has_const_typedef = true;
-				break;
-			}
-			if ((t->tag & PPARSE_TT_TYPEOF) && t->len != 11) {
-				has_const_typedef = true;
-				break;
-			}
-		}
-	}
+	bool has_const_typedef = strip_type_const && type->has_hidden_const;
 
 #define EMIT_PRAGMA_PRELUDE()                                                                                \
 	do {                                                                                                 \
@@ -2690,50 +2678,11 @@ static PParseToken *handle_const_orelse_fallback(PParseToken *tok,
 	return tok;
 }
 
-typedef struct {
-	PParseToken *orelse_tok;
-	bool is_const_fallback;
-} OrelseInitInfo;
-
 static inline void flush_typeof_memsets(PParseToken **vars, int *count, PParseTypeSpec *type, int base) {
 	if (*count > base) {
 		emit_typeof_memsets(&vars[base], *count - base, type->has_volatile, type->has_const);
 		*count = base;
 	}
-}
-
-static OrelseInitInfo
-scan_decl_orelse(PParseToken *decl_end, PParseToken *type_start, PParseTypeSpec *type, PParseDecl *decl) {
-	PPARSE_CTX();
-	OrelseInitInfo info = {0};
-	if (!decl->has_init || !pparse_feat(PPARSE_F_ORELSE)) return info;
-	/* Macro-hygiene parens wrapping the whole initializer were unlinked by
-	 * Phase 1 (p1d_scan_init_orelse), so a decl-init orelse keyword always
-	 * sits at group depth 0 here — this walk only locates the annotation. */
-	int pd = 0;
-	PPARSE_FOR_TAIL(scan, pparse_next(_pc, decl_end)) {
-		if (scan->flags & PPARSE_TF_OPEN) {
-			pd++;
-			continue;
-		}
-		if (scan->flags & PPARSE_TF_CLOSE) {
-			pd--;
-			continue;
-		}
-		if (pd) continue;
-		if (pparse_match_ch(scan, ',') || pparse_match_ch(scan, ';')) break;
-		if (pparse_ann(scan) & P1_IS_ORELSE_KW) {
-			info.orelse_tok = scan;
-			break;
-		}
-	}
-
-	if (info.orelse_tok) {
-		bool is_fallback = is_orelse_value_fallback(pparse_next(_pc, info.orelse_tok));
-		info.is_const_fallback = pparse_has_effective_const_qual(type_start, type, decl) && is_fallback;
-	}
-
-	return info;
 }
 
 typedef struct {
@@ -2874,10 +2823,13 @@ static PParseToken *process_declarators(PParseToken *tok,
 			return NULL;
 		}
 
-		OrelseInitInfo orelse_info = scan_decl_orelse(decl.end, type_start, type, &decl);
-		bool is_const_orelse_fallback = orelse_info.is_const_fallback;
+		uint32_t recipe = pparse_ann(decl.var_name);
+		PParseToken *orelse_tok = decl.has_init && pparse_feat(PPARSE_F_ORELSE)
+					       ? pparse_decl_init_orelse(decl.end)
+					       : NULL;
+		bool is_const_orelse_fallback = orelse_tok && (recipe & P1_DECL_CONST_ORELSE);
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
-		bool has_bo = pparse_feat(PPARSE_F_ORELSE) && pparse_declarator_has_bracket_orelse(decl_start, decl.end);
+		bool has_bo = pparse_feat(PPARSE_F_ORELSE) && (recipe & P1_DECL_BRACKET_OE);
 		bool brace_opened = false;
 		BOFrame bo_frame;
 		if (has_bo) {
@@ -2904,86 +2856,27 @@ static PParseToken *process_declarators(PParseToken *tok,
 		if (first_decl) {
 			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
-				if (pparse_feat(PPARSE_F_AUTO_STATIC) && _ps->raw_block_depth == 0 && emit_block_depth > 0 &&
-				    !in_ctrl_paren() &&
-				    /* SPEC §6.9 criterion 3: explicit const — do not use
-				     * pparse_has_effective_const_qual (typeof is treated as const for
-				     * orelse temps, which wrongly auto-static'd mutable
-				     * typeof(int[N]) arrays). */
-				    pparse_decl_has_explicit_const(type_start, type, &decl) &&
-				    !type->has_volatile && !type->has_volatile_member &&
-				    !type->has_static && !type->has_extern && !type->has_register &&
-				    !type->has_auto && !type->has_constexpr && !type->has_thread_local &&
-				    (decl.is_array || type->is_array) &&
-				    (!decl.is_pointer || decl.is_const) && decl.has_init &&
-				    !decl.is_vla && !type->is_vla && !decl_is_raw &&
-				    !orelse_info.orelse_tok) {
-					bool has_volatile_td = false;
-					PPARSE_FOR_RANGE(tv, type_start, type->end)
-						if (pparse_is_volatile_typedef(tv) || pparse_has_volatile_member_typedef(tv)) {
-							has_volatile_td = true;
-							break;
-						}
-					if (!has_volatile_td &&
-					    !pparse_range_has_attribute(
-						pragma_start ? pragma_start : type_start, type->end, PPARSE_TT_ASM) &&
-					    !pparse_range_has_attribute(pparse_next(_pc, decl.var_name), decl.end, 0)) {
-						PParseToken *eq = decl.end; // '=' token
-						PParseToken *init = pparse_next(_pc, eq);
-						bool lit_ok = false;
-						if (init && pparse_match_ch(init, '{') && pparse_pair(_pc, init) &&
-						    pparse_match_ch(pparse_next(_pc, pparse_pair(_pc, init)), ';') &&
-						    pparse_is_const_literal_initializer(eq))
-							lit_ok = true;
-						else if (init && init->kind == PPARSE_TK_STR &&
-							 pparse_is_const_literal_initializer(eq))
-							lit_ok = true;
-						if (lit_ok) OUT_LIT("static ");
-					}
-				}
+				if ((recipe & P1_DECL_AUTO_STATIC) &&
+				    !pparse_range_has_attribute(pragma_start, type_start, PPARSE_TT_ASM))
+					OUT_LIT("static ");
 				emit_type_with_pragma_prelude(
 				    pragma_start, type_start, type->end, raw_tok, false);
 			}
 			first_decl = false;
 		}
 
-		uint32_t recipe = pparse_ann(decl.var_name);
-		PParseDeclShape shape;
 		uint8_t zero_kind;
 		if (recipe & P1_DECL_RECIPE) {
-			uint8_t bits = (uint8_t)(recipe >> P1_DECL_SHAPE_SHIFT);
-			shape = (PParseDeclShape){.effective_vla = (bits & P1DS_EFF_VLA) != 0,
-						 .is_aggregate = (bits & P1DS_AGG) != 0,
-						 .is_union_type = (bits & P1DS_UNION) != 0};
 			zero_kind = (uint8_t)((recipe >> P1_DECL_ZERO_SHIFT) & 3);
-		} else {
-			/* No P1K_DECL: file scope, func type, or aggregate member. */
-			shape = pparse_classify_decl_shape(type_start, type, &decl);
-			/* No P1K_DECL recipe means no recorded scope; a stmt-expr
-			 * ICE context cannot arise on this path. */
-			zero_kind = compute_decl_zero_kind(&shape, type_start, type, &decl,
-							   decl.has_init, decl_is_raw,
-							   type->has_static, PPARSE_SID_UNKNOWN);
-#ifdef PRISM_DEBUG
-			if (current_func_idx >= 0 && decl.var_name && !shape.is_func_type &&
-			    !p1_token_in_nested_function(decl.var_name))
-				pparse_error_tok(decl.var_name, "internal: missing P1K_DECL recipe");
-#endif
-		}
-		bool effective_vla = shape.effective_vla;
+		} else
+			return NULL;
 		bool needs_memset = (zero_kind == P1Z_MEMSET);
-		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {
-			PPARSE_FOR_RANGE(tv, type_start, type->end)
-				if (pparse_is_volatile_typedef(tv) || pparse_has_volatile_member_typedef(tv)) {
-					type->has_volatile = true;
-					break;
-				}
-		}
+		if (needs_memset && (recipe & P1_DECL_VOLATILE_VALUE)) type->has_volatile = true;
 		if (needs_memset && !type->has_volatile && type->has_volatile_member)
 			type->has_volatile = true;
 		if (is_const_orelse_fallback && _ps->raw_block_depth == 0) {
 			if (process_const_orelse_decl(&tok,
-						      orelse_info.orelse_tok,
+						      orelse_tok,
 						      decl_start,
 						      &decl,
 						      type_start,
@@ -3002,19 +2895,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 		emit_declarator(decl_start, decl.end);
 		if (has_bo) bo_restore(&bo_frame);
 		tok = decl.end;
-		bool init_stmt_ctx = in_for_init() || in_ctrl_paren();
 		uint8_t emit_zk = zero_kind;
-		if (emit_zk == P1Z_MEMSET && init_stmt_ctx && !effective_vla) {
-			/* for/if init cannot emit memset. Demoting to ={0} is illegal for
-			 * _Atomic aggregates (and some empty/FAM shapes on strict compilers). */
-			if ((type->has_atomic && shape.is_aggregate) ||
-			    (type_start && pparse_type_brace_zero_unsafe(type_start, type->end, 0)))
-				pparse_error_tok(decl.var_name,
-					  "aggregate requiring memset cannot be zero-initialized in a "
-					  "for/if/switch init-statement; move the declaration before the "
-					  "statement");
-			emit_zk = P1Z_AGG;
-		}
 		if (emit_zk == P1Z_SCALAR || emit_zk == P1Z_AGG) {
 			if (emit_zk == P1Z_AGG) OUT_LIT(" = {0}");
 			else
@@ -3022,17 +2903,13 @@ static PParseToken *process_declarators(PParseToken *tok,
 		}
 
 		if (emit_zk == P1Z_MEMSET) {
-			bool real_for_init = in_for_init() && emit_scope_depth > 0 &&
-					     scope_stack[emit_scope_depth - 1].is_loop;
-			if (!(init_stmt_ctx && effective_vla && !real_for_init)) {
-				PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena,
-						 _ps->typeof_vars,
-						 _ps->typeof_var_count + 1,
-						 _ps->typeof_var_cap,
-						 16,
-						 PParseToken *);
-				_ps->typeof_vars[_ps->typeof_var_count++] = decl.var_name;
-			}
+			PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena,
+					 _ps->typeof_vars,
+					 _ps->typeof_var_count + 1,
+					 _ps->typeof_var_cap,
+					 16,
+					 PParseToken *);
+			_ps->typeof_vars[_ps->typeof_var_count++] = decl.var_name;
 		}
 
 		PParseToken *pd_unreachable_tok = NULL;
@@ -3060,15 +2937,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 			return pparse_next(_pc, tok);
 		} else if (pparse_match_ch(tok, ',')) {
 			PParseToken *next_decl_tok = pparse_next(_pc, tok);
-			bool split_decl = false;
-			if (!in_for_init()) {
-				PParseDecl next_decl = pparse_declarator(next_decl_tok);
-				split_decl = next_decl.end &&
-					     ((_ps->typeof_var_count > 0 && next_decl.var_name &&
-					       (next_decl.has_init || next_decl.is_vla)) ||
-					      (pparse_feat(PPARSE_F_ORELSE) &&
-					       pparse_declarator_has_bracket_orelse(next_decl_tok, next_decl.end)));
-			}
+			bool split_decl = !in_for_init() && (pparse_ann(tok) & P1_DECL_SPLIT);
 			if (split_decl) {
 				out_char(';');
 				flush_typeof_memsets(
@@ -3213,8 +3082,8 @@ static PParseToken *try_zero_init_decl(PParseToken *tok) {
 			}
 	}
 
+	PParseDecl probe = pparse_declarator(type.end);
 	{
-		PParseDecl probe = pparse_declarator(type.end);
 		if (!probe.var_name || !probe.end) return NULL;
 		if (pparse_match_ch(probe.end, '=')) {
 			PParseToken *aeq = pparse_next(_pc, probe.end);
@@ -3237,8 +3106,7 @@ static PParseToken *try_zero_init_decl(PParseToken *tok) {
 
 	if (pparse_feat(PPARSE_F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init()) {
 		// Mirror Phase 1D's narrower gate: only fire on the
-		PParseDecl _peek = pparse_declarator(type.end);
-		bool _has_init = _peek.var_name && _peek.end && pparse_match_ch(_peek.end, '=');
+		bool _has_init = probe.var_name && probe.end && pparse_match_ch(probe.end, '=');
 		bool _has_explicit_intent = _has_init || type.is_typedef || type.is_struct || type.is_enum ||
 					    type.has_static || type.has_extern || type.has_thread_local ||
 					    type.has_register || type.has_atomic || type.has_constexpr ||
