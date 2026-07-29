@@ -6749,15 +6749,50 @@ static int cm_exec(const char *src, PrismFeatures feat) {
 	}
 	close(fd);
 	unlink(bin);
-	char cmd[PATH_MAX * 2 + 80];
-	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -o %s %s >/dev/null 2>&1", cm_cc(), bin, path);
+	/* Keep the compiler's stderr and print it when the build fails.
+	 *
+	 * A bare `exit=-1001` says a build failed and nothing about why, which is
+	 * useless on a platform you cannot reach -- macOS arm reported exactly
+	 * that for one cell of gen/runtime-defer and there was no way to tell a
+	 * real portability problem from a transient spawn failure. The compiler
+	 * already knows; it just had its mouth taped shut by `2>&1` to
+	 * /dev/null. */
+	char errf[PATH_MAX];
+	int efd = test_mkstemp(errf, "cm_cerr_");
+	if (efd >= 0) close(efd);
+	char cmd[PATH_MAX * 2 + 96];
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -o %s %s >/dev/null 2>%s", cm_cc(), bin, path,
+		 efd >= 0 ? errf : "/dev/null");
 	if (run_command_status(cmd) != 0) {
+		/* Capped, because a build failure is the *expected* result in several
+		 * tiers -- a cell referencing an undefined cleanup() is supposed not
+		 * to link -- and printing every one drowns the log. A handful is
+		 * enough to name a real portability problem, which is all this is
+		 * for. */
+		if (efd >= 0) {
+			static int shown;
+			pthread_mutex_lock(&cm_memo_lock);
+			int slot = shown < 5 ? shown++ : -1;
+			pthread_mutex_unlock(&cm_memo_lock);
+			if (slot >= 0) {
+				FILE *ef = fopen(errf, "r");
+				if (ef) {
+					char eb[400];
+					size_t n = fread(eb, 1, sizeof eb - 1, ef);
+					eb[n] = '\0';
+					fclose(ef);
+					if (n) printf("  [cc failed] %.380s\n", eb);
+				}
+			}
+			unlink(errf);
+		}
 		unlink(path);
 		free(path);
 		/* A build failure is a property of the text, so it caches. */
 		free(prog);
 		return -1001;
 	}
+	if (efd >= 0) unlink(errf);
 	int st = run_command_status(bin);
 	unlink(bin);
 	unlink(path);
