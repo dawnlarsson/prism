@@ -1535,8 +1535,10 @@ static void cm_gen_feature_cube_range(unsigned m_lo, unsigned m_hi) {
 	}
 }
 
-/* 128 masks over 8 slices. The slices are what the tier table holds. */
-#define CM_CUBE_SHARDS 8
+/* 128 masks over 16 slices. The slices are what the tier table holds.
+ * At 8 slices each was ~6.7s and they were the whole tail of the run; at 16
+ * they are ~3.3s, which is under the point where one tier sets the floor. */
+#define CM_CUBE_SHARDS 16
 #define CM_CUBE_SLICE(n)                                                                             \
 	static void cm_gen_feature_cube_##n(void) {                                                  \
 		cm_gen_feature_cube_range((unsigned)(n) * (128 / CM_CUBE_SHARDS),                    \
@@ -1550,6 +1552,14 @@ CM_CUBE_SLICE(4)
 CM_CUBE_SLICE(5)
 CM_CUBE_SLICE(6)
 CM_CUBE_SLICE(7)
+CM_CUBE_SLICE(8)
+CM_CUBE_SLICE(9)
+CM_CUBE_SLICE(10)
+CM_CUBE_SLICE(11)
+CM_CUBE_SLICE(12)
+CM_CUBE_SLICE(13)
+CM_CUBE_SLICE(14)
+CM_CUBE_SLICE(15)
 
 #ifndef _WIN32
 /* Compiling byte-identical output twice proves nothing and costs a process
@@ -1724,7 +1734,18 @@ static void cm_strip_raw(const char *src, char *out, size_t cap) {
 	out[o] = '\0';
 }
 
-static void cm_gen_raw_product(void) {
+/*
+ * Raw product, strided across shards.
+ *
+ * At 7.67s this was the slowest single tier once the cube was sliced, and
+ * so the floor under the whole run. Unlike the cube there is no single
+ * loop bound to cut: the tier is three independent nests. A stride over a
+ * shared counter covers all three, and because every shard runs, each cell
+ * still executes exactly once -- this divides the work, it does not sample
+ * it.
+ */
+static void cm_gen_raw_product_part(unsigned rp_part, unsigned rp_nparts) {
+	size_t rp_seq = 0;
 	long raw_exec_seen = 0;
 	/* Declaration shapes: type specifier + declarator.  `n` is a parameter,
 	 * so the VLA row is the only variably-modified cell and nothing else in
@@ -1795,6 +1816,7 @@ static void cm_gen_raw_product(void) {
 	for (size_t pl = 0; pl < sizeof(place) / sizeof(place[0]); pl++)
 		for (size_t sh = 0; sh < sizeof(shapes) / sizeof(shapes[0]); sh++)
 			for (size_t so = 0; so < sizeof(stor) / sizeof(stor[0]); so++) {
+				if (rp_seq++ % rp_nparts != rp_part) continue;
 				/* register arrays and const-without-init are not the
 				 * subject under test; skip rather than pin a verdict. */
 				int is_reg = strcmp(stor[so], "register ") == 0;
@@ -1848,6 +1870,7 @@ static void cm_gen_raw_product(void) {
 
 	/* O3: per-declarator `raw` suppresses exactly the declarators it marks. */
 	for (size_t sh = 0; sh < sizeof(shapes) / sizeof(shapes[0]); sh++) {
+		if (rp_seq++ % rp_nparts != rp_part) continue;
 		if (strstr(shapes[sh].decl, "[n]")) { gated++; continue; } /* VM split */
 		char mixed[1024], split[1024];
 		snprintf(mixed, sizeof(mixed),
@@ -1915,6 +1938,7 @@ static void cm_gen_raw_product(void) {
 		for (size_t f = 0; f < sizeof(fns) / sizeof(fns[0]); f++)
 			for (size_t b = 0; b < sizeof(bodies) / sizeof(bodies[0]); b++)
 				for (size_t q = 0; q < sizeof(pre) / sizeof(pre[0]); q++) {
+					if (rp_seq++ % rp_nparts != rp_part) continue;
 					char fsrc[1024], fref[1024];
 					const char *fmt = "void rp_h(void);\n%s\n%s%srp_fn%s { %s %s%s%s }\n";
 					snprintf(fsrc, sizeof(fsrc), fmt, fns[f].decls, pre[q].with,
@@ -1989,10 +2013,22 @@ static void cm_gen_raw_product(void) {
 
 	char name[320];
 	snprintf(name, sizeof(name),
-		 "completeness[gen/raw-product]: %ld cells, %ld bad, %ld executed, %ld gated-out%s%s",
-		 st.cells, st.bad, raw_exec_seen, gated, st.bad ? " -- " : "", st.bad ? st.first : "");
+		 "completeness[gen/raw-product %u/%u]: %ld cells, %ld bad, %ld executed, "
+		 "%ld gated-out%s%s",
+		 rp_part, rp_nparts, st.cells, st.bad, raw_exec_seen, gated,
+		 st.bad ? " -- " : "", st.bad ? st.first : "");
 	CHECK(st.bad == 0, name);
 }
+
+#define CM_RAWP_SHARDS 4
+#define CM_RAWP_SLICE(n)                                                                             \
+	static void cm_gen_raw_product_##n(void) {                                                   \
+		cm_gen_raw_product_part((unsigned)(n), CM_RAWP_SHARDS);                              \
+	}
+CM_RAWP_SLICE(0)
+CM_RAWP_SLICE(1)
+CM_RAWP_SLICE(2)
+CM_RAWP_SLICE(3)
 
 /*
  * `raw` as an ordinary identifier, executed (absorbs test.raw.c's
@@ -9882,7 +9918,18 @@ static void (*const cm_tiers[])(void) = {
 	cm_gen_feature_cube_5,
 	cm_gen_feature_cube_6,
 	cm_gen_feature_cube_7,
-	cm_gen_raw_product,
+	cm_gen_feature_cube_8,
+	cm_gen_feature_cube_9,
+	cm_gen_feature_cube_10,
+	cm_gen_feature_cube_11,
+	cm_gen_feature_cube_12,
+	cm_gen_feature_cube_13,
+	cm_gen_feature_cube_14,
+	cm_gen_feature_cube_15,
+	cm_gen_raw_product_0,
+	cm_gen_raw_product_1,
+	cm_gen_raw_product_2,
+	cm_gen_raw_product_3,
 	cm_gen_defer_ret_shape,
 	cm_gen_golf_pins,
 	cm_gen_reject_alphabet,
@@ -10066,7 +10113,10 @@ static void *cm_worker(void *arg) {
 }
 #endif
 
-#define CM_MAX_WORKERS 8
+/* Capped at 16 rather than 8: the tiers are mostly blocked waiting on cc and
+ * on the programs they build, so workers cost little while they wait. The
+ * cores/2 scaling below still keeps a 4-core CI runner at 4. */
+#define CM_MAX_WORKERS 16
 
 void run_completeness_tests(void) {
 	printf("\n=== COMPLETENESS (generative) ===\n");

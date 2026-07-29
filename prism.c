@@ -1,5 +1,14 @@
 #define PRISM_VERSION "1.1.6"
 
+/* Standard C, needed on every platform. It used to sit in the POSIX-only block
+ * below with <spawn.h> and <unistd.h>, so on Windows it was never included and
+ * the two time(NULL) calls in the preprocess-cache prune were implicit
+ * declarations: implicitly int, while time_t is 64-bit there, so `now` took a
+ * truncated value and every cache age comparison against PRISM_PP_CACHE_MAX_DAYS
+ * was computed from garbage. Same subsystem and same silence as the #line
+ * marker bug. */
+#include <time.h>
+
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -13,7 +22,6 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 #define INSTALL_PATH "/usr/local/bin/prism"

@@ -438,6 +438,7 @@ int main(void) {
 		{"api_3",    run_api_tests_3},
 		{"api_4",    run_api_tests_4},
 		{"api_5",    run_api_tests_5},
+		{"api_6",    run_api_tests_6},
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
 		{"machine",  run_machine_tests},

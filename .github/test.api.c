@@ -1022,11 +1022,87 @@ static int count_named_entries_with_prefix(const char *dir_path, const char *pre
 }
 #endif
 
+/*
+ * Build the prism binary once per run, then hand out copies.
+ *
+ * There are 33 call sites, and every one of them ran `cc prism.c -O0 -g` to
+ * produce a byte-identical binary from identical source with identical flags:
+ * 33 compiles of a 21,000-line translation unit, and by a wide margin the
+ * largest single cost in the suite. The build now happens once under a lock
+ * and the rest is a 2 MB file copy.
+ *
+ * Callers still get their own path rather than a shared one, because several
+ * of them move, replace, chmod or delete the binary they are given -- the
+ * install and symlink-hijack tests exist precisely to do that to it. A hard
+ * link would be faster and would let those tests corrupt the master.
+ *
+ * Each call still performs exactly one CHECK, so the test count is unchanged
+ * and a failed master build fails every caller rather than being swallowed.
+ */
+static pthread_mutex_t btp_lock = PTHREAD_MUTEX_INITIALIZER;
+static char btp_master[PATH_MAX];
+static int btp_state; /* 0 = not attempted, 1 = built, -1 = build failed */
+
+/*
+ * The copy holds g_spawn_mtx and opens O_CLOEXEC, and both are load-bearing.
+ *
+ * Without them this passed run alone and failed 40 tests in the full parallel
+ * run, every failure a -1 out of posix_spawnp. That is ETXTBSY: while one
+ * thread has a binary open for writing, another thread's posix_spawn forks, the
+ * child inherits that write fd, and a third thread's exec of the same binary is
+ * refused because a process still holds it open for writing. Serialising
+ * against the spawn lock closes the fork window; O_CLOEXEC means an inherited
+ * fd cannot outlive an exec even if one slips through.
+ *
+ * cc never hit this because it created and closed the file inside its own
+ * process, so nothing of ours ever held the fd across someone else's fork.
+ */
+static bool btp_copy(const char *from, const char *to) {
+	bool ok = false;
+	pthread_mutex_lock(&g_spawn_mtx);
+	int in = open(from, O_RDONLY | O_CLOEXEC);
+	if (in >= 0) {
+		int out = open(to, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+		if (out >= 0) {
+			char buf[65536];
+			ssize_t n;
+			ok = true;
+			while ((n = read(in, buf, sizeof buf)) > 0) {
+				ssize_t off = 0;
+				while (off < n) {
+					ssize_t w = write(out, buf + off, (size_t)(n - off));
+					if (w <= 0) { ok = false; break; }
+					off += w;
+				}
+				if (!ok) break;
+			}
+			if (n < 0) ok = false;
+			if (close(out) != 0) ok = false;
+		}
+		close(in);
+	}
+	pthread_mutex_unlock(&g_spawn_mtx);
+	if (!ok) remove(to);
+	return ok;
+}
+
 static bool build_test_prism_binary(const char *prism_bin, const char *name) {
-	const char *cc = getenv("CC");
-	if (!shell_word_ok(cc)) cc = "cc";
-	char *argv[] = {(char *)cc, "prism.c", "-O0", "-g", "-o", (char *)prism_bin, NULL};
-	int status = run_exec_argv(argv);
+	pthread_mutex_lock(&btp_lock);
+	if (btp_state == 0) {
+		char dir[PATH_MAX];
+		btp_state = -1;
+		if (test_mkdtemp(dir, "prism_btp_")) {
+			snprintf(btp_master, sizeof btp_master, "%s/prism_master", dir);
+			const char *cc = getenv("CC");
+			if (!shell_word_ok(cc)) cc = "cc";
+			char *argv[] = {(char *)cc,  "prism.c", "-O0", "-g",
+					"-o",	     btp_master, NULL};
+			if (run_exec_argv(argv) == 0) btp_state = 1;
+		}
+	}
+	pthread_mutex_unlock(&btp_lock);
+
+	int status = (btp_state == 1 && btp_copy(btp_master, prism_bin)) ? 0 : 1;
 	CHECK_EQ(status, 0, name);
 	return status == 0;
 }
@@ -6710,6 +6786,11 @@ static void test_orelse_bracket_leak_in_return_defer(void) {
 //   cc -x c - -x none -x objective-c ...
 // The user's -x flag ends up AFTER stdin (-), so it has no effect.
 // The pipe language must use the user's -x value, not hardcoded "c".
+/* POSIX-only: this test calls run_exec_argv / compiler_available / symlink,
+ * which are themselves #ifndef _WIN32. The call site is inside UNIX_ONLY(),
+ * which expands to nothing on Windows, so before this guard the body still
+ * compiled there as unreferenced dead code full of implicit declarations. */
+#ifndef _WIN32
 static void test_cli_x_lang_pipe_ordering(void) {
 	printf("\n--- CLI -x language pipe ordering ---\n");
 
@@ -6822,6 +6903,7 @@ static void test_cli_x_lang_pipe_ordering(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+#endif
 
 /* `prism -c -` must treat lone `-` as a stdin TU (GCC/Clang), not a passthrough
  * cc arg. Without `-x`, preprocess must inject `-x c`; `-x none` maps to `c`. */
@@ -7262,6 +7344,11 @@ static void test_noflat_include_dedup(void) {
 // "gcc" on non-Apple platforms (or /usr/bin/gcc on Apple which IS clang).
 // This causes -fpreprocessed to be incorrectly passed to clang, which doesn't
 // support it, failing with: "cc: error: unknown argument '-fpreprocessed'"
+/* POSIX-only: this test calls run_exec_argv / compiler_available / symlink,
+ * which are themselves #ifndef _WIN32. The call site is inside UNIX_ONLY(),
+ * which expands to nothing on Windows, so before this guard the body still
+ * compiled there as unreferenced dead code full of implicit declarations. */
+#ifndef _WIN32
 static void test_fpreprocessed_not_passed_to_clang(void) {
 	printf("\n--- -fpreprocessed not passed to clang ---\n");
 
@@ -7321,6 +7408,7 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+#endif
 
 // Regression: meson's `has_header_symbol` probe invokes the compiler with
 // `-c -Werror=unused-command-line-argument`. prism used to forward `-c` (and
@@ -7328,6 +7416,9 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 // probe with "argument unused during compilation: '-c'", causing false-negative
 // feature detection (e.g. wayland's SFD_CLOEXEC check). Verify that probe-style
 // flags are filtered out of the PP invocation so compilation still succeeds.
+/* POSIX-only, same reason as the guarded tests above: the helpers it calls
+ * are #ifndef _WIN32 and UNIX_ONLY() removes the call on Windows. */
+#ifndef _WIN32
 static void test_pp_strips_compile_only_flags(void) {
 	printf("\n--- PP strips -c/-o from preprocess step ---\n");
 
@@ -7381,6 +7472,7 @@ static void test_pp_strips_compile_only_flags(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+#endif
 
 // Regression: -fbounds-check must NOT wrap struct/union field array dimensions.
 // C11 6.7.2.1 says brackets after a field name in struct-declaration-list are
@@ -7454,6 +7546,11 @@ static void test_signal_temps_register_overflow(void) {
 // make_temp_file used to create a file via mkstemps (O_EXCL) but
 // immediately close(fd) and return 0.  The fix: return the open fd so
 // callers use fdopen() instead of fopen(), eliminating the TOCTOU window.
+/* POSIX-only: this test calls run_exec_argv / compiler_available / symlink,
+ * which are themselves #ifndef _WIN32. The call site is inside UNIX_ONLY(),
+ * which expands to nothing on Windows, so before this guard the body still
+ * compiled there as unreferenced dead code full of implicit declarations. */
+#ifndef _WIN32
 static void test_make_temp_file_toctou_symlink(void) {
 	char path[PATH_MAX];
 	int fd = make_temp_file(path, sizeof(path), "prism_toctou_XXXXXX", 0, NULL);
@@ -7495,6 +7592,7 @@ static void test_make_temp_file_toctou_symlink(void) {
 	unlink(path);
 	unlink(victim);
 }
+#endif
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 // signal_temps_register uses a non-atomic load-check-store pattern.
@@ -8118,7 +8216,14 @@ static void test_cli_main_leak_asan(void) {
 	/* Build prism with ASan+LSan — skip if compiler lacks support */
 	const char *cc = getenv("CC");
 	if (!shell_word_ok(cc)) cc = "cc";
-	char *build_argv[] = {(char *)cc, "prism.c", "-O1", "-g",
+	/* -O0, not -O1. Measured on the box: -O1 -g takes 7.53s to build this TU
+	 * under ASan, -O0 -g takes 1.44s, and that six seconds was the single
+	 * largest test in the suite and the floor under the whole run. The test
+	 * asserts an exit code, and LSan tracks allocations at runtime, so the
+	 * optimisation level cannot change what it detects -- if anything -O0 is
+	 * the stricter setting, because -O1 is free to delete an allocation that
+	 * would otherwise have been reported as leaked. */
+	char *build_argv[] = {(char *)cc, "prism.c", "-O0", "-g",
 		"-fsanitize=address,leak", "-fno-omit-frame-pointer",
 		"-o", prism_bin, NULL};
 	int status = run_exec_argv(build_argv);
@@ -10661,6 +10766,12 @@ void run_api_tests_4(void) {
 	test_collect_source_defines_ifdef_both_branches_extracted();
 	test_collect_source_defines_after_code_line();
 	test_signal_temps_ready_flag();
+}
+
+/* Second half of group 4, split for the same reason group 3 was: one suite is
+ * one thread, so the group's cost is a floor under the whole run. */
+void run_api_tests_6(void) {
+	printf("\n=== API TESTS (group 6) ===\n");
 	test_collect_source_defines_block_comment_end_same_line();
 	test_collect_source_defines_disabled_include_abi_drop();
 	test_generic_controlling_expr_mutilation();
