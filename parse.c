@@ -10531,7 +10531,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 		}
 		/* Everything except a leading attribute is parser-owned and stable.
 		 * Bake auto-static once; Pass 2 only checks its pre-type emission span. */
-		if (pparse_feat(PPARSE_F_AUTO_STATIC) && brace_depth > 0 && !decl_raw &&
+		if (pparse_feat(PPARSE_F_AUTO_STATIC) && brace_depth > 0 && !decl_raw && !saw_static &&
 		    (pparse_decl_const_flags(&type, &decl) & PPARSE_DECL_CONST_EXPLICIT) &&
 		    !type.has_volatile && !type.has_hidden_volatile && !type.has_volatile_member && !type.has_static &&
 		    !type.has_extern && !type.has_register && !type.has_auto && !type.has_constexpr &&
@@ -12168,9 +12168,9 @@ static unsigned pparse_context_intro(PParseToken *t) {
 	unsigned r = (pparse_is_unevaluated_operand_intro(t) || (t->tag & PPARSE_TT_GENERIC) ||
 		      (t->flags & PPARSE_TF_STATIC_ASSERT)) ? PPARSE_CI_UNEVAL : 0;
 	bool word = t->kind == PPARSE_TK_IDENT || t->kind == PPARSE_TK_KEYWORD;
-	bool alignof = word && ((t->len == 8 && prism_memeq_static(pparse_loc(_pc, t), "_Alignof", 8)) ||
-			      (t->len == 7 && prism_memeq_static(pparse_loc(_pc, t), "alignof", 7)));
-	if (alignof) r |= PPARSE_CI_ALIGNOF | (t->kind == PPARSE_TK_IDENT ? PPARSE_CI_UNEVAL : 0);
+	bool is_alignof = word && ((t->len == 8 && prism_memeq_static(pparse_loc(_pc, t), "_Alignof", 8)) ||
+				  (t->len == 7 && prism_memeq_static(pparse_loc(_pc, t), "alignof", 7)));
+	if (is_alignof) r |= PPARSE_CI_ALIGNOF | (t->kind == PPARSE_TK_IDENT ? PPARSE_CI_UNEVAL : 0);
 	if (word && ((t->len == 8 && prism_memeq_static(pparse_loc(_pc, t), "offsetof", 8)) ||
 		     (t->len == 18 && prism_memeq_static(pparse_loc(_pc, t), "__builtin_offsetof", 18))))
 		r |= PPARSE_CI_OFFSETOF;
