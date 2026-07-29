@@ -110,6 +110,18 @@ typedef struct {
 	int source_define_count;
 	int source_define_cap;
 	char *active_membuf; // open_memstream buffer; freed on longjmp recovery
+	/* open_memstream's size-out parameter. Both of the pointers handed to
+	 * open_memstream must outlive every fclose of that stream, because the
+	 * C library writes the final buffer address and length THROUGH them at
+	 * close. In library mode the close can happen in error_recovery_result,
+	 * after a longjmp has already unwound the frame that called
+	 * open_memstream — so a `size_t memlen` local there is a dangling
+	 * pointer by then, and fclose writes a length into whatever now
+	 * occupies that stack slot. That was a real crash: glibc's fclose wrote
+	 * 0 over error_recovery_result's own hidden struct-return pointer, and
+	 * the function segfaulted storing its result. active_membuf was already
+	 * moved here for the same reason; the length was left behind. */
+	size_t active_memlen;
 } PrismState;
 
 static PRISM_THREAD_LOCAL PrismState prism_state_storage;
@@ -1814,300 +1826,20 @@ static PParseToken *try_bracket_orelse(PParseToken *tok) {
 	return NULL;
 }
 
-#define BOUNDS_COMM_DIAG(t, msg)                                                                             \
-	do {                                                                                                 \
-		if (pparse_feat(PPARSE_F_WARN_SAFETY)) {                                                                   \
-			pparse_warn_tok((t), msg);                                                                  \
-			return NULL;                                                                         \
-		}                                                                                            \
-		pparse_error_tok((t), msg);                                                                         \
-	} while (0)
-
 static PParseToken *try_bounds_check_deref_add(PParseToken *tok);
 
+/* Emit `a[__prism_bchk(idx, sizeof(a)/sizeof(a[0]))]`.
+ *
+ * The decision — whether this subscript can be checked at all, which array the
+ * bound comes from, how many dimensions are already peeled, and whether an
+ * outer pointer cast changes the element size — belongs to parse.c and is made
+ * by pparse_bounds_plan_subscript. What is left here is the write-out. */
 static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 	PPARSE_CTX();
-	if (!pparse_feat(PPARSE_F_BOUNDS_CHECK)) return NULL;
-	if (!pparse_match_ch(tok, '[') || !(tok->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, tok)) return NULL;
-	if (tok->flags & PPARSE_TF_C23_ATTR) return NULL;
-	if (pparse_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
-	/* Idempotence: an index already wrapped by a previous Prism pass
-	 * (`a[__prism_bchk(...)]` — e.g. -save-temps .i re-compiles or
-	 * --prism-verify's second pass) must not be wrapped again.  The
-	 * __prism_ namespace is reserved, so this cannot fire on user code. */
-	{
-		PParseToken *idx0 = pparse_next(_pc, tok);
-		if (idx0 && idx0->kind == PPARSE_TK_IDENT && idx0->len == 12 &&
-		    prism_memeq_static(pparse_loc(_pc, idx0), "__prism_bchk", 12))
-			return NULL;
-	}
-	// ALWAYS declarator dimensions per C11 6.7.2.1, never expression
-	// brackets never get tagged P1_DECL_BRACKET via parse_declarator.
-	if (in_struct_body()) return NULL;
-	if (!last_emitted) return NULL;
-	uint32_t ti = pparse_idx(_pc, tok);
-	PParseToken *rp_prev = (ti >= 1) ? &pparse_token_pool[ti - 1] : NULL;
-	if (rp_prev) {
-		PParseToken *rp = rp_prev;
-		if (pparse_match_ch(rp, ')') && (rp->flags & PPARSE_TF_CLOSE) && pparse_pair(_pc, rp)) {
-			PParseToken *op = pparse_pair(_pc, rp);
-			if (pparse_bounds_paren_derives_array(op)) BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_DERIVED_SUB);
-			/* `(a+i)[0]` must not wrap index 0 against sizeof(a) — the
-			 * base is already offset. Same unverifiable shape as `*(a+i)`. */
-			if (pparse_bounds_paren_has_array_arithmetic(op)) {
-				BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
-			}
-		}
-	}
+	PParseBoundsPlan plan;
+	if (!pparse_bounds_plan_subscript(tok, last_emitted, in_struct_body(), &plan)) return NULL;
 
-	// ISO C treats `(i)[b]` the same as `i[b]` (commutative subscript).
-	if (rp_prev) {
-		PParseToken *rp = rp_prev;
-		if (pparse_match_ch(rp, ')') && pparse_pair(_pc, rp)) {
-			PParseToken *op = pparse_pair(_pc, rp);
-			PParseToken *idx = pparse_next(_pc, op);
-			if (pparse_is_value_name_token(idx) && pparse_next(_pc, idx) == rp) {
-				PParseToken *rb_close = pparse_pair(_pc, tok);
-				PParseToken *inner = pparse_next(_pc, tok);
-				if (rb_close && inner && pparse_next(_pc, inner) == rb_close &&
-				    pparse_bounds_is_tracked_array(inner) && !pparse_bounds_is_tracked_array(idx))
-					BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_IDX_ARR);
-			}
-		}
-	}
-
-	// Commutative-subscript bypass check: ISO C defines `idx[arr]` as
-	{
-		PParseToken *rb_close = pparse_pair(_pc, tok);
-		PParseToken *inner_first = pparse_next(_pc, tok);
-		/* Parenthesized `idx[(&arr[0])]` and bare `idx[&arr[0]]` both derive
-		 * an unchecked pointer; require rewrite to `arr[idx]`. */
-		if (inner_first && rb_close && pparse_bounds_span_derives_array(inner_first, rb_close))
-			BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_DERIVED);
-	}
-
-	bool comma_resolved = false;
-	{
-		PParseToken *close_scan = pparse_pair(_pc, tok);
-		PParseToken *inner = pparse_next(_pc, tok);
-		PParseToken *iclose = close_scan;
-		/* ISO `idx[(e1, arr)]` == `idx[arr]`; unwrap comma tail so the
-     * main path sees the array ident.  If the last operand is the
-     * tracked array, this is not a commutative *bypass* (it is
-     * `arr` with index `idx` in disguise) — skip hard-pparse_error diags. */
-		if (pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN)) {
-			PParseToken *pclose = pparse_pair(_pc, inner);
-			if (pclose) {
-				PParseToken *lastop = pparse_last_comma_operand(inner, pclose);
-				if (lastop && lastop != pparse_next(_pc, inner) && pparse_next(_pc, lastop) == pclose) {
-					inner = lastop;
-					iclose = pclose;
-					if (pparse_bounds_is_tracked_array(lastop)) comma_resolved = true;
-				}
-			}
-		}
-		if (!comma_resolved) {
-			/* If last_emitted is a struct/union field access (preceded by
-       * `.`/`->`), we do not know the field's type from the typedef
-       * table, so we cannot assert a commutative bypass. Skip both
-       * branches — the final brute-scan guard below is gated by the
-       * same `memb` flag and handles this case correctly. */
-			bool le_is_member = pparse_idx(_pc, last_emitted) >= 1 &&
-					    (pparse_token_pool[pparse_idx(_pc, last_emitted) - 1].tag & PPARSE_TT_MEMBER);
-			if (!le_is_member) {
-				while (inner != iclose && pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN) &&
-				       pparse_pair(_pc, inner) && pparse_next(_pc, pparse_pair(_pc, inner)) == iclose) {
-					iclose = pparse_pair(_pc, inner);
-					inner = pparse_next(_pc, inner);
-				}
-				if (inner != iclose && pparse_next(_pc, inner) == iclose &&
-				    pparse_bounds_is_tracked_array(inner)) {
-					PParseToken *le = pparse_bounds_peel_paren_ident(last_emitted);
-					if (!pparse_bounds_is_tracked_array(le) && !pparse_bounds_expr_base_is_pointer(le))
-						BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_IDX_ARR);
-				}
-				/* `ptr[arr[i]]` / `i[arr[j]]`: array name is itself
-				 * subscripted — SPEC §6.10: not a commutative bypass;
-				 * the inner `[` gets its own recursive wrap. */
-			} // !le_is_member
-		} // !comma_resolved
-	}
-	if (comma_resolved) BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_COMMA_OP);
-	{
-		PParseToken *rb = pparse_pair(_pc, tok);
-		/* `(i)[…]` / `(2)[…]`: last_emitted is `)`, peel to the index
-		 * primary so ternary/arith hidden-array scans still fire. */
-		PParseToken *le = pparse_bounds_peel_index_lhs(last_emitted);
-		if (rb && (pparse_is_value_name_token(le) || le->kind == PPARSE_TK_NUM || last_emitted->kind == PPARSE_TK_NUM)) {
-			bool memb = pparse_idx(_pc, le) >= 1 && (pparse_token_pool[pparse_idx(_pc, le) - 1].tag & PPARSE_TT_MEMBER);
-			bool left_ok_scan = !memb && le->kind != PPARSE_TK_NUM && !pparse_is_known_typedef(le) &&
-					    pparse_bounds_is_tracked_array(le);
-			PParseToken *hit = left_ok_scan ? NULL : pparse_bounds_find_tracked_array(pparse_next(_pc, tok), rb);
-			while (hit) {
-				PParseToken *nx = pparse_next(_pc, hit);
-				if (!(nx && pparse_match_ch(nx, '[') && (nx->flags & PPARSE_TF_OPEN))) break;
-				hit = pparse_bounds_find_tracked_array(pparse_next(_pc, nx), rb);
-			}
-			if (hit) BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_SCAN);
-			/* `0[(a+i)]` — array arith in index paren */
-			PParseToken *inner0 = pparse_next(_pc, tok);
-			if (!left_ok_scan && inner0 && pparse_match_ch(inner0, '(') && (inner0->flags & PPARSE_TF_OPEN) &&
-			    pparse_pair(_pc, inner0) && pparse_next(_pc, pparse_pair(_pc, inner0)) == rb &&
-			    pparse_bounds_paren_has_array_arithmetic(inner0)) {
-				BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
-			}
-		}
-	}
-	PParseToken *name_tok = last_emitted;
-	if (pparse_idx(_pc, tok) >= 1) {
-		PParseToken *pool_prev = &pparse_token_pool[pparse_idx(_pc, tok) - 1];
-		if (pool_prev != last_emitted &&
-		    (pparse_match_ch(pool_prev, ']') || pparse_match_ch(pool_prev, ')') || pparse_is_value_name_token(pool_prev)))
-			name_tok = pool_prev;
-	}
-	int dim_depth = 0;
-	while (1) {
-		if (pparse_match_ch(name_tok, ')') && pparse_pair(_pc, name_tok)) {
-			PParseToken *open = pparse_pair(_pc, name_tok);
-			if (pparse_idx(_pc, open) >= 1) {
-				PParseToken *bp = &pparse_token_pool[pparse_idx(_pc, open) - 1];
-				if (pparse_is_value_name_token(bp) || bp->kind == PPARSE_TK_NUM || pparse_match_ch(bp, ')') ||
-				    pparse_match_ch(bp, ']'))
-					break;
-			}
-			PParseToken *inner = pparse_next(_pc, open);
-			if (!inner) break;
-			if (pparse_is_value_name_token(inner) && pparse_next(_pc, inner) == name_tok) {
-				name_tok = inner;
-				break;
-			}
-			if (pparse_match_ch(inner, '(') && pparse_pair(_pc, inner) &&
-			    pparse_next(_pc, pparse_pair(_pc, inner)) == name_tok) {
-				name_tok = pparse_pair(_pc, inner);
-				continue;
-			}
-			if (pparse_idx(_pc, name_tok) >= 1) {
-				PParseToken *inner_last = &pparse_token_pool[pparse_idx(_pc, name_tok) - 1];
-				if (pparse_match_ch(inner_last, ']')) {
-					name_tok = inner_last;
-					continue;
-				}
-			}
-			break;
-		}
-		if (pparse_match_ch(name_tok, ']') && pparse_pair(_pc, name_tok)) {
-			PParseToken *open_br = pparse_pair(_pc, name_tok);
-			if (pparse_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) break;
-			if (open_br->flags & PPARSE_TF_C23_ATTR) break;
-			if (pparse_idx(_pc, open_br) < 1) break;
-			PParseToken *before = &pparse_token_pool[pparse_idx(_pc, open_br) - 1];
-			if (!(pparse_is_value_name_token(before) || pparse_match_ch(before, ')') || pparse_match_ch(before, ']')))
-				break;
-			name_tok = before;
-			dim_depth++;
-			continue;
-		}
-		break;
-	}
-	if (!pparse_is_value_name_token(name_tok) && last_emitted) {
-		PParseToken *probe = last_emitted;
-		while (probe && pparse_match_ch(probe, ')') && pparse_pair(_pc, probe)) {
-			PParseToken *op = pparse_pair(_pc, probe);
-			if (pparse_bounds_paren_has_array_arithmetic(op)) {
-				BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
-			}
-			PParseToken *hit = pparse_bounds_find_tracked_array(pparse_next(_pc, op), probe);
-			if (hit && pparse_bounds_is_tracked_array(hit)) {
-				name_tok = hit;
-				break;
-			}
-			if (pparse_idx(_pc, op) < 1) break;
-			probe = &pparse_token_pool[pparse_idx(_pc, op) - 1];
-		}
-	}
-	if (!pparse_is_value_name_token(name_tok)) return NULL;
-	if (pparse_is_known_typedef(name_tok)) return NULL;
-	if (pparse_idx(_pc, name_tok) >= 1 && (pparse_token_pool[pparse_idx(_pc, name_tok) - 1].tag & PPARSE_TT_MEMBER)) return NULL;
-	if (pparse_idx(_pc, name_tok) >= 1) {
-		PParseToken *pv = &pparse_token_pool[pparse_idx(_pc, name_tok) - 1];
-		if (pv->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) return NULL;
-		if (pparse_match_ch(pv, '*') && !(pv->flags & PPARSE_TF_OPEN) && pparse_idx(_pc, pv) >= 1) {
-			PParseToken *pp = &pparse_token_pool[pparse_idx(_pc, pv) - 1];
-			bool is_decl_star = (pp->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) ||
-					    (pparse_match_ch(pp, '*') && !(pp->flags & PPARSE_TF_OPEN)) ||
-					    (pparse_match_ch(pp, '(') && (pp->flags & PPARSE_TF_OPEN));
-			if (is_decl_star) return NULL;
-		}
-	}
-	PParseArrayBindingInfo array = pparse_array_binding_info(name_tok);
-	if (!array.tracked) return NULL;
-	if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return NULL;
-	if (pparse_idx(_pc, name_tok) >= 1) {
-		PParseToken *operand_start = name_tok;
-		PParseToken *operand_end = name_tok;
-		PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, operand_start) - 1];
-		while (pparse_match_ch(prev, '(') && (prev->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, prev)) {
-			PParseToken *rp = pparse_pair(_pc, prev);
-			if (!rp || pparse_next(_pc, prev) != operand_start || pparse_next(_pc, operand_end) != rp) break;
-			operand_start = prev;
-			operand_end = rp;
-			if (pparse_idx(_pc, prev) < 1) {
-				prev = NULL;
-				break;
-			}
-			prev = &pparse_token_pool[pparse_idx(_pc, prev) - 1];
-		}
-		if (prev && pparse_match_ch(prev, '&') && !(prev->flags & PPARSE_TF_OPEN)) {
-			bool unary = true;
-			if (pparse_idx(_pc, prev) >= 1) {
-				PParseToken *pp = &pparse_token_pool[pparse_idx(_pc, prev) - 1];
-				/* `)` after a cast type-name `(void)` / `(int *)` still
-				 * leaves `&` unary — `(void)&a[n]` is one-past-legal.
-				 * Expression `)` (`(x)&a[i]`) is binary `&`. */
-				if (pparse_is_value_name_token(pp) || pp->kind == PPARSE_TK_NUM || pp->kind == PPARSE_TK_STR ||
-				    pparse_match_ch(pp, ']') ||
-				    (pparse_match_ch(pp, ')') && !pparse_close_paren_ends_cast_type_name(pp)))
-					unary = false;
-			}
-			if (unary) return NULL;
-		}
-	}
-
-	PParseToken *arr_tok = name_tok;
-	PParseToken *close = pparse_pair(_pc, tok);
-	/* Pointer-cast then subscript: bound with cast element size via
-	 * sizeof(arr)/sizeof(*(T *)arr), not sizeof(arr)/sizeof(arr[0]).
-	 * Walk outward so the outermost cast wins: `((int*)(void*)a)[i]` must
-	 * use `*(int*)…`, not the inner `*(void*)`. Also accept pointer-to-array
-	 * casts `(T(*)[N])` whose last token before `)` is `]`. */
-	PParseToken *cast_close = NULL; /* ')' of outermost (T *) / (T(*)[N]) */
-	{
-		PParseToken *probe = arr_tok;
-		for (int peel = 0; peel < 8 && pparse_idx(_pc, probe) >= 1; peel++) {
-			PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, probe) - 1];
-			if (pparse_match_ch(prev, ')') && pparse_pair(_pc, prev)) {
-				PParseToken *open = pparse_pair(_pc, prev);
-				PParseToken *last = pparse_idx(_pc, prev) >= 1 ? &pparse_token_pool[pparse_idx(_pc, prev) - 1] : NULL;
-				if (last && (pparse_match_ch(last, '*') || pparse_match_ch(last, ']'))) {
-					PParseToken *fi = pparse_skip_noise(_pc, pparse_next(_pc, open));
-					bool looks_cast =
-					    fi && (pparse_is_type_keyword(fi) ||
-						   (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) ||
-						   pparse_is_known_typedef(fi));
-					if (looks_cast) {
-						cast_close = prev;
-						probe = open;
-						continue;
-					}
-				}
-				if (pparse_next(_pc, open) == probe && pparse_next(_pc, probe) == prev) {
-					probe = open;
-					continue;
-				}
-			}
-			break;
-		}
-	}
+	PParseToken *close = plan.close;
 	OUT_LIT("[__prism_bchk((__prism_bchk_size_t)(");
 	if (pparse_feat(PPARSE_F_ORELSE) && (pparse_ann(tok) & P1_OE_BRACKET))
 		emit_token_range_orelse(pparse_next(_pc, tok), close);
@@ -2126,20 +1858,20 @@ static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 		}
 	}
 	OUT_LIT("), sizeof(");
-	out_str(pparse_loc(_pc, arr_tok), arr_tok->len);
-	for (int d = 0; d < dim_depth; d++) OUT_LIT("[0]");
+	out_str(pparse_loc(_pc, plan.arr), plan.arr->len);
+	for (int d = 0; d < plan.dim_depth; d++) OUT_LIT("[0]");
 	OUT_LIT(")/sizeof(");
-	if (cast_close) {
+	if (plan.cast_close) {
 		/* sizeof(*(T *)arr) — cast_close is ')' of (T *) before arr. */
-		PParseToken *cast_open = pparse_pair(_pc, cast_close);
+		PParseToken *cast_open = pparse_pair(_pc, plan.cast_close);
 		OUT_LIT("(*");
-		PPARSE_FOR_RANGE(ct, cast_open, arr_tok)
+		PPARSE_FOR_RANGE(ct, cast_open, plan.arr)
 			emit_tok(ct);
-		out_str(pparse_loc(_pc, arr_tok), arr_tok->len);
+		out_str(pparse_loc(_pc, plan.arr), plan.arr->len);
 		OUT_LIT(")");
 	} else {
-		out_str(pparse_loc(_pc, arr_tok), arr_tok->len);
-		for (int d = 0; d <= dim_depth; d++) OUT_LIT("[0]");
+		out_str(pparse_loc(_pc, plan.arr), plan.arr->len);
+		for (int d = 0; d <= plan.dim_depth; d++) OUT_LIT("[0]");
 	}
 	OUT_LIT("))]");
 	return pparse_next(_pc, close);
@@ -2147,86 +1879,13 @@ static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 
 static PParseToken *try_bounds_check_deref_add(PParseToken *tok) {
 	PPARSE_CTX();
-	if (!pparse_feat(PPARSE_F_BOUNDS_CHECK)) return NULL;
-	if (!pparse_match_ch(tok, '*') || (tok->flags & PPARSE_TF_OPEN)) return NULL;
-	if (pparse_token_is_in_unevaluated_operand(tok)) return NULL;
-	if (pparse_idx(_pc, tok) >= 1) {
-		PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, tok) - 1];
-		if (prev->kind == PPARSE_TK_NUM || prev->kind == PPARSE_TK_STR) return NULL;
-		if (prev->kind == PPARSE_TK_IDENT && !(prev->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) &&
-		    !(prev->tag & (PPARSE_TT_RETURN | PPARSE_TT_GOTO | PPARSE_TT_DEFER))) return NULL;
-		if (pparse_match_ch(prev, ']')) return NULL;
-		if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE)) {
-			PParseToken *om = pparse_pair(_pc, prev);
-			PParseToken *fi = om ? pparse_next(_pc, om) : NULL;
-			bool looks_cast = fi && (pparse_is_type_keyword(fi) ||
-						 (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)));
-			if (!looks_cast) return NULL;
-		}
+	/* Never wraps anything — `*(a+i)` cannot be checked, only reported. */
+	if (pparse_bounds_deref_add_is_unverifiable(tok)) {
+		if (pparse_feat(PPARSE_F_WARN_SAFETY))
+			pparse_warn_tok(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
+		else
+			pparse_error_tok(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
 	}
-
-	PParseToken *op = pparse_next(_pc, tok);
-	if (!op || !pparse_match_ch(op, '(') || !(op->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, op)) return NULL;
-	/* Peel casts: `*(T*)(a+i)` / `*(int *)(a+i)` — otherwise the cast
-	 * group hides the additive paren and the check never fires. */
-	for (;;) {
-		PParseToken *cast_close = pparse_pair(_pc, op);
-		PParseToken *fi = pparse_next(_pc, op);
-		bool looks_cast =
-		    fi && (pparse_is_type_keyword(fi) || (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)));
-		if (!looks_cast) break;
-		PParseToken *after = pparse_next(_pc, cast_close);
-		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, after))
-			return NULL;
-		op = after;
-	}
-	PParseToken *cp = pparse_pair(_pc, op);
-	PParseToken *lhs = pparse_next(_pc, op);
-	if (!lhs || lhs == cp) return NULL;
-	/* Peel redundant outer paren layers: `*((a + 1))` → scan `a + 1`.
-	 * Without this, the inner `(a + 1)` is skipped as a nested group and
-	 * the unverifiable pointer arithmetic bypasses -fbounds-check. */
-	PParseToken *scan_end = cp;
-	while (lhs && pparse_match_ch(lhs, '(') && (lhs->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, lhs)) {
-		PParseToken *inner_cp = pparse_pair(_pc, lhs);
-		if (!inner_cp || pparse_next(_pc, inner_cp) != scan_end) break;
-		lhs = pparse_next(_pc, lhs);
-		scan_end = inner_cp;
-		if (!lhs || lhs == scan_end) return NULL;
-	}
-	/* Peel a leading cast inside the grouping: `*((T*)(a+i))` — the cast
-	 * open is not a redundant whole-body wrap, so the loop above stops on
-	 * it and would otherwise skip both `(T*)` and `(a+i)` as nested groups. */
-	for (;;) {
-		if (!lhs || !pparse_match_ch(lhs, '(') || !(lhs->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, lhs)) break;
-		PParseToken *cast_close = pparse_pair(_pc, lhs);
-		PParseToken *fi = pparse_next(_pc, lhs);
-		bool looks_cast =
-		    fi && (pparse_is_type_keyword(fi) || (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)));
-		if (!looks_cast) break;
-		PParseToken *after = pparse_next(_pc, cast_close);
-		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, after))
-			return NULL;
-		PParseToken *add_close = pparse_pair(_pc, after);
-		if (!add_close || pparse_next(_pc, add_close) != scan_end) break;
-		lhs = pparse_next(_pc, after);
-		scan_end = add_close;
-		if (!lhs || lhs == scan_end) return NULL;
-	}
-	// Must contain a top-level `+` or `-` operator inside the parens.
-	bool has_addsub = false;
-	PPARSE_FOR_RANGE(t, lhs, scan_end) {
-		PPARSE_SKIP_GROUP_ON_CLOSE(t)
-		if ((pparse_match_ch(t, '+') || pparse_match_ch(t, '-')) && !(t->flags & PPARSE_TF_OPEN)) {
-			has_addsub = true;
-			break;
-		}
-	}
-	if (!has_addsub) return NULL;
-	// Must reference a tracked array name somewhere in the parens.
-	PParseToken *hit = pparse_bounds_find_tracked_array(lhs, scan_end);
-	if (!hit) return NULL;
-	BOUNDS_COMM_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
 	return NULL;
 }
 
@@ -4233,29 +3892,44 @@ static const char *cc_next_token(const char *p, const char **start, int *len, bo
 	return p;
 }
 
+/* `CC=/path with spaces/cc` is one argv entry, not several.
+ *
+ * cc_executable, cc_split_into_argv and cc_extra_arg_count each need to know
+ * whether the whole CC string, trimmed, names a real executable — and each
+ * used to answer it with its own copy of the trim, the space/quote scan and
+ * the access() probe. Three copies of one predicate is three places for the
+ * three answers to drift apart, and they must agree: cc_extra_arg_count sizes
+ * the argv that cc_split_into_argv then fills.
+ *
+ * Writes the trimmed string into `buf` and returns its length, or 0 when the
+ * string is quoted, has no space, does not fit, or does not name a file. */
+static size_t cc_whole_string_exe(const char *cc, char *buf, size_t bufsz) {
+	if (!cc || !*cc) return 0;
+	while (*cc == ' ' || *cc == '\t') cc++;
+	size_t tlen = strlen(cc);
+	while (tlen > 0 && (cc[tlen - 1] == ' ' || cc[tlen - 1] == '\t')) tlen--;
+	if (tlen == 0 || tlen >= bufsz) return 0;
+	bool has_space = false;
+	for (size_t i = 0; i < tlen; i++) {
+		if (cc[i] == '"' || cc[i] == '\'') return 0;
+		if (cc[i] == ' ' || cc[i] == '\t') has_space = true;
+	}
+	if (!has_space) return 0;
+	memcpy(buf, cc, tlen);
+	buf[tlen] = '\0';
+#ifdef _WIN32
+	return _access(buf, 0) == 0 ? tlen : 0;
+#else
+	return (access(buf, X_OK) == 0 || access(buf, F_OK) == 0) ? tlen : 0;
+#endif
+}
+
 static const char *cc_executable(const char *cc) {
 	if (!cc || !*cc) return cc;
 	/* Prefer the whole string when it is an unquoted path with spaces. */
 	{
-		const char *trim = cc;
-		while (*trim == ' ' || *trim == '\t') trim++;
-		size_t tlen = strlen(trim);
-		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) tlen--;
-		bool has_space = false, has_quote = false;
-		for (size_t i = 0; i < tlen; i++) {
-			if (trim[i] == ' ' || trim[i] == '\t') has_space = true;
-			if (trim[i] == '"' || trim[i] == '\'') has_quote = true;
-		}
-		if (has_space && !has_quote && tlen > 0 && tlen < PATH_MAX) {
-			static PRISM_THREAD_LOCAL char whole[PATH_MAX];
-			memcpy(whole, trim, tlen);
-			whole[tlen] = '\0';
-#ifdef _WIN32
-			if (_access(whole, 0) == 0) return whole;
-#else
-			if (access(whole, X_OK) == 0 || access(whole, F_OK) == 0) return whole;
-#endif
-		}
+		static PRISM_THREAD_LOCAL char whole[PATH_MAX];
+		if (cc_whole_string_exe(cc, whole, sizeof(whole))) return whole;
 	}
 	const char *start;
 	int len;
@@ -4277,29 +3951,16 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 		return;
 	}
 	/* Unquoted paths with spaces (`CC=/path with spaces/cc`) must stay one
-	 * argv entry when they name a real executable — splitting yields ENOENT. */
+	 * argv entry when they name a real executable — splitting yields ENOENT.
+	 * Written back over `dup` so the caller still owns exactly one block. */
 	{
-		char *trim = dup;
-		while (*trim == ' ' || *trim == '\t') trim++;
-		size_t tlen = strlen(trim);
-		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) trim[--tlen] = '\0';
-		bool has_space = false, has_quote = false;
-		for (char *q = trim; *q; q++) {
-			if (*q == ' ' || *q == '\t') has_space = true;
-			if (*q == '"' || *q == '\'') has_quote = true;
-		}
-		if (has_space && !has_quote) {
-#ifdef _WIN32
-			int ok = _access(trim, 0) == 0;
-#else
-			int ok = access(trim, X_OK) == 0 || access(trim, F_OK) == 0;
-#endif
-			if (ok) {
-				if (trim != dup) memmove(dup, trim, tlen + 1);
-				args[(*argc)++] = dup;
-				if (out_dup) *out_dup = dup;
-				return;
-			}
+		char probe[PATH_MAX];
+		size_t tlen = cc_whole_string_exe(cc, probe, sizeof(probe));
+		if (tlen) {
+			memcpy(dup, probe, tlen + 1);
+			args[(*argc)++] = dup;
+			if (out_dup) *out_dup = dup;
+			return;
 		}
 	}
 	const char *p = dup;
@@ -4316,27 +3977,8 @@ static int cc_extra_arg_count(const char *cc) {
 	if (!cc || !*cc) return 0;
 	/* Match cc_split_into_argv: whole-string executable → no extra tokens. */
 	{
-		const char *trim = cc;
-		while (*trim == ' ' || *trim == '\t') trim++;
-		size_t tlen = strlen(trim);
-		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) tlen--;
-		bool has_space = false, has_quote = false;
-		for (size_t i = 0; i < tlen; i++) {
-			if (trim[i] == ' ' || trim[i] == '\t') has_space = true;
-			if (trim[i] == '"' || trim[i] == '\'') has_quote = true;
-		}
-		if (has_space && !has_quote) {
-			char tmp[PATH_MAX];
-			if (tlen < sizeof(tmp)) {
-				memcpy(tmp, trim, tlen);
-				tmp[tlen] = '\0';
-#ifdef _WIN32
-				if (_access(tmp, 0) == 0) return 0;
-#else
-				if (access(tmp, X_OK) == 0 || access(tmp, F_OK) == 0) return 0;
-#endif
-			}
-		}
+		char probe[PATH_MAX];
+		if (cc_whole_string_exe(cc, probe, sizeof(probe))) return 0;
 	}
 	const char *start;
 	int len;
@@ -6966,7 +6608,12 @@ static PrismResult error_recovery_result(void) {
 			 .error_msg = strdup(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
 			 .error_line = _pc->error_line,
 			 .error_col = _ps->error_col};
-	// IMPORTANT: fclose must precede free — POSIX open_memstream only
+	/* fclose must precede free: closing a memstream writes the final buffer
+	 * address through the pointer given to open_memstream, so freeing first
+	 * leaves fclose to publish a dangling pointer into active_membuf — and
+	 * the free below would then be reading what fclose just wrote. Both
+	 * out-parameters live in PrismState precisely so this close is safe
+	 * after the longjmp that unwound transpile_to_result. */
 	if (out_fp) {
 		fclose(out_fp);
 		out_fp = NULL;
@@ -6975,6 +6622,7 @@ static PrismResult error_recovery_result(void) {
 		free(_ps->active_membuf);
 		_ps->active_membuf = NULL;
 	}
+	_ps->active_memlen = 0;
 	prism_reset();
 	return r;
 }
@@ -6983,14 +6631,15 @@ static PrismResult error_recovery_result(void) {
 static PrismResult transpile_to_result(PParseToken *tok) {
 	PRISM_STATE();
 	PrismResult result = {0};
-	size_t memlen = 0;
-#ifdef PRISM_LIB_MODE
+	/* Both out-parameters live in thread-local state rather than on this
+	 * frame, in every build. A longjmp out of transpile_tokens unwinds past
+	 * here, and the fclose in error_recovery_result still writes the final
+	 * buffer address and length through these two pointers — so they have to
+	 * outlive the frame that opened the stream. Keeping the pair together
+	 * also removes three #ifdef PRISM_LIB_MODE forks from this function. */
 	_ps->active_membuf = NULL;
-	FILE *fp = open_memstream(&_ps->active_membuf, &memlen);
-#else
-	char *membuf = NULL;
-	FILE *fp = open_memstream(&membuf, &memlen);
-#endif
+	_ps->active_memlen = 0;
+	FILE *fp = open_memstream(&_ps->active_membuf, &_ps->active_memlen);
 	if (!fp) {
 		result.status = PRISM_ERR_IO;
 		result.error_msg = strdup("open_memstream failed");
@@ -6998,25 +6647,16 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 		return result;
 	}
 	if (transpile_tokens(tok, fp)) {
-#ifdef PRISM_LIB_MODE
 		result.output = _ps->active_membuf;
-#else
-		result.output = membuf;
-#endif
-		result.output_len = memlen;
+		result.output_len = _ps->active_memlen;
 		result.status = PRISM_OK;
 	} else {
-#ifdef PRISM_LIB_MODE
 		free(_ps->active_membuf);
-#else
-		free(membuf);
-#endif
 		result.status = PRISM_ERR_SYNTAX;
 		result.error_msg = strdup("Transpilation failed");
 	}
-#ifdef PRISM_LIB_MODE
 	_ps->active_membuf = NULL;
-#endif
+	_ps->active_memlen = 0;
 	return result;
 }
 
