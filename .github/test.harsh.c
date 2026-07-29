@@ -511,47 +511,12 @@ static void test_harsh_stray_default_outside_switch_rejected(void) {
     prism_free(&r);
 }
 
-static void test_harsh_plain_stray_case_rejected(void) {
-    PrismResult r = prism_transpile_source(
-        "int f(void){ case 1: return 0; }\n",
-        "harsh_plain_stray_case.c", prism_defaults());
-
-    CHECK(r.status != PRISM_OK,
-          "harsh plain stray case: must reject case label outside switch");
-    prism_free(&r);
-}
-
-static void test_harsh_plain_stray_default_rejected(void) {
-    PrismResult r = prism_transpile_source(
-        "int f(void){ default: return 0; }\n",
-        "harsh_plain_stray_default.c", prism_defaults());
-
-    CHECK(r.status != PRISM_OK,
-          "harsh plain stray default: must reject default label outside switch");
-    prism_free(&r);
-}
-
-static void test_harsh_file_scope_control_statements_rejected(void) {
-    const char *bad[] = {
-        "return 0;\n",
-        "break;\n",
-        "continue;\n",
-        "case 1: ;\n",
-        "default: ;\n",
-        "goto L;\nL: ;\n",
-    };
-
-    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-        PrismResult r = prism_transpile_source(bad[i], "harsh_file_scope_control.c", prism_defaults());
-        char name[112];
-        snprintf(name,
-                 sizeof(name),
-                 "harsh file-scope control stmt: bad case %zu rejected",
-                 i + 1);
-        CHECK(r.status != PRISM_OK, name);
-        prism_free(&r);
-    }
-}
+/* Plain stray case/default at function scope, and the six file-scope control
+ * statements, were removed from here: gen/reject-alphabet's fn_stray[] and
+ * file_scope[] cover exactly those inputs. The two functions above are NOT
+ * covered there -- a stray label after a braceless switch whose body was
+ * consumed by a do-while is a different shape from a label in a function that
+ * has no switch at all -- so they stay, and are called below. */
 
 void run_harsh_review_tests(void) {
 #ifndef _MSC_VER
@@ -579,5 +544,6 @@ void run_harsh_review_tests(void) {
     test_harsh_braceless_switch_body_snapshot_limit();
     test_harsh_if_init_else_goto_safety_deep_do_missed();
     test_harsh_if_init_else_body_goto_safety_deep_do_missed();
-    /* stray case/default + file-scope control → completeness gen/reject-alphabet */
+    test_harsh_stray_case_outside_switch_rejected();
+    test_harsh_stray_default_outside_switch_rejected();
 }

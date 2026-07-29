@@ -437,14 +437,16 @@ int main(void) {
 		{"api_2",    run_api_tests_2},
 		{"api_3",    run_api_tests_3},
 		{"api_4",    run_api_tests_4},
+		{"api_5",    run_api_tests_5},
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
 		{"machine",  run_machine_tests},
 		{"alphabet", run_alphabet_tests},
 		{"insertion", run_insertion_tests},
 		{"contexts", run_contexts_tests},
+		/* One suite, but it fans its 126 tiers out over worker threads
+		 * internally -- see cm_tiers[] in test.completeness.c. */
 		{"completeness", run_completeness_tests},
-		{"completeness_exec", run_completeness_open_tests},
 		{"scale",    run_scale_tests},
 		{"runtime",  run_runtime_tests},
 #ifdef HAVE_TORTURE

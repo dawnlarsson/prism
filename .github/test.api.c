@@ -913,8 +913,22 @@ static void test_memory_leak_stress(void) {
 // this produced SIGBUS crashes in the parent when other threads were
 // mid-malloc at fork time.  posix_spawn is atomic on darwin and does not
 // duplicate libc state.
+/*
+ * Every caller of this reads the exit status and nothing else, so the child's
+ * stdout goes to /dev/null rather than being inherited.
+ *
+ * Inheriting it corrupted the suite log. `prism transpile <file>` with no -o
+ * writes the whole translation unit to stdout, so that TU landed in the middle
+ * of the [PASS] stream, and the child and the parent's buffered stdout then
+ * disagreed about the file offset: a 13,740-test run left a log holding 710
+ * PASS lines and a 546 KB hole of NUL bytes. The verdict was never wrong --
+ * the counters are in memory -- but a failing test's diagnostic line had a
+ * 95% chance of being in the part that got eaten.
+ *
+ * Use run_exec_argv_capture when the output is the thing being tested.
+ */
 static int run_exec_argv(char *const argv[]) {
-	return prism_spawn_wait(argv, NULL, NULL);
+	return prism_spawn_wait(argv, "/dev/null", NULL);
 }
 
 static int run_exec_argv_capture(char *const argv[], const char *stdout_path,
@@ -9413,6 +9427,19 @@ void run_api_tests_3(void) {
 	test_version_full_output_for_meson();
 	test_cli_split_D_flag_not_source();
 	test_cli_run_prog_args_and_link_pragma();
+	);
+}
+
+/*
+ * Group 3 was 22.8s of a 23.0s run once the completeness tiers stopped being
+ * the bottleneck: 45 CLI tests, every one spawning the prism binary and a
+ * compiler. Suites get a thread each, so halving the group halves the critical
+ * path. The two halves are no more concurrent with each other than groups 1-4
+ * already were.
+ */
+void run_api_tests_5(void) {
+	printf("\n=== API TESTS (group 5) ===\n");
+	UNIX_ONLY(
 #if defined(__linux__) && defined(__x86_64__)
 	test_system_header_linemarker_flag();
 #endif

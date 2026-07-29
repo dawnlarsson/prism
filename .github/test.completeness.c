@@ -72,11 +72,16 @@ static void cm_report(const char *tier, CmStats *st) {
 	CHECK(st->bad == 0, name);
 }
 
-/* Forward decls for helpers used by tiers defined earlier than they are. */
+/* Forward decls for helpers used by tiers defined earlier than they are.
+ * Guarded to match their definitions: all four are POSIX-only (they spawn a
+ * compiler and run the result), so declaring them unconditionally leaves MSVC
+ * with a static function declared and never defined, which is C2129. */
+#ifndef _WIN32
 static int cm_already_ran(const char *out);
 static int cm_run_plain(const char *code);
 static int cm_exec(const char *src, PrismFeatures feat);
 static int cm_exec_matches_plain(const char *src, PrismFeatures f);
+#endif
 
 /* Forward decls for tiers defined later in this file. */
 static void cm_gen_soft_ident(void);
@@ -1320,7 +1325,19 @@ static void cm_gen_defer_cfg(void) {
  * {defer, orelse, bounds, auto_static, auto_unreachable, zeroinit} on a
  * fixed snippet pack — leak/inject invariants.
  */
-static void cm_gen_feature_cube(void) {
+/*
+ * Feature cube, sliced by mask range.
+ *
+ * This one tier was 44.8s of a 44.8s run: 128 masks x 42 snippets, and the
+ * runnable cells each spawn a compiler and then the built program. The tier
+ * queue cannot subdivide a single call, so while this stayed one row the whole
+ * suite waited on it no matter how many workers were draining. The masks are
+ * independent -- nothing carries across an iteration -- so the loop bound is
+ * simply a parameter, and CM_CUBE_SHARDS rows of the table cover it between
+ * them. Each slice reports its own line so a failure still names a mask range
+ * you can rerun.
+ */
+static void cm_gen_feature_cube_range(unsigned m_lo, unsigned m_hi) {
 	static const char *snips[] = {
 		"void cleanup(void); void f(void){ defer cleanup(); }",
 		"void cleanup(void); void f(void){ defer { cleanup(); } }",
@@ -1376,7 +1393,7 @@ static void cm_gen_feature_cube(void) {
 	long cube_rejected = 0;
 	/* 2^7 = 128 feature masks (warn_safety is the 7th, absorbed from the cert
 	 * suite's -fno-safety hooks) × snips. */
-	for (unsigned mask = 0; mask < 128; mask++) {
+	for (unsigned mask = m_lo; mask < m_hi; mask++) {
 		PrismFeatures f = prism_defaults();
 		f.defer = mask & 1;
 		f.orelse = (mask >> 1) & 1;
@@ -1410,6 +1427,7 @@ static void cm_gen_feature_cube(void) {
 					 * inside it is lowered, so the keyword reaches the
 					 * backend and the output is not meant to build. */
 					!strstr(snips[s], "raw {");
+#ifndef _WIN32 /* cm_exec spawns a compiler and runs the result */
 			if (runnable) {
 				/* Plain cc cannot be the reference here: the snippets use
 				 * defer and orelse, so the untransformed source does not
@@ -1437,9 +1455,12 @@ static void cm_gen_feature_cube(void) {
 				if (strstr(sn, "die(void);")) {
 					size_t L = strlen(prog);
 					snprintf(prog + L, sizeof(prog) - L, "%s", "");
+					/* The include must precede the use: gcc accepts the
+					 * implicit declaration of _Exit, clang 22 rejects it. */
 					snprintf(prog, sizeof(prog),
-						 "%s\n_Noreturn void die(void){ _Exit(0); }\n"
-						 "#include <stdlib.h>\nint main(void){ return 0; }\n",
+						 "#include <stdlib.h>\n%s\n"
+						 "_Noreturn void die(void){ _Exit(0); }\n"
+						 "int main(void){ return 0; }\n",
 						 sn);
 				} else if (strstr(sn, "void f(void)")) {
 					size_t L = strlen(prog);
@@ -1473,6 +1494,7 @@ static void cm_gen_feature_cube(void) {
 							mask, s, rc);
 				}
 			}
+#endif /* !_WIN32 */
 			PrismResult r = cm_txf(snips[s], f);
 			if (!r.output && r.status == PRISM_OK) {
 				cm_note(&st, "cube null out mask=%u s=%zu", mask, s);
@@ -1503,15 +1525,31 @@ static void cm_gen_feature_cube(void) {
 		}
 	}
 	{
-		char nm[192];
+		char nm[224];
 		snprintf(nm, sizeof(nm),
-			 "completeness[gen/feature-cube]: %ld cells, %ld bad, %ld executed, %ld "
-			 "transpile-rejected%s%s",
-			 st.cells, st.bad, cube_exec_seen, cube_rejected, st.bad ? " -- " : "",
-			 st.bad ? st.first : "");
+			 "completeness[gen/feature-cube masks %u-%u]: %ld cells, %ld bad, %ld "
+			 "executed, %ld transpile-rejected%s%s",
+			 m_lo, m_hi - 1, st.cells, st.bad, cube_exec_seen, cube_rejected,
+			 st.bad ? " -- " : "", st.bad ? st.first : "");
 		CHECK(st.bad == 0, nm);
 	}
 }
+
+/* 128 masks over 8 slices. The slices are what the tier table holds. */
+#define CM_CUBE_SHARDS 8
+#define CM_CUBE_SLICE(n)                                                                             \
+	static void cm_gen_feature_cube_##n(void) {                                                  \
+		cm_gen_feature_cube_range((unsigned)(n) * (128 / CM_CUBE_SHARDS),                    \
+					  (unsigned)((n) + 1) * (128 / CM_CUBE_SHARDS));             \
+	}
+CM_CUBE_SLICE(0)
+CM_CUBE_SLICE(1)
+CM_CUBE_SLICE(2)
+CM_CUBE_SLICE(3)
+CM_CUBE_SLICE(4)
+CM_CUBE_SLICE(5)
+CM_CUBE_SLICE(6)
+CM_CUBE_SLICE(7)
 
 #ifndef _WIN32
 /* Compiling byte-identical output twice proves nothing and costs a process
@@ -1903,6 +1941,7 @@ static void cm_gen_raw_product(void) {
 							cm_note(&st,
 								"raw on a function definition is not a no-op f=%zu b=%zu q=%zu",
 								f, b, q);
+#ifndef _WIN32 /* cm_exec spawns a compiler and runs the result */
 						else {
 							/* The text already matched; run both arms and
 							 * require the same behaviour too. Identical
@@ -1941,6 +1980,7 @@ static void cm_gen_raw_product(void) {
 										f, b, q, xa, xb);
 							}
 						}
+#endif /* !_WIN32 */
 					}
 					prism_free(&ra);
 					prism_free(&rb);
@@ -2617,116 +2657,8 @@ static void cm_gen_reject_alphabet(void) {
 	cm_report("gen/reject-alphabet", &st);
 }
 
-void run_completeness_tests(void) {
-	printf("\n=== COMPLETENESS (T1′ generative closed) ===\n");
-	cm_gen_stmt_defer();
-	cm_gen_orelse_sites();
-	cm_gen_autostatic();
-	cm_gen_goto_closed();
-	cm_gen_polarity();
-	cm_gen_hunt3_seed();
-	cm_gen_autounreach();
-	cm_gen_bounds_wrap();
-	cm_gen_zeroinit();
-	cm_gen_defer_cfg();
-	cm_gen_feature_cube();
-	cm_gen_raw_product();
-	cm_gen_defer_ret_shape();
-	cm_gen_golf_pins();
-	cm_gen_reject_alphabet();
-	cm_gen_soft_ident();
-	cm_gen_orelse_actions();
-	cm_gen_zeroinit_dense();
-	/* Promoted from open + new hunters (SPEC-correct oracles). */
-	cm_gen_cast_subscript();
-	cm_gen_name_semantics();
-	cm_gen_attr_multidecl();
-	cm_gen_raw_suppress();
-	cm_gen_linemarker();
-	cm_gen_illformed();
-	cm_gen_generic_decl();
-	cm_gen_bounds_bypass();
-	cm_gen_bounds_multidim();
-	cm_gen_bounds_filescope();
-	cm_gen_cast_correct();
-	cm_gen_goto_assign_first();
-	cm_gen_computed_goto();
-	cm_gen_orelse_reject_dense();
-	cm_gen_defer_expr_splice();
-	cm_gen_raw_feature_matrix();
-	cm_gen_ctrl_paren_defer();
-	cm_gen_bounds_cast_oob();
-	cm_gen_switch_case_bypass();
-	cm_gen_stmt_expr_defer_tail();
-	cm_gen_multi_raw_prefix();
-	cm_gen_atomic_zi_init();
-	cm_gen_defer_braceless_decl();
-	cm_gen_orelse_storage();
-	cm_gen_nested_defer();
-	cm_gen_defer_cf_body();
-	cm_gen_goto_vla_cross();
-	cm_gen_bounds_ptr_arith();
-	cm_gen_attr_ctrlflow();
-	cm_gen_case_orelse();
-	cm_gen_shadow_after_defer();
-	cm_gen_bounds_bypass_dense();
-	cm_gen_unreach_sites();
-	cm_gen_autostatic_sites();
-	cm_gen_zeroinit_sites();
-	cm_gen_orelse_expr_ctx();
-	cm_gen_taint_defer();
-	cm_gen_label_defer_loop();
-	cm_gen_orelse_type_junk_dense();
-	cm_gen_generic_assoc();
-	cm_gen_member_subscript_orelse();
-	cm_gen_comma_orelse_split();
-	cm_gen_braceless_ctrl_defer();
-	cm_gen_cast_orelse_junk();
-	cm_gen_nested_typeof_orelse();
-	cm_gen_compound_lit_orelse();
-	cm_gen_designator_orelse();
-	cm_gen_bitint_orelse();
-	cm_gen_atomic_orelse();
-	cm_gen_pp_span_orelse();
-	cm_gen_empty_orelse_action();
-	cm_gen_dim_orelse_uneval();
-	cm_gen_bounds_param_shadow();
-	/* Market-seven densify layer. */
-	cm_gen_bounds_addr_modes();
-	cm_gen_market7_cross();
-	cm_gen_raw_prefix_feat();
-	cm_gen_zi_typeof_product();
-	cm_gen_orelse_bare_ctrl();
-	cm_gen_defer_switch_product();
-	cm_gen_soft_ident_expr();
-	cm_gen_aur_call_shapes();
-	cm_gen_as_init_shapes();
-	cm_gen_market7_deep();
-	cm_gen_feature_pair();
-	cm_gen_defer_exit_dense();
-	cm_gen_bounds_emit_paths();
-	cm_gen_hunt67_densify();
-	cm_gen_defer_expr_reject();
-	cm_gen_bounds_comm_reject();
-	cm_gen_bounds_derived_lhs();
-	cm_gen_orelse_array_type();
-	cm_gen_atomic_typeof_init();
-	cm_gen_bounds_warn_safety();
-	cm_gen_bounds_uneval_product();
-	cm_gen_bounds_vla_wrap();
-	cm_gen_bounds_deref_sites();
-	cm_gen_bounds_lhs_peel();
-	cm_gen_bounds_rank_registry();
-	cm_gen_bounds_member_falsepos();
-#ifndef _WIN32
-	cm_gen_runtime_defer();
-	cm_gen_runtime_orelse();
-	cm_gen_runtime_bounds();
-	cm_gen_runtime_zi();
-	cm_gen_runtime_cross();
-	cm_gen_ice_stmt_expr();
-#endif
-}
+/* The tier list that stood here is now cm_tiers[] at the end of this file,
+ * where every tier is in scope and the shard workers can drain it. */
 
 /*
  * Soft-keyword × namespace role product: raw/defer/orelse as ordinary names.
@@ -9345,10 +9277,21 @@ static void cm_gen_zeroinit_padding(void) {
 		const char *types;
 		int gap; /* 1 = Prism is known not to cover every byte of this type */
 	} cells[] = {
-	    /* The x87 family. sizeof is 16 (or 12 on 32-bit x86), the value is 10
-	     * bytes, and a zero initializer writes only the value. Elsewhere
-	     * `long double` is a 128-bit quad with no padding and these pass with
-	     * gap unused, which is why the flag records rather than asserts. */
+	    /* `long double` is the one scalar in C with padding bytes, and whether
+	     * a zero initializer covers them is a TOOLCHAIN property, not an
+	     * architecture one. Measured, and none of these reproduce the gap:
+	     *
+	     *   aarch64 Linux, GCC 11        sizeof 16 (quad)        no gap
+	     *   x86_64 Linux, GCC 16         sizeof 16, -O0/1/2      no gap
+	     *   x86_64 Linux, clang 22       sizeof 16, -O0/1/2      no gap
+	     *   macOS arm64, Apple clang 21  sizeof 8 (plain double) no gap
+	     *
+	     * CI did reproduce it, on macOS x86 and Linux x86, where the compilers
+	     * are older and `long double v = 0;` writes only the 10-byte x87 value
+	     * and leaves the rest of the 16-byte slot holding stack. So the flag
+	     * PERMITS a gap rather than expecting one: 0 here, 9 there, and neither
+	     * is a failure. Do not narrow it to an arch check; that was the first
+	     * guess and it is wrong. */
 	    {"long-double", "typedef long double T;", 1},
 	    {"complex-long-double", "typedef long double _Complex T;", 1},
 	    {"volatile-long-double", "typedef volatile long double T;", 1},
@@ -9450,7 +9393,7 @@ static void cm_gen_pp_cache(void) {
 	char *dir = test_mkdtemp(dirbuf, "cm_ppcache_");
 	if (!dir) {
 		cm_note(&st, "could not create temp dir");
-		cm_report("gen/pp-cache", &st);
+			cm_report("gen/pp-cache", &st);
 		return;
 	}
 	snprintf(bin, sizeof(bin), "%s/prism_ppc", dir);
@@ -9607,6 +9550,47 @@ static void cm_gen_pp_cache(void) {
 
 #undef CM_PPC_WRITE
 #undef CM_PPC_CHECK
+	/* The dependency set is recovered by parsing linemarkers, and that parser
+	 * is per-compiler. It understood only GCC/Clang's `# 1 "file"`; MSVC emits
+	 * `#line 1 "file"`, so on Windows every marker was rejected, the dependency
+	 * set collapsed to the top-level input, and editing any include never
+	 * invalidated the entry. Prism served stale preprocessed output with no
+	 * diagnostic. Everything above this point passed throughout, because it
+	 * runs on POSIX where the GCC spelling parses: the tier tested the cache's
+	 * logic and never the parsing it rests on. These call the parser directly,
+	 * so the next spelling that appears is caught on any platform. */
+	{
+		static const struct {
+			const char *marker;
+			const char *want; /* NULL = must be rejected */
+		} mk[] = {
+		    {"# 1 \"a.c\"\n", "a.c"},
+		    {"#line 1 \"a.c\"\n", "a.c"},
+		    {"#  12 \"dir/b.h\"\n", "dir/b.h"},
+		    {"#line  12 \"dir/b.h\"\n", "dir/b.h"},
+		    {"#line 7 \"C:\\\\x\\\\y.c\"\n", "C:\\x\\y.c"},
+		    {"# 1 \"<built-in>\"\n", NULL},
+		    {"#line 1 \"<command-line>\"\n", NULL},
+		    {"#pragma once\n", NULL},
+		    {"#define X 1\n", NULL},
+		    {"int x;\n", NULL},
+		    {"#line \"a.c\"\n", NULL},  /* no number */
+		    {"#lineX 1 \"a.c\"\n", NULL}, /* not the keyword */
+		};
+		for (size_t i = 0; i < sizeof(mk) / sizeof(mk[0]); i++) {
+			char buf[PATH_MAX];
+			const char *m = mk[i].marker;
+			size_t n = pp_marker_path(m, m + strlen(m), buf, sizeof buf);
+			st.cells++;
+			if (mk[i].want == NULL) {
+				if (n) cm_note(&st, "marker %zu: accepted %s, expected reject", i, buf);
+			} else if (!n || strcmp(buf, mk[i].want) != 0) {
+				cm_note(&st, "marker %zu: got %s, expected %s", i, n ? buf : "(reject)",
+					mk[i].want);
+			}
+		}
+	}
+
 	cm_report("gen/pp-cache", &st);
 }
 
@@ -9686,34 +9670,432 @@ static void cm_gen_kw_identifier_ctx(void) {
 
 #endif /* !_WIN32: POSIX-only executed tiers */
 
-void run_completeness_open_tests(void) {
-	printf("\n=== COMPLETENESS EXECUTED TIERS ===\n");
-	/* The compile-and-run oracles live on this second suite thread rather
-	 * than inside run_completeness_tests: each cell spawns cc and then the
-	 * built binary, so they are latency-bound, not CPU-bound, and running
-	 * them beside the static product halves the suite's wall clock. */
-	cm_gen_goto_open();
+/* Spawns compilers and runs the results, so POSIX-only like the other
+ * executed tiers. */
 #ifndef _WIN32
-	cm_gen_cert_compile_run();
-	cm_gen_raw_identifier();
-	cm_gen_raw_string();
-	cm_gen_source_defines();
-	cm_gen_runtime_defer_product();
-	cm_gen_orelse_product();
-	cm_gen_orelse_defer();
-	cm_gen_passthrough();
-	cm_gen_defer_depth();
-	cm_gen_defer_edges();
-	cm_gen_defer_wide();
-	cm_gen_defer_reject();
-	cm_gen_runtime_bounds_trap();
-	cm_gen_runtime_zeroinit();
-	cm_gen_runtime_autostatic();
-	cm_gen_flag_polarity();
-	cm_gen_driver_surfaces();
-	cm_gen_lib_api();
-	cm_gen_zeroinit_padding();
-	cm_gen_pp_cache();
-	cm_gen_kw_identifier_ctx();
+/* ── sanitizers as an independent oracle ──────────────────────────────
+ *
+ * Every other tier is Prism checking Prism: its output against its own
+ * expectations. MSan, ASan and UBSan do not know what Prism intended, which is
+ * exactly what makes them worth the wall clock. Each of the three answers a
+ * safety claim directly:
+ *
+ *   zero-init  MSan must report NO uninitialised read in Prism's output for a
+ *              program where plain C reports one. That is the feature's entire
+ *              purpose, checked by something that is not us.
+ *   bounds     For an out-of-bounds access Prism must TRAP FIRST, before ASan
+ *              can report. If ASan reports instead, the wrap was missing and
+ *              the access really happened: a silent safety hole that no
+ *              text-matching or exit-status oracle here would notice.
+ *   defer,     UBSan must be clean on the lowered output. Defer moves calls
+ *   orelse     across every exit path and orelse hoists its left-hand side
+ *              into a temporary; neither may introduce undefined behaviour
+ *              that the source did not already have.
+ *
+ * Each sanitizer is probed once. Where the toolchain cannot provide one the
+ * cells are skipped and counted, never silently passed: MSan in particular
+ * needs clang and is absent on plenty of hosts. */
+#define CM_SAN_CLEAN 0	  /* ran to completion, sanitizer silent */
+#define CM_SAN_REPORT 1	  /* sanitizer reported a finding */
+#define CM_SAN_TRAPPED 2  /* died by signal: Prism's own check fired first */
+#define CM_SAN_UNAVAIL (-1)
+#define CM_SAN_INFRA (-2)
+
+/* Is `san` usable by the configured compiler? Probed once per sanitizer. */
+static int cm_san_available(const char *san) {
+	/* create_temp_file, not test_mkstemp: the probe source needs a .c suffix
+	 * or the compiler rejects it as an unknown file type and every sanitizer
+	 * looks unavailable. That silently skipped all 16 cells on the first run. */
+	char *src = create_temp_file("int main(void){return 0;}\n");
+	if (!src) return 0;
+	char cmd[PATH_MAX * 2 + 160], bin[PATH_MAX];
+	snprintf(bin, sizeof(bin), "%s.bin", src);
+	snprintf(cmd, sizeof(cmd), "%s -fsanitize=%s -w -o '%s' '%s' >/dev/null 2>&1", cm_cc(), san,
+		 bin, src);
+	int ok = run_command_status(cmd) == 0;
+	unlink(src);
+	unlink(bin);
+	free(src);
+	return ok;
+}
+
+/* Transpile with Prism, build under `san`, run, and classify the outcome. */
+static int cm_exec_sanitized(const char *code, PrismFeatures feat, const char *san, char *out,
+			     size_t outcap) {
+	PrismResult r = cm_txf(code, feat);
+	if (!cm_ok(&r) || !r.output) {
+		prism_free(&r);
+		return CM_SAN_INFRA;
+	}
+	char *path = create_temp_file(r.output);
+	prism_free(&r);
+	if (!path) return CM_SAN_INFRA;
+
+	char bin[PATH_MAX], log[PATH_MAX], cmd[PATH_MAX * 3];
+	snprintf(bin, sizeof(bin), "%s.bin", path);
+	snprintf(log, sizeof(log), "%s.san", path);
+	snprintf(cmd, sizeof(cmd),
+		 "%s -fsanitize=%s -fno-omit-frame-pointer -g -O1 -w -o '%s' '%s' >/dev/null 2>&1",
+		 cm_cc(), san, bin, path);
+	int rc = CM_SAN_INFRA;
+	if (run_command_status(cmd) == 0) {
+		char *argv[] = {bin, NULL};
+		int status = 0;
+		if (prism_spawn_wait_raw(argv, "/dev/null", log, &status) == 0) {
+			char *txt = cm_slurp(log);
+			int reported = txt && (strstr(txt, "runtime error") ||
+					       strstr(txt, "ERROR: AddressSanitizer") ||
+					       strstr(txt, "use-of-uninitialized") ||
+					       strstr(txt, "use-of-uninitialised"));
+			if (out && txt) {
+				snprintf(out, outcap, "%s", txt);
+			}
+			free(txt);
+			/* Order matters: a signal means Prism's own check fired
+			 * before the sanitizer could report on an access that, by
+			 * definition, then never happened. */
+			rc = WIFSIGNALED(status) ? CM_SAN_TRAPPED
+						 : (reported ? CM_SAN_REPORT : CM_SAN_CLEAN);
+		}
+	}
+	unlink(bin);
+	unlink(log);
+	unlink(path);
+	free(path);
+	return rc;
+}
+
+static void cm_gen_sanitizer_oracle(void) {
+	CmStats st = {0};
+	long skipped = 0;
+	PrismFeatures d = prism_defaults();
+	char detail[512];
+
+	/* zero-init: each program reads a local Prism must have zeroed. Under
+	 * plain C these are uninitialised reads; under Prism they must not be. */
+	static const char *uninit[] = {
+	    "static int sink(int v){return v;}\nint main(void){ int x; return sink(x); }\n",
+	    "static int sink(int v){return v;}\nint main(void){ int a[4]; return sink(a[2]); }\n",
+	    "static int sink(int v){return v;}\nstruct S{int x,y;};\n"
+	    "int main(void){ struct S s; return sink(s.x + s.y); }\n",
+	    "static int sink(long v){return (int)v;}\nint main(void){ long *p; return sink((long)(p != 0)); }\n",
+	    "static int sink(int v){return v;}\nint main(void){ int n=3; int v[n]; return sink(v[1]); }\n",
+	};
+	if (cm_san_available("memory")) {
+		for (size_t i = 0; i < sizeof(uninit) / sizeof(uninit[0]); i++) {
+			st.cells++;
+			int rc = cm_exec_sanitized(uninit[i], d, "memory", detail, sizeof detail);
+			if (rc == CM_SAN_INFRA) cm_note(&st, "msan %zu: could not build", i);
+			else if (rc == CM_SAN_REPORT)
+				cm_note(&st, "msan %zu: uninitialised read survived zero-init", i);
+		}
+	} else
+		skipped += sizeof(uninit) / sizeof(uninit[0]);
+
+	/* bounds: every one of these is out of range, so Prism must trap. ASan
+	 * reporting instead would mean the access happened unwrapped. */
+	static const char *oob[] = {
+	    "int main(void){ int a[4]; for(int i=0;i<4;i++)a[i]=i; volatile int j=4; return a[j]; }\n",
+	    "int main(void){ char a[8]; volatile int j=8; return a[j]; }\n",
+	    "int main(void){ int a[2][3]; volatile int j=3; return a[1][j]; }\n",
+	    "int main(void){ volatile int n=4; int a[n]; volatile int j=4; return a[j]; }\n",
+	    "static int g[4];\nint main(void){ volatile int j=4; return g[j]; }\n",
+	};
+	if (cm_san_available("address")) {
+		for (size_t i = 0; i < sizeof(oob) / sizeof(oob[0]); i++) {
+			st.cells++;
+			int rc = cm_exec_sanitized(oob[i], d, "address", detail, sizeof detail);
+			if (rc == CM_SAN_INFRA) cm_note(&st, "asan %zu: could not build", i);
+			else if (rc == CM_SAN_REPORT)
+				cm_note(&st,
+					"asan %zu: ASan reported the overflow, so Prism did not trap it",
+					i);
+			else if (rc == CM_SAN_CLEAN)
+				cm_note(&st, "asan %zu: neither trapped nor reported", i);
+		}
+	} else
+		skipped += sizeof(oob) / sizeof(oob[0]);
+
+	/* defer and orelse: the lowering must not introduce UB of its own. */
+	static const char *ub[] = {
+	    "static void s(int x){(void)x;}\nint main(void){ int a=0; defer s(a); a=1; return 0; }\n",
+	    "static void s(int x){(void)x;}\n"
+	    "int main(void){ for(int i=0;i<3;i++){ defer s(i); if(i==1) continue; } return 0; }\n",
+	    "static void s(int x){(void)x;}\n"
+	    "int main(void){ { defer s(1); { defer s(2); goto out; } } out: return 0; }\n",
+	    "static int g(int n){return n;}\nint main(void){ int v = g(0) orelse 7; return v-7; }\n",
+	    "static int *p(void){ static int v; return &v; }\n"
+	    "int main(void){ int *q = p() orelse 0; return q==0; }\n",
+	    "static void s(int x){(void)x;}\nstatic int g(int n){return n;}\n"
+	    "int main(void){ defer s(0); int v = g(0) orelse 3; int a[4]={0}; return a[v&3]; }\n",
+	};
+	if (cm_san_available("undefined")) {
+		for (size_t i = 0; i < sizeof(ub) / sizeof(ub[0]); i++) {
+			st.cells++;
+			int rc = cm_exec_sanitized(ub[i], d, "undefined", detail, sizeof detail);
+			if (rc == CM_SAN_INFRA) cm_note(&st, "ubsan %zu: could not build", i);
+			else if (rc == CM_SAN_REPORT)
+				cm_note(&st, "ubsan %zu: lowering introduced UB: %.120s", i, detail);
+		}
+	} else
+		skipped += sizeof(ub) / sizeof(ub[0]);
+
+	char name[256];
+	snprintf(name, sizeof(name),
+		 "completeness[gen/sanitizer-oracle]: %ld cells, %ld bad, %ld skipped (sanitizer "
+		 "unavailable)%s%s",
+		 st.cells, st.bad, skipped, st.bad ? " -- " : "", st.bad ? st.first : "");
+	CHECK(st.bad == 0, name);
+}
+#endif /* !_WIN32 */
+
+/*
+ * Every generative tier, in one table.
+ *
+ * These used to be 125 hand-written call sites across two driver functions,
+ * one per suite thread. That made `completeness` 56.6s of a 56.6s run: it was
+ * the critical path on its own while the other twenty suite threads all
+ * finished inside 14s. Tier cost spans five orders of magnitude -- a pure
+ * string-match tier is microseconds, a tier that spawns hundreds of compilers
+ * is seconds -- so splitting by count would just move the bottleneck. The
+ * workers below therefore drain this table through one cursor, which balances
+ * itself whatever the individual costs turn out to be.
+ *
+ * Adding a tier means adding a row here. There is no shard to choose.
+ */
+static void (*const cm_tiers[])(void) = {
+	cm_gen_stmt_defer,
+	cm_gen_orelse_sites,
+	cm_gen_autostatic,
+	cm_gen_goto_closed,
+	cm_gen_polarity,
+	cm_gen_hunt3_seed,
+	cm_gen_autounreach,
+	cm_gen_bounds_wrap,
+	cm_gen_zeroinit,
+	cm_gen_defer_cfg,
+	cm_gen_feature_cube_0,
+	cm_gen_feature_cube_1,
+	cm_gen_feature_cube_2,
+	cm_gen_feature_cube_3,
+	cm_gen_feature_cube_4,
+	cm_gen_feature_cube_5,
+	cm_gen_feature_cube_6,
+	cm_gen_feature_cube_7,
+	cm_gen_raw_product,
+	cm_gen_defer_ret_shape,
+	cm_gen_golf_pins,
+	cm_gen_reject_alphabet,
+	cm_gen_soft_ident,
+	cm_gen_orelse_actions,
+	cm_gen_zeroinit_dense,
+	/* Promoted from open + new hunters (SPEC-correct oracles). */
+	cm_gen_cast_subscript,
+	cm_gen_name_semantics,
+	cm_gen_attr_multidecl,
+	cm_gen_raw_suppress,
+	cm_gen_linemarker,
+	cm_gen_illformed,
+	cm_gen_generic_decl,
+	cm_gen_bounds_bypass,
+	cm_gen_bounds_multidim,
+	cm_gen_bounds_filescope,
+	cm_gen_cast_correct,
+	cm_gen_goto_assign_first,
+	cm_gen_computed_goto,
+	cm_gen_orelse_reject_dense,
+	cm_gen_defer_expr_splice,
+	cm_gen_raw_feature_matrix,
+	cm_gen_ctrl_paren_defer,
+	cm_gen_bounds_cast_oob,
+	cm_gen_switch_case_bypass,
+	cm_gen_stmt_expr_defer_tail,
+	cm_gen_multi_raw_prefix,
+	cm_gen_atomic_zi_init,
+	cm_gen_defer_braceless_decl,
+	cm_gen_orelse_storage,
+	cm_gen_nested_defer,
+	cm_gen_defer_cf_body,
+	cm_gen_goto_vla_cross,
+	cm_gen_bounds_ptr_arith,
+	cm_gen_attr_ctrlflow,
+	cm_gen_case_orelse,
+	cm_gen_shadow_after_defer,
+	cm_gen_bounds_bypass_dense,
+	cm_gen_unreach_sites,
+	cm_gen_autostatic_sites,
+	cm_gen_zeroinit_sites,
+	cm_gen_orelse_expr_ctx,
+	cm_gen_taint_defer,
+	cm_gen_label_defer_loop,
+	cm_gen_orelse_type_junk_dense,
+	cm_gen_generic_assoc,
+	cm_gen_member_subscript_orelse,
+	cm_gen_comma_orelse_split,
+	cm_gen_braceless_ctrl_defer,
+	cm_gen_cast_orelse_junk,
+	cm_gen_nested_typeof_orelse,
+	cm_gen_compound_lit_orelse,
+	cm_gen_designator_orelse,
+	cm_gen_bitint_orelse,
+	cm_gen_atomic_orelse,
+	cm_gen_pp_span_orelse,
+	cm_gen_empty_orelse_action,
+	cm_gen_dim_orelse_uneval,
+	cm_gen_bounds_param_shadow,
+	/* Market-seven densify layer. */
+	cm_gen_bounds_addr_modes,
+	cm_gen_market7_cross,
+	cm_gen_raw_prefix_feat,
+	cm_gen_zi_typeof_product,
+	cm_gen_orelse_bare_ctrl,
+	cm_gen_defer_switch_product,
+	cm_gen_soft_ident_expr,
+	cm_gen_aur_call_shapes,
+	cm_gen_as_init_shapes,
+	cm_gen_market7_deep,
+	cm_gen_feature_pair,
+	cm_gen_defer_exit_dense,
+	cm_gen_bounds_emit_paths,
+	cm_gen_hunt67_densify,
+	cm_gen_defer_expr_reject,
+	cm_gen_bounds_comm_reject,
+	cm_gen_bounds_derived_lhs,
+	cm_gen_orelse_array_type,
+	cm_gen_atomic_typeof_init,
+	cm_gen_bounds_warn_safety,
+	cm_gen_bounds_uneval_product,
+	cm_gen_bounds_vla_wrap,
+	cm_gen_bounds_deref_sites,
+	cm_gen_bounds_lhs_peel,
+	cm_gen_bounds_rank_registry,
+	cm_gen_bounds_member_falsepos,
+#ifndef _WIN32
+	cm_gen_runtime_defer,
+	cm_gen_runtime_orelse,
+	cm_gen_runtime_bounds,
+	cm_gen_runtime_zi,
+	cm_gen_runtime_cross,
+	cm_gen_ice_stmt_expr,
+#endif
+	cm_gen_goto_open,
+#ifndef _WIN32
+	cm_gen_cert_compile_run,
+	cm_gen_raw_identifier,
+	cm_gen_raw_string,
+	cm_gen_source_defines,
+	cm_gen_runtime_defer_product,
+	cm_gen_orelse_product,
+	cm_gen_orelse_defer,
+	cm_gen_passthrough,
+	cm_gen_defer_depth,
+	cm_gen_defer_edges,
+	cm_gen_defer_wide,
+	cm_gen_defer_reject,
+	cm_gen_runtime_bounds_trap,
+	cm_gen_runtime_zeroinit,
+	cm_gen_runtime_autostatic,
+	cm_gen_flag_polarity,
+	cm_gen_driver_surfaces,
+	cm_gen_lib_api,
+	cm_gen_zeroinit_padding,
+	cm_gen_pp_cache,
+	cm_gen_kw_identifier_ctx,
+	cm_gen_sanitizer_oracle,
+#endif
+};
+
+#ifndef _WIN32
+static pthread_mutex_t cm_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+#define CM_CURSOR_LOCK()   pthread_mutex_lock(&cm_cursor_lock)
+#define CM_CURSOR_UNLOCK() pthread_mutex_unlock(&cm_cursor_lock)
+#else
+#define CM_CURSOR_LOCK()   ((void)0)
+#define CM_CURSOR_UNLOCK() ((void)0)
+#endif
+
+static size_t cm_cursor = 0;
+
+/* PRISM_TIER_TIMES=1 prints each tier's wall time to stderr. The queue can
+ * only balance what it can subdivide, so when the suite gets slow the question
+ * is always "is one tier longer than the target wall clock", and this answers
+ * it without a profiler. */
+static void cm_drain(void) {
+	const size_t n = sizeof cm_tiers / sizeof cm_tiers[0];
+#ifndef _WIN32 /* sys/time.h, and so gettimeofday, is POSIX-only here */
+	const int timing = getenv("PRISM_TIER_TIMES") != NULL;
+#endif
+	for (;;) {
+		size_t i;
+		CM_CURSOR_LOCK();
+		i = cm_cursor++;
+		CM_CURSOR_UNLOCK();
+		if (i >= n) return;
+#ifndef _WIN32
+		if (timing) {
+			struct timeval a, b;
+			gettimeofday(&a, NULL);
+			cm_tiers[i]();
+			gettimeofday(&b, NULL);
+			fprintf(stderr, "[tier %3zu] %7.2fs\n", i,
+				(b.tv_sec - a.tv_sec) + (b.tv_usec - a.tv_usec) / 1e6);
+			continue;
+		}
+#endif
+		cm_tiers[i]();
+	}
+}
+
+#ifndef _WIN32
+/* total/passed/failed are _Thread_local, so a worker's tallies are invisible
+ * to the suite thread that has to report them. Each worker folds its own back
+ * under this lock before exiting. */
+static pthread_mutex_t cm_tally_lock = PTHREAD_MUTEX_INITIALIZER;
+static int cm_tally_total, cm_tally_passed, cm_tally_failed;
+
+static void *cm_worker(void *arg) {
+	(void)arg;
+	total = passed = failed = 0;
+	cm_drain();
+	pthread_mutex_lock(&cm_tally_lock);
+	cm_tally_total += total;
+	cm_tally_passed += passed;
+	cm_tally_failed += failed;
+	pthread_mutex_unlock(&cm_tally_lock);
+	return NULL;
+}
+#endif
+
+#define CM_MAX_WORKERS 8
+
+void run_completeness_tests(void) {
+	printf("\n=== COMPLETENESS (generative) ===\n");
+#ifdef _WIN32
+	cm_drain();
+#else
+	long cores = sysconf(_SC_NPROCESSORS_ONLN);
+	int k = (int)(cores / 2);
+	if (k < 4) k = 4;                 /* mostly blocked on cc, so oversubscribe */
+	if (k > CM_MAX_WORKERS) k = CM_MAX_WORKERS;
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	/* Same 8 MiB as the suite threads: musl's 128 KiB default overflows the
+	 * recursive parser on the deeper generated inputs. */
+	pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+
+	pthread_t w[CM_MAX_WORKERS];
+	int made = 0;
+	for (int i = 0; i < k; i++)
+		if (pthread_create(&w[made], &attr, cm_worker, NULL) == 0) made++;
+	pthread_attr_destroy(&attr);
+
+	/* Drain here too, so a total pthread_create failure still runs the suite. */
+	cm_drain();
+	for (int i = 0; i < made; i++) pthread_join(w[i], NULL);
+
+	total += cm_tally_total;
+	passed += cm_tally_passed;
+	failed += cm_tally_failed;
 #endif
 }

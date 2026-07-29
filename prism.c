@@ -5386,6 +5386,16 @@ static size_t pp_marker_path(const char *l, const char *end, char *out, size_t o
 	if (l >= end || *l != '#') return 0;
 	l++;
 	while (l < end && (*l == ' ' || *l == '\t')) l++;
+	/* Two spellings. GCC and Clang emit `# 1 "file"`; MSVC emits
+	 * `#line 1 "file"`. Requiring a digit here dropped every marker cl
+	 * produced, so on Windows the dependency set collapsed to the top-level
+	 * input alone and editing any included file never invalidated the entry:
+	 * prism served a stale preprocessed TU with no diagnostic, forever. That
+	 * is the whole failure mode this cache is meant not to have. */
+	if (l + 4 <= end && prism_memeq_static(l, "line", 4)) {
+		l += 4;
+		while (l < end && (*l == ' ' || *l == '\t')) l++;
+	}
 	if (l >= end || *l < '0' || *l > '9') return 0;
 	while (l < end && *l >= '0' && *l <= '9') l++;
 	while (l < end && (*l == ' ' || *l == '\t')) l++;

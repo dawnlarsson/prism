@@ -8143,6 +8143,7 @@ void run_defer_tests(void) {
 
 	// braceless switch inside braced switch drops defers
 	test_braceless_switch_defer_drop();
+	test_braceless_switch_defer_wipe();
 
 	// defer shadow inner-block false positive
 	test_defer_shadow_inner_block_false_positive();
