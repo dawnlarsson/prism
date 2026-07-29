@@ -248,6 +248,64 @@ static const char *cm_cc_early(void) {
 	return (cc && *cc && !strpbrk(cc, " \t\"'\\$`;&|<>()[]{}*?!#~\n")) ? cc : "cc";
 }
 
+/*
+ * Cap how many compiler children exist at once.
+ *
+ * The suite runs ~26 suite threads plus the completeness tier workers, and
+ * nearly every one of them spawns a compiler. That was fine while completeness
+ * spawned serially from a single thread; once it fanned out, a small CI runner
+ * could have thirty-odd compilers resident at a few hundred MB each, and the
+ * next fork returned EAGAIN. Prism's own spawn_command turns a failed
+ * posix_spawnp into `return -1`, main passes it through, and the shell sees
+ * exit 255 -- which is exactly the "split -D: -U <name.c> compiles OK: expected
+ * 0, got 255" that alpine/musl x86 reported and that never reproduced on a
+ * 32-core box.
+ *
+ * g_spawn_mtx below only serialises the posix_spawnp call itself. This bounds
+ * the child's whole lifetime, which is what actually consumes the memory.
+ */
+static pthread_mutex_t g_inflight_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_inflight_cv = PTHREAD_COND_INITIALIZER;
+static int g_inflight, g_inflight_max;
+
+static void spawn_slot_acquire(void) {
+	pthread_mutex_lock(&g_inflight_mtx);
+	if (g_inflight_max == 0) {
+		long c = sysconf(_SC_NPROCESSORS_ONLN);
+		g_inflight_max = (int)(c > 0 ? c * 2 : 8);
+		if (g_inflight_max < 4) g_inflight_max = 4;
+		if (g_inflight_max > 32) g_inflight_max = 32;
+	}
+	while (g_inflight >= g_inflight_max)
+		pthread_cond_wait(&g_inflight_cv, &g_inflight_mtx);
+	g_inflight++;
+	pthread_mutex_unlock(&g_inflight_mtx);
+}
+
+static void spawn_slot_release(void) {
+	pthread_mutex_lock(&g_inflight_mtx);
+	g_inflight--;
+	pthread_cond_signal(&g_inflight_cv);
+	pthread_mutex_unlock(&g_inflight_mtx);
+}
+
+/*
+ * Per-thread environment override for spawned children.
+ *
+ * setenv(3) mutates the whole process, and ~30 threads are spawning compilers.
+ * A test that pointed CC at its own shim pointed every other thread's prism at
+ * it too, then deleted the shim on the way out -- which is how `filekind` came
+ * to run `/tmp/prism_drv_XXXXXX/cc`, get ENOENT, and report `expected 0, got
+ * 255` in roughly a third of runs. Thread-local means a test can give its own
+ * child a variable without touching anybody else's.
+ */
+static _Thread_local char *g_spawn_env1;
+
+/* kv is "NAME=VALUE" and must outlive the spawn; callers keep it on their
+ * stack for the duration of the call. */
+static void spawn_env_set(const char *kv) { g_spawn_env1 = (char *)kv; }
+static void spawn_env_clear(void) { g_spawn_env1 = NULL; }
+
 static int prism_spawn_wait_raw(char *const argv[], const char *stdout_path,
 				const char *stderr_path, int *raw_status) {
 	posix_spawn_file_actions_t fa;
@@ -260,29 +318,101 @@ static int prism_spawn_wait_raw(char *const argv[], const char *stdout_path,
 						 O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
 	pid_t pid = 0;
-	pthread_mutex_lock(&g_spawn_mtx);
-	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
-	pthread_mutex_unlock(&g_spawn_mtx);
+	spawn_slot_acquire();
+	int err = 0;
+	/* ETXTBSY means some process still holds this binary open for writing, and
+	 * EAGAIN means the machine is momentarily out of processes. Neither is a
+	 * statement about prism, so neither should ever become a test verdict --
+	 * retry briefly and let the writer finish. Removing the 28 bare system(3)
+	 * calls closed the large source of this; what is left is the unavoidable
+	 * window where a compiler we spawned has written a binary but the kernel
+	 * has not yet dropped its last write reference. */
+	/* environ plus at most one override, built on the stack for this call. */
+	char *envbuf[256];
+	char **envp = environ;
+	if (g_spawn_env1) {
+		size_t klen = strcspn(g_spawn_env1, "=") + 1;
+		size_t n = 0;
+		for (char **e = environ; *e && n < (sizeof envbuf / sizeof *envbuf) - 2; e++)
+			if (strncmp(*e, g_spawn_env1, klen) != 0) envbuf[n++] = *e;
+		envbuf[n++] = g_spawn_env1;
+		envbuf[n] = NULL;
+		envp = envbuf;
+	}
+
+	for (int attempt = 0; attempt < 5; attempt++) {
+		pthread_mutex_lock(&g_spawn_mtx);
+		err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, envp);
+		pthread_mutex_unlock(&g_spawn_mtx);
+		if (err != ETXTBSY && err != EAGAIN) break;
+		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)}; /* 20ms, 40ms, ... */
+		nanosleep(&nap, NULL);
+	}
 	posix_spawn_file_actions_destroy(&fa);
-	if (err != 0) { errno = err; return -1; }
+	if (err != 0) {
+		spawn_slot_release();
+		errno = err;
+		return -1;
+	}
 
 	int status = 0;
+	int rc = 0;
 	while (waitpid(pid, &status, 0) == -1)
-		if (errno != EINTR) return -1;
+		if (errno != EINTR) { rc = -1; break; }
+	spawn_slot_release();
+	if (rc != 0) return rc;
 	if (raw_status) *raw_status = status;
 	return 0;
+}
+
+/* -1 is returned for "could not spawn" and for "child died on a signal" alike,
+ * and a test that reports `expected 0, got -1` gives you no way to tell those
+ * apart -- which is a problem exactly when it matters, because both are what
+ * resource pressure looks like on a small CI runner. Say which, once, on
+ * stderr, so a red run carries its own explanation. */
+static void spawn_note_failure(char *const argv[], int spawn_errno, int status,
+			       bool spawned) {
+	if (!spawned)
+		fprintf(stderr, "[spawn] %s: could not start: %s\n", argv[0],
+			strerror(spawn_errno));
+	else if (WIFSIGNALED(status))
+		fprintf(stderr, "[spawn] %s: killed by signal %d\n", argv[0],
+			WTERMSIG(status));
+	else
+		fprintf(stderr, "[spawn] %s: did not exit normally (status 0x%x)\n", argv[0],
+			(unsigned)status);
 }
 
 static int prism_spawn_wait(char *const argv[], const char *stdout_path,
 			    const char *stderr_path) {
 	int status = 0;
-	if (prism_spawn_wait_raw(argv, stdout_path, stderr_path, &status) != 0) return -1;
-	if (!WIFEXITED(status)) return -1;
+	if (prism_spawn_wait_raw(argv, stdout_path, stderr_path, &status) != 0) {
+		spawn_note_failure(argv, errno, 0, false);
+		return -1;
+	}
+	if (!WIFEXITED(status)) {
+		spawn_note_failure(argv, 0, status, true);
+		return -1;
+	}
 	return WEXITSTATUS(status);
 }
 
 // Run an arbitrary shell command via /bin/sh -c. Preserves shell semantics
 // (redirections, pipes, globbing) that callers embed in `cmd`.
+/*
+ * Use this, never system(3), anywhere in the suite.
+ *
+ * system() forks without taking the spawn mutex, and the forked child inherits
+ * every descriptor the process has open -- including a write handle another
+ * thread is holding on a binary it is copying into place. The exec of that
+ * binary then fails with ETXTBSY, "Text file busy", because a process still has
+ * it open for writing. That is what made the parallel suite return a different
+ * verdict each run: 0 to 4 failures at random, and a test count that drifted
+ * down as cells bailed out early.
+ *
+ * test.completeness.c already had this rule written down. test.api.c had 28
+ * bare system() calls that never got the memo.
+ */
 static int run_command_status(const char *cmd) {
 	char *argv[] = {(char *)"/bin/sh", (char *)"-c", (char *)cmd, NULL};
 	return prism_spawn_wait(argv, NULL, NULL);

@@ -4107,8 +4107,24 @@ static int spawn_command(char **argv, bool quiet_stderr) {
 		actions_ptr = &actions;
 	}
 
+	/* Retry the two errors that mean "not right now" rather than "never".
+	 *
+	 * EAGAIN is the machine momentarily out of processes and ETXTBSY is
+	 * somebody still holding the target open for writing -- both routine when
+	 * prism is one of many jobs under `make -j`, and neither a reason to fail
+	 * a build. Without this, a busy machine makes prism return -1 from
+	 * spawn_command, which main passes straight through as exit 255, and the
+	 * user sees a build fail for no reason they can act on. Found because the
+	 * test suite hit exactly that, intermittently, once it started running its
+	 * own compilers in parallel. */
 	pid_t pid;
-	int err = posix_spawnp(&pid, argv[0], actions_ptr, NULL, argv, env);
+	int err = 0;
+	for (int attempt = 0; attempt < 5; attempt++) {
+		err = posix_spawnp(&pid, argv[0], actions_ptr, NULL, argv, env);
+		if (err != EAGAIN && err != ETXTBSY) break;
+		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
+		nanosleep(&nap, NULL);
+	}
 	if (actions_ptr) posix_spawn_file_actions_destroy(actions_ptr);
 	if (devnull >= 0) close(devnull);
 	if (err) {

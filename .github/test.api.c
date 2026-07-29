@@ -4187,7 +4187,7 @@ static void test_cli_check_analyzer(void) {
 	 * same three properties — sources swapped for the analysis artifact, the
 	 * tool's exit code propagated, and findings mapped back to the ORIGINAL
 	 * file:line through the emitted #line directives. */
-	bool have_cppcheck = system("cppcheck --version >/dev/null 2>&1") == 0;
+	bool have_cppcheck = run_command_status("cppcheck --version >/dev/null 2>&1") == 0;
 
 	char tmpdir[PATH_MAX];
 	char *dir = test_mkdtemp(tmpdir, "prism_check_");
@@ -4232,7 +4232,7 @@ static void test_cli_check_analyzer(void) {
 			 "'%s' check cc -fsyntax-only -Werror=implicit-function-declaration '%s' "
 			 ">/dev/null 2>'%s'",
 			 prism_bin, src, errtxt);
-	int st = system(cmd);
+	int st = run_command_status(cmd);
 	CHECK(st != 0, "check: analyzer exit code propagates on findings");
 	bool mapped = false;
 	f = fopen(errtxt, "r");
@@ -4256,10 +4256,10 @@ static void test_cli_check_analyzer(void) {
 
 	snprintf(cmd, sizeof(cmd), "'%s' check %s --version >/dev/null 2>&1", prism_bin,
 		 have_cppcheck ? "cppcheck" : "cc");
-	CHECK_EQ(system(cmd), 0, "check: no-source tool passthrough");
+	CHECK_EQ(run_command_status(cmd), 0, "check: no-source tool passthrough");
 
 	snprintf(cmd, sizeof(cmd), "rm -f '%s' '%s'", src, errtxt);
-	(void)system(cmd);
+	(void)run_command_status(cmd);
 	unlink(prism_bin);
 	rmdir(dir);
 }
@@ -4301,9 +4301,9 @@ static void test_cli_response_files(void) {
 		fclose(f);
 	}
 	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, rsp);
-	CHECK_EQ(system(cmd), 0, "rsp: @file with .c source transpiles+links");
+	CHECK_EQ(run_command_status(cmd), 0, "rsp: @file with .c source transpiles+links");
 	snprintf(cmd, sizeof(cmd), "'%s'", out);
-	CHECK_EQ(system(cmd), 0, "rsp: orelse fallback ran in rsp-listed source");
+	CHECK_EQ(run_command_status(cmd), 0, "rsp: orelse fallback ran in rsp-listed source");
 
 	/* 2. Nested @file + libiberty quoting: mid-token double quotes and
 	 * single quotes each group ONE arg (CMake-style rsp contents). */
@@ -4328,9 +4328,9 @@ static void test_cli_response_files(void) {
 		fclose(f);
 	}
 	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, rsp2);
-	CHECK_EQ(system(cmd), 0, "rsp: nested @file with quoted args compiles");
+	CHECK_EQ(run_command_status(cmd), 0, "rsp: nested @file with quoted args compiles");
 	snprintf(cmd, sizeof(cmd), "'%s'", qout);
-	CHECK_EQ(system(cmd), 0, "rsp: mid-token \" and ' each grouped one arg");
+	CHECK_EQ(run_command_status(cmd), 0, "rsp: mid-token \" and ' each grouped one arg");
 
 	/* 3. Unreadable @file is kept literally (GCC), not a prism abort. */
 	char errtxt[PATH_MAX];
@@ -4339,7 +4339,7 @@ static void test_cli_response_files(void) {
 		 sizeof(cmd),
 		 "'%s' '@%s/nope.rsp' '%s' -c -o '%s/o.o' >/dev/null 2>'%s'",
 		 prism_bin, dir, qsrc, dir, errtxt);
-	CHECK(system(cmd) != 0, "rsp: missing @file still fails the compile");
+	CHECK(run_command_status(cmd) != 0, "rsp: missing @file still fails the compile");
 	bool prism_aborted = false;
 	f = fopen(errtxt, "r");
 	if (f) {
@@ -4360,12 +4360,12 @@ static void test_cli_response_files(void) {
 		fclose(f);
 	}
 	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, selfrsp);
-	CHECK(system(cmd) != 0, "rsp: self-referencing @file rejected (no hang)");
+	CHECK(run_command_status(cmd) != 0, "rsp: self-referencing @file rejected (no hang)");
 
 	snprintf(cmd, sizeof(cmd),
 		 "rm -f '%s' '%s' '%s' '%s' '%s' '%s' '%s' '%s' '%s/o.o' '%s'",
 		 src, rsp, rsp2, qsrc, qrsp, out, qout, errtxt, dir, selfrsp);
-	(void)system(cmd);
+	(void)run_command_status(cmd);
 	unlink(prism_bin);
 	rmdir(dir);
 }
@@ -4375,9 +4375,9 @@ static void test_cli_mixed_c_cpp_driver(void) {
 
 	/* C++ passthrough needs a C++ driver; minimal environments (Alpine with
 	 * only gcc + musl-dev) legitimately lack one — skip, don't fail. */
-	if (system("c++ --version >/dev/null 2>&1") != 0 &&
-	    system("g++ --version >/dev/null 2>&1") != 0 &&
-	    system("clang++ --version >/dev/null 2>&1") != 0) {
+	if (run_command_status("c++ --version >/dev/null 2>&1") != 0 &&
+	    run_command_status("g++ --version >/dev/null 2>&1") != 0 &&
+	    run_command_status("clang++ --version >/dev/null 2>&1") != 0) {
 		passed++;
 		total++;
 		printf("[PASS] cxxmix: skipped (no C++ driver installed)\n");
@@ -4431,11 +4431,11 @@ static void test_cli_mixed_c_cpp_driver(void) {
 		 c_path,
 		 cxx_path,
 		 out_path);
-	int st = system(cmd);
+	int st = run_command_status(cmd);
 	CHECK_EQ(st, 0, "cxxmix: prism lib.c main.cpp links");
 	if (st == 0) {
 		snprintf(cmd, sizeof(cmd), "'%s'", out_path);
-		CHECK_EQ(system(cmd), 0, "cxxmix: mixed binary runs");
+		CHECK_EQ(run_command_status(cmd), 0, "cxxmix: mixed binary runs");
 	}
 
 	/* Pure .cpp must use g++/clang++ so libc++/libstdc++ link. */
@@ -4455,11 +4455,11 @@ static void test_cli_mixed_c_cpp_driver(void) {
 			 prism_bin,
 			 cpp_only,
 			 out_cpp);
-		st = system(cmd);
+		st = run_command_status(cmd);
 		CHECK_EQ(st, 0, "cxxmix: pure .cpp STL links via c++ driver");
 		if (st == 0) {
 			snprintf(cmd, sizeof(cmd), "'%s'", out_cpp);
-			CHECK_EQ(system(cmd), 0, "cxxmix: pure .cpp STL runs");
+			CHECK_EQ(run_command_status(cmd), 0, "cxxmix: pure .cpp STL runs");
 		}
 		unlink(cpp_only);
 		unlink(out_cpp);
@@ -4492,11 +4492,11 @@ static void test_cli_mixed_c_cpp_driver(void) {
 			 c2_path,
 			 cxx2_path,
 			 out2);
-		st = system(cmd);
+		st = run_command_status(cmd);
 		CHECK_EQ(st, 0, "cxxmix: multi .c + .cpp links with -x c temps");
 		if (st == 0) {
 			snprintf(cmd, sizeof(cmd), "'%s'", out2);
-			CHECK_EQ(system(cmd), 0, "cxxmix: multi .c + .cpp runs");
+			CHECK_EQ(run_command_status(cmd), 0, "cxxmix: multi .c + .cpp runs");
 		}
 		unlink(c2_path);
 		unlink(cxx2_path);
@@ -4547,9 +4547,9 @@ static void test_cli_file_kind_driver_matrix(void) {
 	printf("\n--- CLI file-kind × driver matrix ---\n");
 
 #ifndef _WIN32
-	if (system("c++ --version >/dev/null 2>&1") != 0 &&
-	    system("g++ --version >/dev/null 2>&1") != 0 &&
-	    system("clang++ --version >/dev/null 2>&1") != 0) {
+	if (run_command_status("c++ --version >/dev/null 2>&1") != 0 &&
+	    run_command_status("g++ --version >/dev/null 2>&1") != 0 &&
+	    run_command_status("clang++ --version >/dev/null 2>&1") != 0) {
 		passed++;
 		total++;
 		printf("[PASS] filekind: skipped (no C++ driver installed)\n");
@@ -4695,7 +4695,7 @@ static void test_cli_file_kind_driver_matrix(void) {
 		if ((cases[ci].flags & FK_LINK) && st == 0) {
 			snprintf(cmd, sizeof(cmd), "'%s'", out_path);
 			snprintf(name, sizeof(name), "filekind %s: run", cases[ci].tag);
-			CHECK_EQ(system(cmd), 0, name);
+			CHECK_EQ(run_command_status(cmd), 0, name);
 		}
 
 		unlink(path_cxx);
@@ -4738,7 +4738,7 @@ static void test_cli_file_kind_driver_matrix(void) {
 			CHECK_EQ(st, 0, "filekind: -D joined + -include links");
 			if (st == 0) {
 				snprintf(cmd, sizeof(cmd), "'%s'", out_path);
-				CHECK_EQ(system(cmd), 0, "filekind: -D joined runs");
+				CHECK_EQ(run_command_status(cmd), 0, "filekind: -D joined runs");
 			}
 			unlink(out_path);
 		}
@@ -4750,7 +4750,7 @@ static void test_cli_file_kind_driver_matrix(void) {
 			CHECK_EQ(st, 0, "filekind: split -D + -include links");
 			if (st == 0) {
 				snprintf(cmd, sizeof(cmd), "'%s'", out_path);
-				CHECK_EQ(system(cmd), 0, "filekind: split -D runs");
+				CHECK_EQ(run_command_status(cmd), 0, "filekind: split -D runs");
 			}
 			unlink(out_path);
 		}
@@ -4784,8 +4784,8 @@ static void test_cli_file_kind_driver_matrix(void) {
 	}
 
 	/* Cross-prefix driver mapping when a mingw-style gcc exists. */
-	if (system("x86_64-w64-mingw32-gcc --version >/dev/null 2>&1") == 0 &&
-	    system("x86_64-w64-mingw32-g++ --version >/dev/null 2>&1") == 0) {
+	if (run_command_status("x86_64-w64-mingw32-gcc --version >/dev/null 2>&1") == 0 &&
+	    run_command_status("x86_64-w64-mingw32-g++ --version >/dev/null 2>&1") == 0) {
 		snprintf(path_cxx, sizeof(path_cxx), "%s/cross.cpp", dir);
 		FILE *f = fopen(path_cxx, "w");
 		if (f) {
@@ -5440,7 +5440,29 @@ static void test_cli_split_D_flag_not_source(void) {
 		char *argv[] = {prism_bin, "-U", "SOMETHING.c",
 				"-c", src_path, "-o", obj_path, NULL};
 		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
-		CHECK_EQ(st, 0, "split -D: -U <name.c> compiles OK");
+		/* This one has failed on linux-x86 CI with exit 255 and could not be
+		 * reproduced locally on either gcc or clang, where `-U SOMETHING.c`
+		 * only warns about extra tokens after #undef. An exit code on its own
+		 * cannot tell us whether prism rejected the flag, the backend did, or
+		 * the spawn failed under load, so put the child's stderr in the
+		 * failure message and let the next red run say which. */
+		char why[256];
+		snprintf(why, sizeof why, "split -D: -U <name.c> compiles OK");
+		if (st != 0) {
+			char tail[160] = "";
+			FILE *ef = fopen(stderr_path, "r");
+			if (ef) {
+				size_t got = fread(tail, 1, sizeof tail - 1, ef);
+				tail[got] = '\0';
+				for (char *p = tail; *p; p++)
+					if (*p == '\n' || *p == '\r') *p = ' ';
+				fclose(ef);
+			}
+			snprintf(why, sizeof why,
+				 "split -D: -U <name.c> compiles OK (exit %d, stderr: %s)", st,
+				 tail[0] ? tail : "<empty>");
+		}
+		CHECK_EQ(st, 0, why);
 		unlink(obj_path);
 	}
 
@@ -7164,13 +7186,18 @@ static void test_cli_driver_output_and_deps(void) {
 				chmod(cc_bin, 0755);
 				char obj[PATH_MAX];
 				snprintf(obj, sizeof(obj), "%s/sp.o", dir);
-				setenv("CC", cc_bin, 1);
+				/* Thread-local, not setenv: this used to point every
+				 * other thread's prism at this shim, and then delete
+				 * it below while they were still spawning it. */
+				char kv[PATH_MAX + 4];
+				snprintf(kv, sizeof kv, "CC=%s", cc_bin);
+				spawn_env_set(kv);
 				char *argv[] = {prism_bin, "-c", src_path, "-o", obj, NULL};
 				CHECK_EQ(run_exec_argv_capture(argv, NULL, err_path), 0,
 					 "drv: CC with spaces ok");
 				CHECK(access(obj, F_OK) == 0, "drv: CC with spaces wrote object");
 				unlink(obj);
-				unsetenv("CC");
+				spawn_env_clear();
 			}
 			unlink(cc_bin);
 			rmdir(cc_dir);
@@ -8915,16 +8942,33 @@ static void test_nested_stmtexpr_ctrl_state_desync(void) {
 	prism_free(&r);
 }
 
-static void test_taint_propagation_perf(void) {
-	/* taint propagation's inner loop uses O(N) linear scan with
-	 * memcmp to resolve function call targets.  With N functions each
-	 * making M calls, the fixed-point loop costs O(N*M*N) per iteration.
-	 *
-	 * Fix: use HashMap for O(1) function name lookup. */
-	int N = 5000;
+/* CPU time on this thread where the platform has it, wall clock otherwise.
+ * The suite runs ~30 threads that each spawn compilers, so wall clock here
+ * measures how busy the machine is, not how much work the transpile did. */
+static double taint_perf_now(void) {
+#ifdef _WIN32
+	LARGE_INTEGER freq, pc;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&pc);
+	return (double)pc.QuadPart / freq.QuadPart;
+#else
+	struct timespec t;
+#ifdef CLOCK_THREAD_CPUTIME_ID
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) == 0)
+		return t.tv_sec + t.tv_nsec / 1e9;
+#endif
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec / 1e9;
+#endif
+}
+
+/* One transpile of N mutually-calling functions; returns the time it took, or
+ * -1 if it did not transpile. */
+static double taint_perf_run(int N, const char *label) {
 	size_t cap = (size_t)N * 200 + 256;
 	char *code = malloc(cap);
-	CHECK(code != NULL, "taint-perf: malloc"); if (!code) return;
+	CHECK(code != NULL, "taint-perf: malloc");
+	if (!code) return -1;
 	int n = 0;
 	for (int i = 0; i < N; i++)
 		n += snprintf(code + n, cap - n, "void fn_%d(void);\n", i);
@@ -8935,29 +8979,48 @@ static void test_taint_propagation_perf(void) {
 		n += snprintf(code + n, cap - n, " }\n");
 	}
 	n += snprintf(code + n, cap - n, "int main(void) { fn_0(); return 0; }\n");
-#ifdef _WIN32
-	LARGE_INTEGER freq, pc0, pc1;
-	QueryPerformanceFrequency(&freq);
-	QueryPerformanceCounter(&pc0);
+
+	double t0 = taint_perf_now();
 	PrismResult r = prism_transpile_source(code, "taint_perf.c", prism_defaults());
-	QueryPerformanceCounter(&pc1);
+	double elapsed = taint_perf_now() - t0;
 	free(code);
-	double elapsed = (double)(pc1.QuadPart - pc0.QuadPart) / freq.QuadPart;
-#else
-	struct timespec t0, t1;
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	PrismResult r = prism_transpile_source(code, "taint_perf.c", prism_defaults());
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	free(code);
-	double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-#endif
-	CHECK_EQ(r.status, PRISM_OK,
-		 "taint-perf: 5000 functions with 10 calls each transpiles OK");
-	CHECK(elapsed < 5.0,
-	      "taint-perf: 5000-function taint propagation completes in <5s");
-	if (elapsed >= 5.0)
-		printf("  (elapsed: %.3f s)\n", elapsed);
+	bool ok = r.status == PRISM_OK;
+	CHECK(ok, label);
 	prism_free(&r);
+	return ok ? elapsed : -1;
+}
+
+static void test_taint_propagation_perf(void) {
+	/* Taint propagation resolves call targets by name. That lookup was an
+	 * O(N) linear scan with memcmp, so with N functions making M calls each
+	 * the fixed-point loop cost O(N*M*N) per iteration; the fix was a hash
+	 * map for O(1) lookup.
+	 *
+	 * That is a claim about *complexity*, so this measures the shape of the
+	 * curve rather than a stopwatch reading. It used to assert "under 5
+	 * seconds", which fails on a slow or loaded runner while passing on a
+	 * fast one even if the lookup had regressed all the way back to O(N^2) --
+	 * wrong in both directions. Doubling the input should roughly double the
+	 * work if lookup is O(1) and roughly quadruple it if it is not, and the
+	 * ratio cancels out both machine speed and whatever else the suite is
+	 * doing to the box at the time. */
+	/* 10000/20000 rather than 2500/5000: with an O(1) lookup the small run
+	 * lands around 10ms, which is close enough to timer resolution that the
+	 * ratio stops meaning anything. These sizes put both runs comfortably
+	 * above the noise while still costing well under a second. */
+	double small = taint_perf_run(10000, "taint-perf: 10000 functions transpile OK");
+	double large = taint_perf_run(20000, "taint-perf: 20000 functions transpile OK");
+	if (small < 0 || large < 0) return;
+
+	/* Floor the denominator: on a fast machine the small run can land near
+	 * timer resolution, and dividing by that produces a meaningless ratio. */
+	double ratio = large / (small > 0.01 ? small : 0.01);
+	char msg[192];
+	snprintf(msg, sizeof msg,
+		 "taint-perf: 2x input costs %.2fx time (linear ~2, quadratic ~4), "
+		 "%.3fs -> %.3fs",
+		 ratio, small, large);
+	CHECK(small <= 0.01 || ratio < 3.0, msg);
 }
 
 static void test_ifdef_in_orelse_lib_rejected(void) {
