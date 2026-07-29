@@ -6755,7 +6755,6 @@ static int cm_exec(const char *src, PrismFeatures feat) {
 		unlink(path);
 		free(path);
 		/* A build failure is a property of the text, so it caches. */
-		if (prog) cm_memo_put(mk, prog, -1001);
 		free(prog);
 		return -1001;
 	}
@@ -7492,7 +7491,6 @@ static int cm_run_plain(const char *code) {
 	if (run_command_status(cmd) != 0) {
 		unlink(path);
 		free(path);
-		cm_memo_put(mk, code, -1001);
 		return -1001;
 	}
 	int st = run_command_status(bin);
@@ -10234,18 +10232,22 @@ static void *cm_worker(void *arg) {
 /* Capped at 16 rather than 8: the tiers are mostly blocked waiting on cc and
  * on the programs they build, so workers cost little while they wait. The
  * cores/2 scaling below still keeps a 4-core CI runner at 4. */
+#ifndef _WIN32
 static void cm_memo_report(void) {
 	if (getenv("PRISM_TIER_TIMES"))
 		fprintf(stderr, "[memo] %ld hits, %ld misses (%.0f%% of build-and-run avoided)\n",
 			cm_memo_hits, cm_memo_misses,
 			100.0 * cm_memo_hits / (cm_memo_hits + cm_memo_misses + 1e-9));
 }
+#endif
 
 #define CM_MAX_WORKERS 16
 
 void run_completeness_tests(void) {
 	printf("\n=== COMPLETENESS (generative) ===\n");
+#ifndef _WIN32
 	atexit(cm_memo_report);
+#endif
 #ifdef _WIN32
 	cm_drain();
 #else
