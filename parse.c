@@ -83,6 +83,9 @@
 #define PPARSE_KW_MARKER 0x80000000ULL // Internal marker bit for keyword map: values are (tag | PPARSE_KW_MARKER)
 #define PPARSE_KW_FLAGS_SHIFT 32	// Extra token flags encoded in bits 32-47 of keyword value
 #define PPARSE_KW_LEN_SHIFT 48	// Identifier length encoded in bits 48-55
+/* Linear-probe bound shared by keyword-map insertion and lookup; they must
+ * agree or a displaced keyword becomes unfindable. See pparse_init_keyword_map. */
+#define PPARSE_KW_MAX_PROBE 32
 #define PPARSE_KW_SHADOW_SHIFT 56 // Dialect macro-shadow bit encoded in bits 56-58
 
 enum {
@@ -573,6 +576,7 @@ typedef struct PParseContext {
 
 	PParseToken *tp_pool;	    // Hot: tag, parse_data, match_idx, len, kind, flags
 	char *token_source; // Shared backing buffer for match_idx source offsets
+	bool lex_only;	    // Tokenize for spellings only: do not require balanced delimiters
 	uint32_t tp_count;  // Next free index. 0 reserved as NULL sentinel.
 	uint32_t tp_cap;
 	uint32_t pparse_token_tag_summary; // OR of PPARSE_TT_* tags in the current token stream
@@ -1238,7 +1242,19 @@ static void pparse_init_keyword_map(void) {
 				  : entries[i].extra_flags & PPARSE_TF_RAW ? PPARSE_KWSHADOW_RAW : 0;
 		val |= (uint64_t)shadow << PPARSE_KW_SHADOW_SHIFT;
 		unsigned slot = pparse_KEYWORD_HASH(entries[i].name, len);
-		while (pparse_keyword_cache[slot & 255].name) slot++;
+		unsigned probe = 0;
+		while (pparse_keyword_cache[slot & 255].name) {
+			slot++;
+			probe++;
+		}
+		/* Insertion probes without a bound, lookup gives up after
+		 * PPARSE_KW_MAX_PROBE. A keyword displaced further than that would be
+		 * stored and then never found again -- silently not a keyword. At 141
+		 * entries in 256 slots the worst displacement is 10, so the two agree
+		 * with room to spare; this fires if a future keyword closes the gap. */
+		if (probe >= PPARSE_KW_MAX_PROBE)
+			pparse_error("internal: keyword '%s' displaced %u slots, past the lookup probe limit",
+				     entries[i].name, probe);
 		pparse_keyword_cache[slot & 255] = (PParseKeywordEntry){.name = entries[i].name, .value = val};
 	}
 }
@@ -1258,9 +1274,6 @@ static int pparse_read_ucn(char *p) {
 	return 2 + nhex;
 }
 
-static bool pparse_is_space(char c) {
-	return c == ' ' || c == '\t' || c == '\f' || c == '\r' || c == '\v';
-}
 
 #define pparse_SWAR_HAS_ZERO(v) (((v) - 0x0101010101010101ULL) & ~(v) & 0x8080808080808080ULL)
 #define pparse_SWAR_BROADCAST(c) (0x0101010101010101ULL * (uint8_t)(c))
@@ -1421,7 +1434,7 @@ static inline PRISM_ALWAYS_INLINE PRISM_PURE uint64_t
 pparse_keyword_lookup(PParseContext *_pc, char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = pparse_KEYWORD_HASH(key, keylen);
-	for (int i = 0; i < 32; i++) {
+	for (int i = 0; i < PPARSE_KW_MAX_PROBE; i++) {
 		PParseKeywordEntry *ent = &pparse_keyword_cache[(slot + i) & 255];
 		if (!ent->name) return 0;
 		if ((uint8_t)(ent->value >> PPARSE_KW_LEN_SHIFT) == keylen &&
@@ -1923,7 +1936,8 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		 * a number, a literal prefix or a quote, so none of the tests below can
 		 * match it. Skip straight to punctuation. The '#'/'%:'/'??=' directive
 		 * forms are handled above, before this dispatch, so they are unaffected. */
-		if (__builtin_expect(pparse_char_class[(unsigned char)*p] == 0, 1)) goto do_punct;
+		unsigned cc0 = pparse_char_class[(unsigned char)*p];
+		if (__builtin_expect(cc0 == 0, 1)) goto do_punct;
 
 		if (p[0] == '/' && p[1] == '/') {
 			p = pparse_skip_line_comment(p + 2, &ts);
@@ -1935,16 +1949,25 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			ts.has_space = true;
 			continue;
 		}
-		if (*p == '\n' || pparse_is_space(*p)) {
+		/* Whitespace is the largest single class of loop iterations on real
+		 * preprocessed input: 95,924 of 288,375 on a 1.1 MB .i, 319 KB of the
+		 * bytes, averaging 3.3 bytes a run. The old body wrote all three state
+		 * fields on every byte of the run and re-derived "is this a space"
+		 * from a five-way comparison chain, when the class table consulted one
+		 * line above already answers it. Only the last byte of the run decides
+		 * the flags -- `at_bol` latches on any newline and is never cleared by
+		 * a following space -- so the writes hoist out and only the newline
+		 * count stays per byte. Worth 1.05x on the whole transpile, 20 of 22
+		 * interleaved pairs. */
+		if (cc0 & (PCC_SPACE | PCC_NEWLINE)) {
+			int newlines = 0;
 			do {
-				if (*p == '\n') {
-					ts.line_no++;
-					ts.at_bol = true;
-					ts.has_space = false;
-				} else
-					ts.has_space = true;
+				newlines += (*p == '\n');
 				p++;
-			} while (*p == '\n' || pparse_is_space(*p));
+			} while (pparse_char_class[(unsigned char)*p] & (PCC_SPACE | PCC_NEWLINE));
+			ts.line_no += newlines;
+			if (newlines) ts.at_bol = true;
+			ts.has_space = (p[-1] != '\n');
 			continue;
 		}
 		/* Fast path: the vast majority of tokens are identifiers/keywords that
@@ -2078,7 +2101,12 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		pparse_error_at(p, "invalid token");
 	}
 
-	if (delimiter_n > 0) {
+	/* `lex_only` callers want the token *spellings* out of text that has not
+	 * been through cc -E yet, where a macro body may legitimately open a
+	 * delimiter it never closes. Pairing is meaningless for them, so an
+	 * unclosed delimiter is not an error; every consumer of pair_idx runs
+	 * only on preprocessed input. */
+	if (delimiter_n > 0 && !_pc->lex_only) {
 		PParseToken *open = &pparse_token_pool[delimiter_stack[delimiter_n - 1]];
 		pparse_error_tok(open, "unclosed delimiter '%c'", open->ch0);
 	}
@@ -2554,6 +2582,46 @@ static PParseToken *pparse_tokenize_buffer(char *name, char *buf) {
 	size_t contents_len = strlen(buf);
 	PParseFile *file = pparse_add_input_file((PParseFile){.name = pparse_intern_filename(name)});
 	return pparse_tokenize(file, buf, contents_len);
+}
+
+/* Count dialect keywords in a C text, lexing it the way everything else does.
+ * `buf` must be writable with at least 8 NUL bytes of padding, and must stay
+ * alive for the call; tokens are appended to the pool and left there for the
+ * caller's reset.
+ *
+ * --prism-verify used to hand-roll this scan in prism.c. That scanner knew
+ * about quoted strings, character constants and both comment forms, and
+ * nothing about raw strings, so R"(a "b)"
+ * left it one quote out of phase and every keyword after such a literal became
+ * invisible -- in the one routine whose entire job is to notice a keyword that
+ * leaked into the output. It also counted `defer` *inside* R"(say "defer")" as
+ * real code. Both directions are gone here: the tokenizer already handles raw
+ * strings, prefixes, UCNs and digraphs, and it honours #define shadowing, so a
+ * `#define defer` in the emitted text no longer inflates the count. */
+static void pparse_count_dialect_keywords(char *name, char *buf, long *n_defer, long *n_orelse) {
+	PPARSE_CTX();
+	uint32_t first = pparse_token_count;
+	/* pparse_tokenize hands _pc->token_source to pparse_tokenizer_teardown to
+	 * free. This helper is a borrower, not an owner: restore the pointer so
+	 * teardown still frees whatever it owned before and the caller keeps
+	 * `buf`. Token `loc` pointers into `buf` are never dereferenced here. */
+	char *saved_source = _pc->token_source;
+	bool saved_lex_only = _pc->lex_only;
+	*n_defer = 0;
+	*n_orelse = 0;
+	/* The text has not been through cc -E: a macro body can open a delimiter
+	 * it never closes, and glibc's headers do exactly that. Only the token
+	 * spellings matter here, so lex without demanding balance. */
+	_pc->lex_only = true;
+	PParseToken *first_tok = pparse_tokenize_buffer(name, buf);
+	_pc->lex_only = saved_lex_only;
+	_pc->token_source = saved_source;
+	if (!first_tok) return;
+	for (uint32_t i = first; i < pparse_token_count; i++) {
+		uint32_t tag = pparse_token_pool[i].tag;
+		if (tag & PPARSE_TT_DEFER) (*n_defer)++;
+		else if (tag & PPARSE_TT_ORELSE) (*n_orelse)++;
+	}
 }
 
 // Used by both Pass 1 (analysis) and Pass 2 (emission) in prism.c.
@@ -6531,6 +6599,10 @@ static void pparse_validate_defer_control_flow(PParseToken *t, bool in_loop, boo
 		pparse_error_tok(t, "'continue' inside defer block bypasses remaining defers");
 }
 
+/* Shared recursion budget for every defer walker: statement nesting, hidden
+ * statement expressions and parenthesised group nesting all draw on it. */
+#define PPARSE_DEFER_MAX_DEPTH 4096
+
 static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_loop, bool in_switch, int depth);
 
 static PParseToken *pparse_defer_walk_advance_past_orelse(PParseToken *s, bool in_loop, bool in_switch, int depth) {
@@ -6546,15 +6618,24 @@ static PParseToken *pparse_defer_walk_advance_past_orelse(PParseToken *s, bool i
 	return act ? act : s;
 }
 
+/* `depth` is the shared defer-nesting budget enforced by
+ * pparse_validate_defer_statement. This function recurses once per nested
+ * `(`/`[` inside a defer statement and used to forward `depth` unchanged, so
+ * it was the one defer walker with no bound at all: `defer g((((...1...))))`
+ * with 100k parens segfaulted a release build, while the identical expression
+ * without `defer` transpiled fine. Charging group nesting to the same budget
+ * turns that into the diagnostic below. */
 static void pparse_defer_scan_orelse_in_group(PParseToken *open, bool in_loop, bool in_switch, int depth) {
 	PPARSE_CTX();
+	if (depth >= PPARSE_DEFER_MAX_DEPTH)
+		pparse_error_tok(open, "expression nesting depth inside 'defer' exceeds 4096");
 	PParseToken *end = pparse_pair(_pc, open);
 	if (!end) return;
 	PParseToken *prev = open;
 	PPARSE_FOR_RANGE(s, pparse_next(_pc, open), end) {
 		if (s->flags & PPARSE_TF_OPEN) {
 			if (pparse_match_ch(s, '(') || pparse_match_ch(s, '['))
-				pparse_defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
+				pparse_defer_scan_orelse_in_group(s, in_loop, in_switch, depth + 1);
 			prev = pparse_pair(_pc, s);
 			s = prev;
 			continue;
@@ -6584,7 +6665,8 @@ static void pparse_defer_scan_hidden_stmt_exprs(PParseToken *open, bool in_loop,
 
 static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_loop, bool in_switch, int depth) {
 	PPARSE_CTX();
-	if (depth >= 4096) pparse_error_tok(tok, "braceless control flow nesting depth exceeds 4096");
+	if (depth >= PPARSE_DEFER_MAX_DEPTH)
+		pparse_error_tok(tok, "braceless control flow nesting depth exceeds 4096");
 	tok = pparse_skip_noise(_pc, tok);
 	if (!tok || tok->kind == PPARSE_TK_EOF) return tok;
 	if (pparse_match_ch(tok, '{')) {
@@ -9422,8 +9504,15 @@ p1d_classify_bracket_orelse_ex(PParseToken *tok, uint16_t cur_sid, int p1d_cur_f
 			} else {
 				/* Nested orelse: check LHS of the innermost group only.
 				 * For call args, include the callee so get_n(x orelse 5) rejects.
-				 * Past the tracked depth, fall back to the whole dimension. */
-				PParseToken *grp = oe_depth <= 64 ? open_stack[oe_depth - 1] : NULL;
+				 * Past the tracked depth, fall back to the whole dimension.
+				 * `oe_depth > 0` is defensive: the delimiter-matching pass
+				 * rejects unbalanced closers before Phase 1 runs, so a
+				 * negative depth is unreachable today and the guard costs a
+				 * compare. Without it a stray close would index
+				 * open_stack[-2], and the bound that keeps it from
+				 * happening lives in a different pass. */
+				PParseToken *grp =
+				    (oe_depth > 0 && oe_depth <= 64) ? open_stack[oe_depth - 1] : NULL;
 				PParseToken *se_start = grp ? pparse_next(_pc, grp) : pparse_next(_pc, tok);
 				if (grp && pparse_match_ch(grp, '(')) {
 					PParseToken *before = pparse_walk_back(pparse_idx(_pc, grp), PPARSE_WB_PAST_NOISE);

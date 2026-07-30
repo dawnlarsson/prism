@@ -4140,7 +4140,20 @@ static void collect_source_defines(const char *input_file) {
 	check_continuation: {
 		char *end = line + strlen(line);
 		while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
-		in_continuation = (end > line && end[-1] == '\\');
+		/* A backslash-newline inside a block comment or a raw string does
+		 * splice the source -- C11 5.1.1.2 runs phase 2 before phase 3 -- but
+		 * it does not continue a *directive*, and the comment/raw state above
+		 * already carries to the next line on its own.
+		 *
+		 * Setting the flag from such a line left it stuck on after the comment
+		 * closed, and the `if (in_continuation)` branch at the top of the loop
+		 * then swallowed one real line. Open a block comment, end that line
+		 * with a backslash, close the comment on the next line, and the first
+		 * #define after it was dropped from the output while the second
+		 * survived. `prism check` forces flatten off, so the artifact handed
+		 * to the analyzer was the one missing the macro. */
+		in_continuation =
+		    !in_block_comment && !in_raw_string && (end > line && end[-1] == '\\');
 		if (!in_continuation && !in_block_comment && !in_raw_string) {
 			PP_SCAN_LINE_OPENERS(line);
 		}
@@ -5666,48 +5679,7 @@ PRISM_API void prism_reset(void) {
 	}
 }
 
-/* Count whole-word keywords outside literals and comments. */
 typedef struct { long orelse, defer; } VerifyKwCounts;
-
-static VerifyKwCounts verify_kw_counts(const char *s) {
-	VerifyKwCounts n = {0};
-	for (const char *p = s; *p;) {
-		if (*p == '"' || *p == '\'') {
-			char q = *p++;
-			while (*p && *p != q) {
-				if (*p == '\\' && p[1]) p += 2;
-				else
-					p++;
-			}
-			if (*p) p++;
-			continue;
-		}
-		if (p[0] == '/' && p[1] == '/') {
-			while (*p && *p != '\n') p++;
-			continue;
-		}
-		if (p[0] == '/' && p[1] == '*') {
-			p += 2;
-			while (*p && !(p[0] == '*' && p[1] == '/')) p++;
-			if (*p) p += 2;
-			continue;
-		}
-		if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-		    (*p >= '0' && *p <= '9') || *p == '_') {
-			const char *start = p++;
-			while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-			       (*p >= '0' && *p <= '9') || *p == '_')
-				p++;
-			size_t len = (size_t)(p - start);
-			if (len == 6 && memcmp(start, "orelse", 6) == 0) n.orelse++;
-			else if (len == 5 && memcmp(start, "defer", 5) == 0)
-				n.defer++;
-			continue;
-		}
-		p++;
-	}
-	return n;
-}
 
 /* Reparse emitted C; stable defer/orelse counts prove no operator leaked. */
 static int verify_transpiled_output(char *orig_input, char *out1_path) {
@@ -5732,10 +5704,14 @@ static int verify_transpiled_output(char *orig_input, char *out1_path) {
 		int retrans_ok = transpile(out1_path, tmp2);
 		_pc->features = saved_features;
 		if (retrans_ok) {
-			char *o1 = read_file_bytes(out1_path, 1);
-			char *o2 = read_file_bytes(tmp2, 1);
+			/* 8 bytes of padding, not 1: these go through the tokenizer,
+			 * which looks a few bytes past the current position. */
+			char *o1 = read_file_bytes(out1_path, 8);
+			char *o2 = read_file_bytes(tmp2, 8);
 			if (o1 && o2) {
-				VerifyKwCounts k1 = verify_kw_counts(o1), k2 = verify_kw_counts(o2);
+				VerifyKwCounts k1, k2;
+				pparse_count_dialect_keywords(out1_path, o1, &k1.defer, &k1.orelse);
+				pparse_count_dialect_keywords(tmp2, o2, &k2.defer, &k2.orelse);
 				if (k2.orelse < k1.orelse || k2.defer < k1.defer) {
 					snprintf(diag, sizeof(diag),
 						 "operator keyword leaked to output: orelse %ld->%ld, "
@@ -6007,6 +5983,34 @@ static bool str_startswith(const char *s, const char *prefix) {
 	return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+/* Flags whose operand is the next argv entry rather than part of the flag.
+ *
+ * A missing entry is not cosmetic. The CLI parser uses this to decide where a
+ * flag ends, so an unlisted flag leaves its operand loose and prism classifies
+ * it on its own terms: `prism -dumpbase side.c -c -o out.o t.c` was rejected
+ * with "cannot specify -o when generating multiple output files", because
+ * side.c became a second input. cc accepts that line. Every GNU entry below
+ * was checked against the local driver by asking whether `cc <flag> zzq -c
+ * t.c` complains about zzq as an input file; -isysroot, -imultilib, -aux-info,
+ * -dumpbase, -dumpbase-ext, -dumpdir, -wrapper and --param all did consume it
+ * and none of them were here. The Darwin link-edit entries cannot be probed
+ * off a Mac and are the documented ld64 spellings; multi-operand flags
+ * (-sectcreate, -segprot) are deliberately absent because this predicate
+ * cannot express them. */
+static const char *const cc_separate_operand_flags[] = {
+    /* include search and preprocessing */
+    "-include", "-imacros", "-isystem", "-idirafter", "-iquote", "-iprefix", "-iwithprefix",
+    "-iwithprefixbefore", "-imultilib", "-isysroot", "-include-pch",
+    /* driver plumbing */
+    "-Xlinker", "-Xpreprocessor", "-Xassembler", "-Xclang", "-Xanalyzer", "-mllvm", "-target",
+    "-arch", "-aux-info", "-wrapper", "-specs", "--param", "-dumpbase", "-dumpbase-ext",
+    "-dumpdir", "-serialize-diagnostics",
+    /* Darwin link-edit; the driver forwards the operand */
+    "-framework", "-weak_framework", "-rpath", "-install_name", "-bundle_loader", "-undefined",
+    "-exported_symbols_list", "-unexported_symbols_list", "-filelist", "-compatibility_version",
+    "-current_version",
+};
+
 static bool cc_flag_takes_arg(const char *a) {
 	if (a[0] != '-' || !a[1]) return false;
 	if (!a[2]) {
@@ -6032,11 +6036,9 @@ static bool cc_flag_takes_arg(const char *a) {
 		default: return true;
 		}
 	}
-	return !strcmp(a, "-include") || !strcmp(a, "-isystem") || !strcmp(a, "-idirafter") ||
-	       !strcmp(a, "-imacros") || !strcmp(a, "-iquote") || !strcmp(a, "-iprefix") ||
-	       !strcmp(a, "-iwithprefix") || !strcmp(a, "-iwithprefixbefore") || !strcmp(a, "-Xlinker") ||
-	       !strcmp(a, "-Xpreprocessor") || !strcmp(a, "-Xassembler") || !strcmp(a, "-target") ||
-	       !strcmp(a, "-arch");
+	for (size_t i = 0; i < sizeof cc_separate_operand_flags / sizeof cc_separate_operand_flags[0]; i++)
+		if (!strcmp(a, cc_separate_operand_flags[i])) return true;
+	return false;
 }
 
 static int dep_flag_kind(const char *a) {
@@ -7434,9 +7436,15 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			fclose(f);
 			prism_free(&result);
 		} else {
-			temps[i] = malloc(512);
+			/* PATH_MAX, matching the use_lib_api branch above. 512 was
+			 * not reachable as a failure -- make_temp_file falls back to
+			 * a tmpdir path built from the basename, and NAME_MAX caps
+			 * that well under 512 -- but it silently denied the
+			 * source-adjacent placement to any source in a deep enough
+			 * directory, for no reason the other branch shares. */
+			temps[i] = malloc(PATH_MAX);
 			if (!temps[i]) die("Out of memory");
-			int fd = make_temp_file_registered(temps[i], 512, NULL, 0, cli->sources[i]);
+			int fd = make_temp_file_registered(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
 			if (fd < 0) die("Failed to create temp file");
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);

@@ -845,8 +845,6 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	int opened_handle_count = 0;
 	HANDLE inherit_changed_handles[3];
 	int inherit_changed_count = 0;
-	// Track which standard streams were explicitly redirected by file actions.
-	bool redirected_in = false, redirected_out = false, redirected_err = false;
 
 	if (fa) {
 		si.dwFlags |= STARTF_USESTDHANDLES;
@@ -857,13 +855,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				HANDLE h = (HANDLE)_get_osfhandle(a->src_fd);
 				if (a->fd == STDOUT_FILENO) {
 					hStdOut = h;
-					redirected_out = true;
 				} else if (a->fd == STDIN_FILENO) {
 					hStdIn = h;
-					redirected_in = true;
 				} else if (a->fd == STDERR_FILENO) {
 					hStdErr = h;
-					redirected_err = true;
 				}
 			} else if (a->kind == SPAWN_ACT_OPEN) {
 				const char *winpath = a->path;
@@ -921,13 +916,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				opened_handles[opened_handle_count++] = hOpened;
 				if (a->fd == STDERR_FILENO) {
 					hStdErr = hOpened;
-					redirected_err = true;
 				} else if (a->fd == STDOUT_FILENO) {
 					hStdOut = hOpened;
-					redirected_out = true;
 				} else if (a->fd == STDIN_FILENO) {
 					hStdIn = hOpened;
-					redirected_in = true;
 				}
 			}
 			// SPAWN_ACT_CLOSE: handled by the caller manually, not by this function
@@ -1184,7 +1176,18 @@ static int run_command_quiet(char **argv) {
 
 // Capture the first line of a command's stdout. Returns 0 on success.
 // Uses CreateProcess + pipe instead of _popen to avoid cmd.exe injection.
-static int capture_first_line(char **argv, char *buf, size_t bufsize) {
+// Capture a child's stdout with CreateProcess + a pipe, never cmd.exe, so no
+// shell injection is possible. `first_line_only` stops at the first newline
+// and falls back to the exit status when nothing was captured; otherwise the
+// whole stream is read to EOF.
+//
+// This was two functions. capture_all_output was written as a copy of
+// capture_first_line -- 95 of their lines were identical, the entire
+// CreateProcessW + pipe + PROC_THREAD_ATTRIBUTE_HANDLE_LIST setup twice over.
+// They differed in the read loop and in what an empty capture returns, which
+// is all the flag has to carry.
+static int win32_capture_stdout(char **argv, char *buf, size_t bufsize, bool first_line_only) {
+	if (bufsize == 0) return -1;
 	buf[0] = '\0';
 
 	// Build a properly escaped command line (no cmd.exe shell involved)
@@ -1308,12 +1311,13 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 		return -1;
 	}
 
-	// Read the first line from the pipe
+	/* \r is dropped either way so callers match on LF-only text whatever the
+	 * child line-ended with. */
 	size_t pos = 0;
 	char ch;
 	DWORD nread;
 	while (pos + 1 < bufsize && ReadFile(hReadPipe, &ch, 1, &nread, NULL) && nread == 1) {
-		if (ch == '\n') break;
+		if (first_line_only && ch == '\n') break;
 		if (ch != '\r') buf[pos++] = ch;
 	}
 	buf[pos] = '\0';
@@ -1325,149 +1329,21 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 
-	if (buf[0]) return 0;
-	return (exit_code != 0) ? (int)exit_code : -1;
+	if (first_line_only) {
+		if (buf[0]) return 0;
+		return (exit_code != 0) ? (int)exit_code : -1;
+	}
+	return pos > 0 ? 0 : -1;
 }
 
-// Capture full stdout of a child, up to bufsize-1 bytes. NUL-terminated.
-// Windows twin of the POSIX capture_all_output — does NOT truncate at the
-// first newline. Implementation mirrors capture_first_line but reads to
-// EOF instead of stopping at '\n'. \r bytes are stripped so consumers can
-// match on LF-only text regardless of how the child line-ended its output.
+static int capture_first_line(char **argv, char *buf, size_t bufsize) {
+	return win32_capture_stdout(argv, buf, bufsize, true);
+}
+
+// Windows twin of the POSIX capture_all_output: reads to EOF, does not
+// truncate at the first newline.
 static int capture_all_output(char **argv, char *buf, size_t bufsize) {
-	if (bufsize == 0) return -1;
-	buf[0] = '\0';
-
-	char *cmdline = win32_argv_to_cmdline(argv);
-	if (!cmdline) return -1;
-
-	int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
-	if (wcmd_len <= 0) {
-		free(cmdline);
-		return -1;
-	}
-	wchar_t *wcmdline = (wchar_t *)malloc(wcmd_len * sizeof(wchar_t));
-	if (!wcmdline) {
-		free(cmdline);
-		return -1;
-	}
-	MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wcmd_len);
-	free(cmdline);
-
-	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
-	HANDLE hReadPipe, hWritePipe;
-	if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-		free(wcmdline);
-		return -1;
-	}
-	SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
-	HANDLE hNul = CreateFileW(
-	    L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa_nul, OPEN_EXISTING, 0, NULL);
-
-	PROCESS_INFORMATION pi;
-	memset(&pi, 0, sizeof(pi));
-
-	HANDLE candidates[3] = {GetStdHandle(STD_INPUT_HANDLE),
-				hWritePipe,
-				(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE)};
-	HANDLE handle_list[3];
-	int handle_count = 0;
-	HANDLE inherit_changed_handles[3];
-	int inherit_changed_count = 0;
-	bool inherit_setup_ok = true;
-	for (int i = 0; i < 3; i++) {
-		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL) continue;
-		bool dup = false;
-		for (int j = 0; j < handle_count; j++)
-			if (handle_list[j] == candidates[i]) {
-				dup = true;
-				break;
-			}
-		if (!dup) {
-			DWORD flags;
-			if (!GetHandleInformation(candidates[i], &flags)) {
-				inherit_setup_ok = false;
-				break;
-			}
-			if (!(flags & HANDLE_FLAG_INHERIT)) {
-				if (!SetHandleInformation(
-					candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
-					inherit_setup_ok = false;
-					break;
-				}
-				inherit_changed_handles[inherit_changed_count++] = candidates[i];
-			}
-			handle_list[handle_count++] = candidates[i];
-		}
-	}
-
-	STARTUPINFOEXW six;
-	memset(&six, 0, sizeof(six));
-	six.StartupInfo.cb = sizeof(six);
-	six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-	six.StartupInfo.hStdInput = candidates[0];
-	six.StartupInfo.hStdOutput = hWritePipe;
-	six.StartupInfo.hStdError = candidates[2];
-
-	SIZE_T attr_size = 0;
-	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
-	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
-	BOOL ok = FALSE;
-	BOOL attr_initialized = FALSE;
-	if (inherit_setup_ok && six.lpAttributeList &&
-	    (attr_initialized =
-		 InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size)) &&
-	    UpdateProcThreadAttribute(six.lpAttributeList,
-				      0,
-				      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-				      handle_list,
-				      (SIZE_T)handle_count * sizeof(HANDLE),
-				      NULL,
-				      NULL)) {
-		ok = CreateProcessW(NULL,
-				    wcmdline,
-				    NULL,
-				    NULL,
-				    TRUE,
-				    EXTENDED_STARTUPINFO_PRESENT,
-				    NULL,
-				    NULL,
-				    &six.StartupInfo,
-				    &pi);
-	}
-	if (attr_initialized) DeleteProcThreadAttributeList(six.lpAttributeList);
-	if (six.lpAttributeList)
-		free(six.lpAttributeList);
-	for (int i = 0; i < inherit_changed_count; i++)
-		SetHandleInformation(inherit_changed_handles[i], HANDLE_FLAG_INHERIT, 0);
-	free(wcmdline);
-	CloseHandle(hWritePipe);
-	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
-
-	if (!ok) {
-		CloseHandle(hReadPipe);
-		return -1;
-	}
-
-	size_t pos = 0;
-	char ch;
-	DWORD nread;
-	while (pos + 1 < bufsize && ReadFile(hReadPipe, &ch, 1, &nread, NULL) && nread == 1) {
-		if (ch == '\r') continue; // normalize CRLF → LF
-		buf[pos++] = ch;
-	}
-	buf[pos] = '\0';
-	CloseHandle(hReadPipe);
-
-	WaitForSingleObject(pi.hProcess, INFINITE);
-	DWORD exit_code = 1;
-	GetExitCodeProcess(pi.hProcess, &exit_code);
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
-
-	return pos > 0 ? 0 : -1;
+	return win32_capture_stdout(argv, buf, bufsize, false);
 }
 
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe

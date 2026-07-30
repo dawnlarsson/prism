@@ -2200,7 +2200,10 @@ static void cm_gen_defer_ret_shape(void) {
  * own output re-preprocesses to *defined*. A tier that compared `got` against
  * `ref` alone would report that as a prism bug. It is not; prism inherits it.
  * So a cell where `got == cc` but both differ from `ref` is counted as
- * `inherited`, reported and not failed.
+ * `inherited`, reported and not failed -- but only when prism gained a
+ * definition, never when it lost one. cc_ref is 0 for every live context, so
+ * `got == cc_ref` in the losing direction is 0 == 0 and excuses a dropped
+ * define, which is the defect the tier is for.
  *
  * Comparing against `cc` alone would be equally wrong in the other direction:
  * `cc -E` drops every `#define` it consumes, and re-emitting them is the whole
@@ -2226,24 +2229,6 @@ static int csd_defined(const char *code) {
 	/* -w: GCC rejects clang's -Wno-everything, and a rejected flag would make
 	 * every cell read as "undefined" and the tier vacuously green. */
 	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -E -w %s >/dev/null 2>&1", cm_cc(), path);
-	int rc = run_command_status(cmd);
-	unlink(path);
-	free(path);
-	if (rc < 0) return -1;
-	return rc == 0 ? 1 : 0;
-}
-
-/* Is `code` valid C at all? `cc -E` succeeding proves nothing: the
- * preprocessor accepts text the compiler rejects, and a cell built from such
- * text is not a legitimate input to judge prism against. The splice contexts
- * below produce exactly that - `int pad = 0; \\` followed by `#define X 1`
- * splices into an expression statement containing `#`, which gcc reports as
- * "stray '#' in program". prism rejecting it is correct. */
-static int csd_compiles(const char *code) {
-	char *path = create_temp_file(code);
-	if (!path) return -1;
-	char cmd[PATH_MAX + 96];
-	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", cm_cc(), path);
 	int rc = run_command_status(cmd);
 	unlink(path);
 	free(path);
@@ -2296,6 +2281,26 @@ static int csd_cc_roundtrip(const char *code) {
 	return r;
 }
 
+/* Is `code` valid C at all? `cc -E` succeeding proves nothing: the
+ * preprocessor accepts text the compiler rejects, and a cell built from such
+ * text is not a legitimate input to judge prism against. The splice contexts
+ * below produce exactly that - `int pad = 0; \\` followed by `#define X 1`
+ * splices into an expression statement containing `#`, which gcc reports as
+ * "stray '#' in program". prism rejecting it is correct. */
+static int csd_compiles(const char *code) {
+	char *path = create_temp_file(code);
+	if (!path) return -1;
+	char cmd[PATH_MAX + 96];
+	snprintf(cmd, sizeof(cmd), "%s -std=gnu11 -fsyntax-only -w %s >/dev/null 2>&1", cm_cc(), path);
+	int rc = run_command_status(cmd);
+	unlink(path);
+	free(path);
+	if (rc < 0) return -1;
+	return rc == 0 ? 1 : 0;
+}
+
+/* Definedness after `cc -E` has had the source once and its output is fed back
+ * in. Isolates the preprocessor's own non-idempotence from prism's behaviour. */
 static void cm_gen_source_defines(void) {
 	/* Where the directive sits. %s is the directive spelling. Each entry
 	 * drives one state of the scanner; the trailing group exercises states
@@ -2305,6 +2310,14 @@ static void cm_gen_source_defines(void) {
 	    "/* %s */\n",                                        /* inside one-line block */
 	    "/* opening\n%s\n*/\n",                              /* inside multi-line     */
 	    "/* opening\n * starred\n%s\n*/\n",                  /* starred continuation  */
+	    /* A comment line that ends in a backslash. Phase 2 splices it into
+	     * the comment terminator below, so the comment closes and the
+	     * directive that follows is real -- but the scanner set its
+	     * directive-continuation flag from a line that was inside a comment,
+	     * never cleared it when the comment closed, and ate the next line
+	     * whole. The two neighbours above miss it: neither ends a comment
+	     * line with a backslash. */
+	    "/* opening \\\n*/\n%s\n",                           /* spliced comment close */
 	    "#if 0\n%s\n#endif\n",                               /* dead branch           */
 	    "#if 1\n%s\n#endif\n",                               /* live branch           */
 	    "#ifdef CSD_ABSENT\n%s\n#endif\n",                   /* ifdef false           */
@@ -2417,9 +2430,17 @@ static void cm_gen_source_defines(void) {
 				hoist_boundary++;
 				continue;
 			}
-			if (got == cc_ref) {
-				/* cc -E's own output already disagrees with the
-				 * source the same way; prism only passed it on. */
+			/* `got > ref`, not `got == cc_ref`. The inherited case above is
+			 * real, but it is only ever cc -E *adding* a definition its own
+			 * pass-through text re-preprocesses into. In the other
+			 * direction the test carries no information: cc -E consumes
+			 * every #define it processes, so cc_ref is 0 for every live
+			 * context, and `got == cc_ref` then reads 0 == 0 and excuses
+			 * exactly the thing this tier exists to catch -- prism dropping
+			 * a live define. The spliced-comment-close context above was
+			 * absorbed that way, 7 cells reported as inherited on a build
+			 * that was demonstrably wrong. A loss is never inherited. */
+			if (got == cc_ref && got > ref) {
 				inherited++;
 				continue;
 			}
@@ -9264,6 +9285,59 @@ static void cm_gen_driver_surfaces(void) {
 		}
 	}
 
+	/* Flags whose operand is a separate argv entry. prism has to know where
+	 * such a flag ends, or the operand stays loose and gets classified on its
+	 * own -- and an operand ending in `.c` then becomes a second input:
+	 * `prism -dumpbase side.c -c -o out.o in.c` died with "cannot specify -o
+	 * when generating multiple output files" while cc accepted the same line.
+	 * -isysroot, -imultilib, -aux-info, -dumpbase, -dumpbase-ext, -dumpdir,
+	 * -wrapper and --param were all missing.
+	 *
+	 * The oracle is exit-status parity with cc on the identical command line,
+	 * which is what makes this portable: a flag the local driver does not know
+	 * fails on both legs, and the Darwin entries only carry weight on a Mac.
+	 * The operand is deliberately a real .c file, because that is the shape
+	 * that gets misclassified. */
+	{
+		char plain[PATH_MAX], operand[PATH_MAX], obj[PATH_MAX], ccmd[PATH_MAX * 4];
+		static const char *const flags[] = {
+		    "-include", "-imacros", "-isystem", "-idirafter", "-iquote", "-iprefix",
+		    "-iwithprefix", "-iwithprefixbefore", "-imultilib", "-isysroot", "-Xlinker",
+		    "-Xpreprocessor", "-Xassembler", "-aux-info", "-wrapper", "--param",
+		    "-dumpbase", "-dumpbase-ext", "-dumpdir", "-target", "-arch", "-framework",
+		    "-rpath", "-install_name", "-undefined", "-filelist",
+		};
+		snprintf(plain, sizeof(plain), "%s/plain.c", dir);
+		snprintf(operand, sizeof(operand), "%s/side.c", dir);
+		snprintf(obj, sizeof(obj), "%s/op.o", dir);
+		FILE *pf = fopen(plain, "w");
+		FILE *of = fopen(operand, "w");
+		if (pf && of) {
+			fputs("int plain_main(void){return 0;}\n", pf);
+			fputs("int side_helper(void){return 7;}\n", of);
+			fclose(pf);
+			fclose(of);
+			for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+				snprintf(ccmd, sizeof(ccmd), "%s %s '%s' -c -o '%s' '%s' >/dev/null 2>&1",
+					 cm_cc(), flags[i], operand, obj, plain);
+				int cc_rc = run_command_status(ccmd) == 0;
+				snprintf(cmd, sizeof(cmd), "'%s' %s '%s' -c -o '%s' '%s' >/dev/null 2>&1",
+					 bin, flags[i], operand, obj, plain);
+				int pr_rc = run_command_status(cmd) == 0;
+				remove(obj);
+				st.cells++;
+				if (cc_rc != pr_rc)
+					cm_note(&st, "%s: cc %s the line, prism %s it", flags[i],
+						cc_rc ? "accepted" : "rejected",
+						pr_rc ? "accepted" : "rejected");
+			}
+		} else {
+			if (pf) fclose(pf);
+			if (of) fclose(of);
+			cm_note(&st, "could not write separate-operand fixtures");
+		}
+	}
+
 	cm_report("gen/driver-surfaces", &st);
 }
 
@@ -9570,8 +9644,32 @@ static void cm_gen_zeroinit_padding(void) {
  * cells are sequences of edits, because a cache can only go wrong on the
  * second visit; a single cold transpile proves nothing.
  *
+ * That oracle has exactly one exception, and it is the sources prism refuses
+ * to cache at all: a translation unit naming a build-time macro preprocesses
+ * to different text on every run, so two spawns disagree whenever they
+ * straddle a second. For those, see CM_PPC_NOCACHE below.
+ *
  * PRISM_PP_CACHE_DIR points the whole tier at a private directory, so it can
  * neither pollute the developer's cache nor be perturbed by it. */
+
+/* Entry count reported by `--prism-cache-info`, or -1 if it cannot be read.
+ * `scratch` is a writable path used to capture the output. */
+static long cm_ppc_entry_count(const char *cache, const char *bin, const char *scratch) {
+	char cmd[PATH_MAX * 3], *out;
+	const char *p;
+	long n = -1;
+	snprintf(cmd, sizeof(cmd),
+		 "PRISM_PP_CACHE_DIR='%s' '%s' --prism-cache-info >'%s' 2>/dev/null", cache, bin,
+		 scratch);
+	if (run_command_status(cmd) != 0) return -1;
+	out = cm_slurp(scratch);
+	if (!out) return -1;
+	p = strstr(out, "entries");
+	if (p) n = strtol(p + 7, NULL, 10);
+	free(out);
+	return n;
+}
+
 static void cm_gen_pp_cache(void) {
 	CmStats st = {0};
 	char dirbuf[PATH_MAX], bin[PATH_MAX], cache[PATH_MAX], cmd[PATH_MAX * 4];
@@ -9713,11 +9811,62 @@ static void cm_gen_pp_cache(void) {
 	CM_PPC_CHECK("", "recreate-after");
 
 	/* Build-time date macros must never be served from cache, because the
-	 * answer changes without any input changing. */
-	CM_PPC_WRITE(src, "static const char *d = __DA" "TE__;\nint main(void){ return d[0]==0; }\n");
-	CM_PPC_CHECK("", "date-macro");
-	CM_PPC_WRITE(src, "static const char *t = __TI" "ME__;\nint main(void){ return t[0]==0; }\n");
-	CM_PPC_CHECK("", "time-macro");
+	 * answer changes without any input changing.
+	 *
+	 * These two cells used to run CM_PPC_CHECK, and that was the wrong
+	 * instrument twice over. It is not deterministic: the expansion of
+	 * __TI ME__ differs between any two spawns that straddle a second, and
+	 * __DA TE__ across midnight, so the comparison measured how fast the
+	 * host was. It also could not fail for the reason it existed -- a cache
+	 * that wrongly stored the text and a cache that correctly bypassed it
+	 * both produce two differing texts, so the diff proved nothing either
+	 * way. It passed on x86 only because both spawns landed in the same
+	 * second, and it went red under qemu-riscv64, where they do not, on
+	 * behaviour that was correct.
+	 *
+	 * The invariant that is actually checkable is the one pp_source_is_-
+	 * cacheable implements: no entry is ever written for such a source.
+	 * Transpile twice, so a wrongly-stored entry would also be served back
+	 * on the second pass, and require the entry count not to move.
+	 *
+	 * The source must go to a path of its own, not to `src`. The cache key
+	 * is over argv and the input path, so rewriting `src` reuses the key
+	 * every cell above it already stored under: a wrongly-cached volatile
+	 * TU would overwrite that entry in place and the count would not move.
+	 * A first cut of this check did reuse `src`, and a prism mutated to
+	 * cache these sources passed it 40 cells to 0. A fresh path per cell
+	 * forces a store to be an insert. */
+#define CM_PPC_NOCACHE(label, text)                                                                  \
+	do {                                                                                         \
+		char vol[PATH_MAX];                                                                  \
+		long before, after;                                                                  \
+		int rc = 0;                                                                          \
+		st.cells++;                                                                          \
+		snprintf(vol, sizeof(vol), "%s/vol_%s.c", dir, (label));                             \
+		CM_PPC_WRITE(vol, (text));                                                           \
+		before = cm_ppc_entry_count(cache, bin, cold);                                       \
+		for (int pass = 0; pass < 2 && rc == 0; pass++) {                                    \
+			snprintf(cmd, sizeof(cmd),                                                   \
+				 "PRISM_PP_CACHE_DIR='%s' '%s' transpile '%s' >'%s' 2>/dev/null",     \
+				 cache, bin, vol, warm);                                              \
+			rc = run_command_status(cmd);                                                \
+		}                                                                                    \
+		after = cm_ppc_entry_count(cache, bin, cold);                                        \
+		if (rc != 0)                                                                         \
+			cm_note(&st, "%s: transpile failed, exit %d", (label), rc);                  \
+		else if (before < 0 || after < 0)                                                    \
+			cm_note(&st, "%s: could not read cache entry count", (label));               \
+		else if (after != before)                                                            \
+			cm_note(&st, "%s: cache grew %ld -> %ld, volatile macro was stored",         \
+				(label), before, after);                                             \
+	} while (0)
+
+	CM_PPC_NOCACHE("date-macro",
+		       "static const char *d = __DA" "TE__;\nint main(void){ return d[0]==0; }\n");
+	CM_PPC_NOCACHE("time-macro",
+		       "static const char *t = __TI" "ME__;\nint main(void){ return t[0]==0; }\n");
+	CM_PPC_NOCACHE("timestamp-macro",
+		       "static const char *s = __TIMES" "TAMP__;\nint main(void){ return s[0]==0; }\n");
 
 	/* --prism-cache-info and --prism-cache-clear are user-facing and were
 	 * never run. Clearing must leave the cache usable, not merely empty. */
@@ -9737,6 +9886,7 @@ static void cm_gen_pp_cache(void) {
 
 #undef CM_PPC_WRITE
 #undef CM_PPC_CHECK
+#undef CM_PPC_NOCACHE
 	/* The dependency set is recovered by parsing linemarkers, and that parser
 	 * is per-compiler. It understood only GCC/Clang's `# 1 "file"`; MSVC emits
 	 * `#line 1 "file"`, so on Windows every marker was rejected, the dependency

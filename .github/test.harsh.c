@@ -136,6 +136,94 @@ static void test_harsh_delimiter_overflow(void) {
     free(src);
 }
 
+/* The same nesting as above, one `defer` away. test_harsh_delimiter_overflow
+ * passed at 4100 throughout, because the walkers it exercises are iterative;
+ * pparse_defer_scan_orelse_in_group recurses once per nested group and used to
+ * forward its depth argument unchanged, so it was the one walker with no bound.
+ * At 100000 a release build took SIGSEGV on a stack overflow while the
+ * defer-less expression transpiled fine. Depth is charged to the shared defer
+ * budget now, so the three cells below are: under the cap, over it, and the
+ * size that used to crash -- the last two must produce a diagnostic and an
+ * error status, never a signal. */
+static void test_harsh_defer_group_nesting_depth(void) {
+    static const struct {
+        int depth;
+        bool want_ok;
+        const char *name;
+    } cases[] = {
+        {4000, true, "harsh defer group nesting: under the cap still transpiles"},
+        {4100, false, "harsh defer group nesting: over the cap is rejected"},
+        {100000, false, "harsh defer group nesting: 100k parens diagnose, not crash"},
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const int depth = cases[c].depth;
+        size_t cap = (size_t)depth * 2 + 128;
+        char *src = malloc(cap);
+        size_t len = 0;
+
+        CHECK(src != NULL, "harsh defer group nesting: allocate source buffer");
+        if (!src) return;
+
+        len += snprintf(src + len, cap - len, "void g(int);\nint f(void) { defer g(");
+        for (int i = 0; i < depth; i++) src[len++] = '(';
+        src[len++] = '1';
+        for (int i = 0; i < depth; i++) src[len++] = ')';
+        len += snprintf(src + len, cap - len, "); return 0; }\n");
+
+        PrismResult r = prism_transpile_source(src, "harsh_defer_nest.c", prism_defaults());
+        CHECK((r.status == PRISM_OK) == cases[c].want_ok, cases[c].name);
+        prism_free(&r);
+        free(src);
+    }
+}
+
+/* --prism-verify's whole guarantee is "no dialect keyword leaked into the
+ * output", and it rests on counting `defer`/`orelse` in emitted text. That
+ * count used to come from a hand-rolled scanner in prism.c that knew nothing
+ * about raw strings: R"(a "b)" left it one quote out of phase and every
+ * keyword after such a literal was invisible to it, so a leak past a raw
+ * string could not be detected. It also counted `defer` inside
+ * R"(say "defer")" as real code, and counted a `#define defer ...` spelling
+ * the tokenizer knows is shadowed. The count comes from the tokenizer now.
+ *
+ * The text reaching this counter has *not* been through cc -E, so a macro body
+ * may open a delimiter it never closes -- that is what `lex_only` is for, and
+ * the last cell pins it: without it, glibc's headers make the counter throw. */
+static void test_harsh_verify_kw_counts_lexing(void) {
+    static const struct {
+        const char *src;
+        long want_defer, want_orelse;
+        const char *name;
+    } cases[] = {
+        {"int f(void){ defer g(); }\n", 1, 0, "harsh verify count: plain defer"},
+        {"const char *s = \"defer\";\n", 0, 0, "harsh verify count: defer in a string"},
+        {"/* defer */ int x;\n", 0, 0, "harsh verify count: defer in a block comment"},
+        {"const char *s = R\"(say \"defer\")\";\n", 0, 0,
+         "harsh verify count: defer inside a raw string is not code"},
+        {"const char *s = R\"(a \"b)\";\nint f(void){ defer g(); }\n", 1, 0,
+         "harsh verify count: keyword after an odd-quote raw string is still seen"},
+        {"#define defer bark\nint f(void){ defer; }\n", 0, 0,
+         "harsh verify count: a shadowed defer is not the keyword"},
+        {"int f(void){ x orelse y; }\n", 0, 1, "harsh verify count: orelse"},
+        {"#define OPENER do {\nint f(void){ defer g(); }\n", 1, 0,
+         "harsh verify count: unbalanced macro body does not abort the count"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t sl = strlen(cases[i].src);
+        char *buf = malloc(sl + 8);
+        long nd = -1, no = -1;
+        CHECK(buf != NULL, "harsh verify count: allocate buffer");
+        if (!buf) return;
+        memcpy(buf, cases[i].src, sl);
+        memset(buf + sl, 0, 8);
+        pparse_count_dialect_keywords((char *)"harsh_verify.c", buf, &nd, &no);
+        CHECK(nd == cases[i].want_defer && no == cases[i].want_orelse, cases[i].name);
+        free(buf);
+    }
+}
+
 static void test_harsh_many_special_wrappers(void) {
     size_t cap = 32768;
     char *src = malloc(cap);
@@ -530,6 +618,8 @@ void run_harsh_review_tests(void) {
     test_harsh_error_recovery_barrage();
     test_harsh_many_labels_goto_safety();
     test_harsh_delimiter_overflow();
+    test_harsh_defer_group_nesting_depth();
+    test_harsh_verify_kw_counts_lexing();
     test_harsh_many_special_wrappers();
     test_harsh_defer_control_scope_leaks();
     test_harsh_multihop_special_wrapper_propagation();
