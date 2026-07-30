@@ -1,12 +1,6 @@
 #define PRISM_VERSION "1.1.6"
 
-/* Standard C, needed on every platform. It used to sit in the POSIX-only block
- * below with <spawn.h> and <unistd.h>, so on Windows it was never included and
- * the two time(NULL) calls in the preprocess-cache prune were implicit
- * declarations: implicitly int, while time_t is 64-bit there, so `now` took a
- * truncated value and every cache age comparison against PRISM_PP_CACHE_MAX_DAYS
- * was computed from garbage. Same subsystem and same silence as the #line
- * marker bug. */
+/* Required by the preprocessing cache on every platform. */
 #include <time.h>
 
 #ifndef _WIN32
@@ -41,6 +35,9 @@
 /* parse.c is self-contained: it includes its own headers and needs nothing
  * declared above this point. Keep it that way — it is consumed STB-style,
  * as a single file dropped into a host TU. */
+#ifndef PRISM_LIB_MODE
+#define PRISM_SINGLE_THREAD
+#endif
 #include "parse.c"
 
 static char **build_clean_environ(void);
@@ -61,16 +58,7 @@ static int run_command_quiet(char **argv);
 #include <dirent.h> /* preprocessor-cache eviction sweep */
 #endif
 
-/* Driver and emitter state. These fields used to live in PParseContext, but
- * parse.c never read them - they were there only because prism.c needed
- * somewhere to put CLI flags, #line tracking, emit scratch and output state.
- * parse.c owns C-language logic; this owns everything that is merely how prism
- * drives it.
- *
- * Thread-local storage rather than a heap pointer: nothing here needs a
- * lifetime, and one _tlv_get_addr per function is what PPARSE_CTX already
- * costs. Zero-initialised by definition, so reset_transpiler_state only has to
- * clear what carries between translation units. */
+/* Thread-local driver/emitter state; parse.c owns language state. */
 typedef struct {
 	int error_col;
 	const char *extra_compiler;
@@ -110,17 +98,7 @@ typedef struct {
 	int source_define_count;
 	int source_define_cap;
 	char *active_membuf; // open_memstream buffer; freed on longjmp recovery
-	/* open_memstream's size-out parameter. Both of the pointers handed to
-	 * open_memstream must outlive every fclose of that stream, because the
-	 * C library writes the final buffer address and length THROUGH them at
-	 * close. In library mode the close can happen in error_recovery_result,
-	 * after a longjmp has already unwound the frame that called
-	 * open_memstream — so a `size_t memlen` local there is a dangling
-	 * pointer by then, and fclose writes a length into whatever now
-	 * occupies that stack slot. That was a real crash: glibc's fclose wrote
-	 * 0 over error_recovery_result's own hidden struct-return pointer, and
-	 * the function segfaulted storing its result. active_membuf was already
-	 * moved here for the same reason; the length was left behind. */
+	/* Both open_memstream out-parameters must survive longjmp recovery. */
 	size_t active_memlen;
 } PrismState;
 
@@ -363,13 +341,7 @@ static PRISM_THREAD_LOCAL int ctrl_save_cap = 0;
 static PRISM_THREAD_LOCAL int current_func_idx = -1;  // Index into func_meta[] for the function being emitted
 static PRISM_THREAD_LOCAL bool is_msvc_cached;	      // cached target_is_msvc(), set in transpile_tokens
 static PRISM_THREAD_LOCAL bool prism_profile = false; // --prism-prof: emit phase timing to stderr
-/* --prism-verify / PRISM_VERIFY: translation validation.  After emitting,
- * re-run the full pipeline on the emitted C and require a fixed point
- * (byte-identical modulo preprocessor linemarkers).  Any operator-position
- * defer/orelse that leaked into the output would transform or reject on the
- * second pass; a well-formed output re-verifies through every Phase 1 + CFG
- * check.  Generalizes the self-host stage1==stage2 invariant to every
- * user compile. */
+/* Reparse emitted C and require a fixed point (ignoring linemarkers). */
 static PRISM_THREAD_LOCAL bool prism_verify_mode = false;
 static PRISM_THREAD_LOCAL bool prism_in_verify = false;
 typedef struct {
@@ -397,10 +369,7 @@ static PParseToken *walk_balanced(PParseToken *tok);
 static PParseToken *walk_balanced_orelse(PParseToken *tok);
 static PParseToken *try_bounds_checks(PParseToken *t);
 
-/* typeof(expr orelse val) -> typeof(ternary). Seven copies existed; six were
- * identical and one differed only by omitting the PPARSE_TT_TYPEOF fast path,
- * which try_typeof_orelse tests again itself. The PPARSE_F_ORELSE test is load
- * bearing - try_typeof_orelse does not check the feature. */
+/* typeof(expr orelse val) -> typeof(ternary); callee assumes feature enabled. */
 #define EMIT_TRY_TYPEOF_ORELSE(t)                                                                    \
 	if (pparse_feat(PPARSE_F_ORELSE) && ((t)->tag & PPARSE_TT_TYPEOF)) {                         \
 		PParseToken *_n = try_typeof_orelse(t);                                              \
@@ -418,16 +387,7 @@ static PParseToken *try_bounds_checks(PParseToken *t);
 		continue;                                                                            \
 	}
 
-/* Bounds-check handler, shared by every emit walker.
- *
- * Ten copies of this existed in three spellings: with and without the
- * PPARSE_F_BOUNDS_CHECK fast path, and with or without a `bc != t` test. The
- * fast path only skips the call - try_bounds_checks returns NULL when the
- * feature is off either way - and `bc != t` is dead because a rewrite always
- * returns a token past the construct.
- *
- * Expands to a statement that advances `t` and continues the enclosing walk
- * when a bounds rewrite fired, so it composes with the other handlers. */
+/* Apply a bounds rewrite and advance the enclosing walker when it fires. */
 #define EMIT_TRY_BOUNDS(t)                                                                           \
 	if (__builtin_expect(pparse_feat(PPARSE_F_BOUNDS_CHECK), 0)) {                               \
 		PParseToken *_bc = try_bounds_checks(t);                                             \
@@ -447,7 +407,6 @@ static inline PParseToken *try_strip_raw(PParseToken *t);
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define OUT_TOK(t) out_str(pparse_loc(_pc, t), (t)->len)
-#define skip_balanced(tok, o, c) pparse_skip_balanced_group(tok)
 static bool cc_is_msvc(const char *cc);
 static inline void ctrl_reset(void);
 
@@ -930,12 +889,7 @@ static void scope_pop(void) {
 }
 
 static void defer_add(PParseToken *defer_keyword, PParseToken *start, PParseToken *end) {
-	/* Phase 1 p1d_validate_defer owns the common file-scope reject; this
-	 * guard is UNCONDITIONAL (not PRISM_DEBUG-only) because a defer that
-	 * reaches Pass 2 at depth 0 through an unclassified context (e.g. a
-	 * file-scope initializer) would otherwise register silently and its
-	 * body would never be emitted — a token-dropping miscompile.  One
-	 * comparison per defer statement; found by the contexts suite. */
+	/* Backstop Phase 1: a leaked file-scope defer would otherwise be dropped. */
 	if (emit_block_depth <= 0) pparse_error_tok(start, "defer outside of any scope");
 	pparse_VEC_ENSURE_REALLOC(defer_stack, defer_count + 1, defer_stack_cap, 16);
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
@@ -1537,7 +1491,7 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 					emit_at_stmt_start = false;
 					continue;
 				}
-			} else if ((tok->tag & PPARSE_TT_SUE) && !(pparse_ann(tok) & P1_IS_TYPEDEF)) {
+			} else if (tok->tag & PPARSE_TT_SUE) {
 				PParseToken *next = handle_sue_body(tok);
 				if (next) {
 					tok = next;
@@ -1546,8 +1500,7 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 			}
 		}
 
-		if (emit_at_stmt_start && (tok->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH)) &&
-		    !(pparse_ann(tok) & P1_IS_TYPEDEF)) {
+		if (emit_at_stmt_start && (tok->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH))) {
 			if (pparse_is_else_or_do(tok)) {
 				tok = emit_advance(tok);
 				ctrl_state.pending = true;
@@ -1884,20 +1837,8 @@ static inline void emit_type_with_pragma_prelude(
 	int saved_oe = _ps->bracket_oe_count, saved_dim = _ps->bracket_dim_count;
 	_ps->bracket_oe_count = 0;
 	_ps->bracket_dim_count = 0;
-	/* The prelude emits everything before the type range (attributes, #pragma
-	 * noise).  `raw_tok` bounds it only when the raw token actually PRECEDES
-	 * the type range — `__attribute__((x)) raw int v;`.  When raw sits inside
-	 * the specifiers — `__attribute__((x)) const raw int v;` — those
-	 * specifiers belong to emit_type_range, and using raw_tok as the bound
-	 * emitted them twice: `const const int v;`, invalid C that Phase 1
-	 * accepted.  (Found by the generative raw product's raw-vs-zeroinit-off
-	 * equivalence oracle; `static`/`extern` were unaffected because they take
-	 * the has-storage verbatim path.)
-	 *
-	 * Order is decided by a bounded walk, not by comparing token addresses or
-	 * pparse_idx: the stream is not contiguous across PPARSE_TF_LINK_JUMP
-	 * hops, so index comparison silently misorders tokens from different pool
-	 * segments. */
+	/* Bound the prelude at raw only when raw precedes the type. Walk because
+	 * linked token segments are neither address- nor index-ordered. */
 	PParseToken *prelude_end = type_start;
 	if (raw_tok) {
 		int budget = 64;
@@ -3164,8 +3105,7 @@ static PParseToken *handle_close_brace(PParseToken *tok) {
 		return pparse_next(_pc, tok);
 	}
 	while (emit_scope_depth > 0 && !is_brace_scope(scope_stack[emit_scope_depth - 1].kind)) scope_pop();
-	PParseToken *open = pparse_pair(_pc, tok);
-	if (open && (pparse_ann(open) & P1_RAW_BLOCK) && _ps->raw_block_depth > 0)
+	if ((pparse_ann(tok) & P1_RAW_BLOCK) && _ps->raw_block_depth > 0)
 		_ps->raw_block_depth--;
 	if (pparse_feat(PPARSE_F_DEFER) && emit_scope_depth > 0) {
 		ScopeNode *s = &scope_stack[emit_scope_depth - 1];
@@ -3231,16 +3171,7 @@ static int spawn_command(char **argv, bool quiet_stderr) {
 		actions_ptr = &actions;
 	}
 
-	/* Retry the two errors that mean "not right now" rather than "never".
-	 *
-	 * EAGAIN is the machine momentarily out of processes and ETXTBSY is
-	 * somebody still holding the target open for writing -- both routine when
-	 * prism is one of many jobs under `make -j`, and neither a reason to fail
-	 * a build. Without this, a busy machine makes prism return -1 from
-	 * spawn_command, which main passes straight through as exit 255, and the
-	 * user sees a build fail for no reason they can act on. Found because the
-	 * test suite hit exactly that, intermittently, once it started running its
-	 * own compilers in parallel. */
+	/* Transient under parallel builds: retry EAGAIN/ETXTBSY briefly. */
 	pid_t pid;
 	int err = 0;
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -3357,17 +3288,7 @@ static const char *cc_next_token(const char *p, const char **start, int *len, bo
 	return p;
 }
 
-/* `CC=/path with spaces/cc` is one argv entry, not several.
- *
- * cc_executable, cc_split_into_argv and cc_extra_arg_count each need to know
- * whether the whole CC string, trimmed, names a real executable — and each
- * used to answer it with its own copy of the trim, the space/quote scan and
- * the access() probe. Three copies of one predicate is three places for the
- * three answers to drift apart, and they must agree: cc_extra_arg_count sizes
- * the argv that cc_split_into_argv then fills.
- *
- * Writes the trimmed string into `buf` and returns its length, or 0 when the
- * string is quoted, has no space, does not fit, or does not name a file. */
+/* Recognize an unquoted `CC=/path with spaces/cc` as one argv entry. */
 static size_t cc_whole_string_exe(const char *cc, char *buf, size_t bufsz) {
 	if (!cc || !*cc) return 0;
 	while (*cc == ' ' || *cc == '\t') cc++;
@@ -3735,12 +3656,7 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 	return false;
 }
 
-/* Does `p` leave us inside an unterminated block comment or raw string?
- *
- * Written out four times in collect_source_defines, once per place a line can
- * be examined. has_unclosed_block_comment hands back a malloc'd delimiter for
- * the raw-string case, so the branch that does not take ownership has to free
- * it - the part that is easiest to drop when copying. */
+/* Update multiline-comment/raw-string state; free delimiters not retained. */
 #define PP_SCAN_LINE_OPENERS(p)                                                                      \
 	do {                                                                                         \
 		char *_rd = NULL;                                                                    \
@@ -3773,12 +3689,10 @@ static void collect_source_defines(const char *input_file) {
 
 	typedef struct {
 		char *opening;	// e.g. "#ifdef __APPLE__\n"
-		char *branches; // accumulated "#else\n" or "#elif EXPR\n" text (NULL
-				// initially)
+		char *branches; // accumulated #else/#elif text
 		int branches_len;
 		int branches_cap;
-		bool extractable; // false if opening/branch had continuation (multi-line
-				  // expr)
+		bool extractable; // false for multiline conditions
 	} CondStackEntry;
 
 	int cond_stack_cap = 32;
@@ -3813,10 +3727,10 @@ static void collect_source_defines(const char *input_file) {
 				    (raw_delim_len == 0 || strncmp(r + 1, raw_delim, raw_delim_len) == 0) &&
 				    r[1 + raw_delim_len] == '"') {
 					in_raw_string = false;
+					p = r + 2 + raw_delim_len;
 					free(raw_delim);
 					raw_delim = NULL;
 					raw_delim_len = 0;
-					p = r + 2 + raw_delim_len;
 					goto after_raw_string_close;
 				}
 			}
@@ -3948,15 +3862,7 @@ static void collect_source_defines(const char *input_file) {
 			goto check_continuation;
 		}
 
-		/* Stop collecting at the first top-level #include.
-		 *
-		 * emit_consumed_defines writes the collected defines ABOVE the
-		 * re-emitted includes, so anything defined after an include in the
-		 * source cannot be hoisted without changing what it means - the
-		 * macro may deliberately override something the header defined, or
-		 * depend on it. Collecting only the prefix before the first include
-		 * is what makes the hoist sound. Conditional includes do not stop
-		 * the scan: they are re-emitted with their guards intact. */
+		/* Only the prefix before the first top-level include is safe to hoist. */
 		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
 		if (cond_depth > cond_stack_cap) goto check_continuation;
 		if (cond_depth > 0) {
@@ -3977,19 +3883,7 @@ static void collect_source_defines(const char *input_file) {
 			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '(') p++;
 			int name_len = (int)(p - name_start);
 			if (name_len <= 0) goto check_continuation;
-			/* Function-like macro: the parameter list is part of the
-			 * spelling and has to travel with the name, because the
-			 * collected form is a -D spec and `-D'F(a)=(a)'` is how a
-			 * function-like macro is written there.
-			 *
-			 * `(` must be adjacent to the name: `#define F (x)` is
-			 * object-like with value `(x)`, and the scan above already
-			 * stopped at the space in that case. Parameter lists cannot
-			 * nest, so the first `)` closes the list. A list continued
-			 * onto the next line is still skipped, as before.
-			 *
-			 * Dropping these silently was the bug: object-like defines
-			 * survived a transpile and function-like ones did not. */
+			/* Adjacent macro parameters are part of the -D name. */
 			if (*p == '(') {
 				char *params_end = strchr(p, ')');
 				if (!params_end) goto check_continuation;
@@ -4297,31 +4191,10 @@ static bool input_is_dot_i(const char *path) {
 	return n >= 2 && path[n - 2] == '.' && (path[n - 1] == 'i' || path[n - 1] == 'I');
 }
 
-/* ---- Preprocessed-output cache ----------------------------------------
- *
- * `cc -E` is 39-99% of prism's wall time (8.19 of 8.28 ms on a no-include file,
- * 103.8 of 262.8 ms on test.c), so every transpile-phase optimisation is
- * competing for a small slice. Caching the preprocessor's output removes the
- * spawn entirely whenever nothing it read has changed.
- *
- * Key    = 128-bit hash of the exact argv, the resolved compiler's identity,
- *          and the include-affecting environment.
- * Valid  = every file that contributed to the output still has the same size
- *          and mtime. The dependency list is recovered from the `# N "file"`
- *          linemarkers in the output itself, so no -MD sidecar is needed.
- *
- * A stale hit produces a silently wrong build, so every uncertainty resolves to
- * "miss": unparsable header, missing dep, coarse timestamp, or a source using
- * one of the build-time date macros (whose expansion is not a function of the
- * inputs - see pp_text_has_time_macro). Set PRISM_NO_PP_CACHE=1 to disable.
- */
+/* Preprocessed-output cache: every validation uncertainty is a miss. */
 #define PP_CACHE_MAGIC "PRISMPPC2\n"
 
-/* Sub-second mtime, where the platform exposes it. POSIX.1-2008 requires
- * st_mtime to be a macro for st_mtim.tv_sec, which is the portable probe for
- * the timespec fields. Without nanoseconds a file rewritten inside the same
- * second it was recorded is indistinguishable from an unchanged one, so
- * pp_cache_store refuses to record entries that recent. */
+/* Zero means unavailable; recent second-resolution files are not cached. */
 #if defined(_WIN32)
 #define PP_MTIME_NSEC(st) 0LL
 #elif defined(__APPLE__)
@@ -4488,13 +4361,7 @@ static const char *pp_cache_dir(void) {
 	return dir;
 }
 
-/* A source expanding one of the build-time date macros does not produce output
- * that is a pure function of its inputs, so it must never be cached.
- *
- * The names are assembled from fragments rather than written whole. The scan is
- * a plain substring match, so spelling them literally anywhere in this file -
- * including in a comment - would make prism.c match itself and exclude prism
- * from its own cache. Hence also the circumlocution in these comments. */
+/* Reject volatile time macros; split their names so prism.c remains cacheable. */
 static bool pp_text_has_time_macro(const char *buf, size_t len) {
 	static const char *const m[] = {"__DA"
 					"TE__",
@@ -4517,12 +4384,7 @@ static size_t pp_marker_path(const char *l, const char *end, char *out, size_t o
 	if (l >= end || *l != '#') return 0;
 	l++;
 	while (l < end && (*l == ' ' || *l == '\t')) l++;
-	/* Two spellings. GCC and Clang emit `# 1 "file"`; MSVC emits
-	 * `#line 1 "file"`. Requiring a digit here dropped every marker cl
-	 * produced, so on Windows the dependency set collapsed to the top-level
-	 * input alone and editing any included file never invalidated the entry:
-	 * prism served a stale preprocessed TU with no diagnostic, forever. That
-	 * is the whole failure mode this cache is meant not to have. */
+	/* Accept GCC/Clang `# 1` and MSVC `#line 1` markers. */
 	if (l + 4 <= end && prism_memeq_static(l, "line", 4)) {
 		l += 4;
 		while (l < end && (*l == ' ' || *l == '\t')) l++;
@@ -4776,11 +4638,7 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 		size_t n = pp_marker_path(l, end, buf, sizeof buf);
 		if (n) {
 			int seen = 0;
-			/* Linemarkers carry the path as cc saw it, which is often relative
-			 * to the invoking directory. Validating a relative path would stat
-			 * whatever sits at that name in a future run's cwd - a different
-			 * file with the same name would then validate as unchanged. Canonical
-			 * paths only; if a dep cannot be resolved, do not cache at all. */
+			/* Cache only canonical dependency paths; future cwd may differ. */
 			if (!realpath(buf, can)) goto out;
 			for (i = 0; i < ndeps; i++)
 				if (strcmp(deps[i], can) == 0) {
@@ -4835,11 +4693,7 @@ static bool pp_cache_enabled(void) {
 	return !(v && *v && strcmp(v, "0") != 0);
 }
 
-/* Decided before the spawn, not at store time: a source that expands a date
- * macro can never be cached, so probing and storing are both wasted work. The
- * scan is deliberately conservative - it matches the name anywhere, including
- * in comments and string literals. A false positive costs one cache miss; a
- * false negative would be a silently stale build. */
+/* Conservatively reject volatile time macros before preprocessing. */
 static bool pp_source_is_cacheable(const char *input_file) {
 	struct stat st;
 	FILE *f = NULL;
@@ -5812,15 +5666,7 @@ PRISM_API void prism_reset(void) {
 	}
 }
 
-/* Count whole-word defer/orelse identifiers in one CODE pass; string literals,
- * char literals, and comments are skipped. The leak
- * check asks "did an operator-position keyword survive to the backend"; the
- * transpiler's own pparse_error-message strings ("'orelse' cannot be used …") and a
- * `{"defer", …}` keyword-table entry are not operator keywords and their count
- * is not guaranteed stable across re-preprocessing/header-flattening on every
- * platform (this counter previously counted them, producing a spurious Linux
- * "leak" on the self-referential test harness).  A single scanner tracks
- * string/char/comment state with escape handling. */
+/* Count whole-word keywords outside literals and comments. */
 typedef struct { long orelse, defer; } VerifyKwCounts;
 
 static VerifyKwCounts verify_kw_counts(const char *s) {
@@ -5863,43 +5709,7 @@ static VerifyKwCounts verify_kw_counts(const char *s) {
 	return n;
 }
 
-/* --prism-verify: per-compile translation-validation certificate for the
- * defer/orelse safety theorem.
- *
- * After emitting output #1 for `orig_input`, the ENTIRE pipeline runs on
- * output #1 a second time (preprocess, pparse_tokenize, all Phase 1 analyses + CFG
- * verification, Pass 2).  The certificate requires:
- *   (1) the second pass SUCCEEDS — output #1 is valid C that survives every
- *       Phase-1 constraint and the CFG verifier as plain C.  A leaked
- *       operator-position keyword that produces invalid C, or any emitted
- *       construct that trips a Phase-1 gate, fails here.
- *   (2) NO operator keyword leaked — the count of whole-word `orelse` /
- *       `defer` tokens is IDENTICAL in output #1 and output #2.  Soundness:
- *       prism only ever REMOVES operator-position keywords (it lowers them);
- *       it never introduces one.  So count(#2) <= count(#1) always, and a
- *       strict decrease means pass 2 lowered a keyword that pass 1 left
- *       behind — i.e. output #1 leaked an operator `orelse`/`defer` to the
- *       backend.  Equal counts prove every surviving `orelse`/`defer` word
- *       is a stable ordinary identifier (a user variable/typedef/label),
- *       exactly SPEC's "when disabled the keyword reverts to an identifier".
- *
- * Why not byte-equality: `prism(prism(x))` is deliberately NOT byte-pparse_equal to
- * `prism(x)` under header-flattening — pass 2 re-wraps the diagnostic-pragma
- * preamble, renumbers `#line`, and relocates the one-time `__prism_bchk`
- * runtime helper.  That scaffolding asymmetry is unrelated to defer/orelse.
- * Byte-level lowering-idempotence of defer/orelse (and bounds) IS certified,
- * on controlled inputs where scaffolding is stable, by the in-process
- * contexts/insertion fixed-point oracles (test.contexts.c / test.insertion.c).
- *
- * The second pass disables the additive safety transforms (zero-init,
- * auto-unreachable, auto-static) — each re-applies to already-lowered code
- * with a benign asymmetry (raw-stripped re-zeroing, doubled unreachable
- * marker, reshaped-decl tracking) — and downgrades safety diagnostics to
- * warnings, because Prism's own lowering can emit CFG shapes its strict
- * checker rejects (e.g. `int x = v orelse goto L, y = 10;` → a goto
- * textually before an initialized decl); the user's ORIGINAL already passed
- * the strict check in pass 1.  defer + orelse stay ON so a leaked operator
- * keyword is lowered on pass 2 and detected by the count check.            */
+/* Reparse emitted C; stable defer/orelse counts prove no operator leaked. */
 static int verify_transpiled_output(char *orig_input, char *out1_path) {
 	PRISM_STATE();
 	PPARSE_CTX();
@@ -6022,20 +5832,15 @@ static void error_recovery_init(void) {
 	_pc->error_jmp_set = true;
 }
 
-static PrismResult error_recovery_result(void) {
+static void error_recovery_result(PrismResult *r) {
 	PRISM_STATE();
 	PPARSE_CTX();
 	_pc->error_jmp_set = false;
-	PrismResult r = {.status = PRISM_ERR_SYNTAX,
-			 .error_msg = strdup(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
-			 .error_line = _pc->error_line,
-			 .error_col = _ps->error_col};
-	/* fclose must precede free: closing a memstream writes the final buffer
-	 * address through the pointer given to open_memstream, so freeing first
-	 * leaves fclose to publish a dangling pointer into active_membuf — and
-	 * the free below would then be reading what fclose just wrote. Both
-	 * out-parameters live in PrismState precisely so this close is safe
-	 * after the longjmp that unwound transpile_to_result. */
+	*r = (PrismResult){.status = PRISM_ERR_SYNTAX,
+			   .error_msg = strdup(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
+			   .error_line = _pc->error_line,
+			   .error_col = _ps->error_col};
+	/* fclose publishes the final memstream pointer; it must precede free. */
 	if (out_fp) {
 		fclose(out_fp);
 		out_fp = NULL;
@@ -6046,19 +5851,13 @@ static PrismResult error_recovery_result(void) {
 	}
 	_ps->active_memlen = 0;
 	prism_reset();
-	return r;
 }
 #endif
 
 static PrismResult transpile_to_result(PParseToken *tok) {
 	PRISM_STATE();
 	PrismResult result = {0};
-	/* Both out-parameters live in thread-local state rather than on this
-	 * frame, in every build. A longjmp out of transpile_tokens unwinds past
-	 * here, and the fclose in error_recovery_result still writes the final
-	 * buffer address and length through these two pointers — so they have to
-	 * outlive the frame that opened the stream. Keeping the pair together
-	 * also removes three #ifdef PRISM_LIB_MODE forks from this function. */
+	/* Memstream out-parameters must outlive this frame across longjmp. */
 	_ps->active_membuf = NULL;
 	_ps->active_memlen = 0;
 	FILE *fp = open_memstream(&_ps->active_membuf, &_ps->active_memlen);
@@ -6082,15 +5881,16 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 	return result;
 }
 
-PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features) {
+static void prism_transpile_file_into(PrismResult *result, const char *input_file, PrismFeatures features) {
 	pparse_ctx_init();
-	/* After pparse_ctx_init(): caching before the context exists captures NULL. */
-	PPARSE_CTX();
-	PrismResult result = {0};
 
 #ifdef PRISM_LIB_MODE
+	PPARSE_CTX();
 	error_recovery_init();
-	if (setjmp(_pc->error_jmp) != 0) return error_recovery_result();
+	if (setjmp(_pc->error_jmp) != 0) {
+		error_recovery_result(result);
+		return;
+	}
 #endif
 
 	apply_features(features);
@@ -6098,43 +5898,51 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 	PParseToken *tok;
 	char *pp_buf = preprocess_with_cc((char *)input_file);
 	if (!pp_buf) {
-		result.status = PRISM_ERR_IO;
-		result.error_msg = strdup("Preprocessing failed");
+		result->status = PRISM_ERR_IO;
+		result->error_msg = strdup("Preprocessing failed");
 		goto cleanup;
 	}
 
 	tok = pparse_tokenize_buffer((char *)input_file, pp_buf);
 	if (!tok) {
-		result.status = PRISM_ERR_SYNTAX;
-		result.error_msg = strdup("Failed to pparse_tokenize");
+		result->status = PRISM_ERR_SYNTAX;
+		result->error_msg = strdup("Failed to pparse_tokenize");
 		pparse_tokenizer_teardown(false);
 		goto cleanup;
 	}
 
-	result = transpile_to_result(tok);
+	*result = transpile_to_result(tok);
 
 cleanup:
+	(void)0;
 #ifdef PRISM_LIB_MODE
 	_pc->error_jmp_set = false;
 #endif
+}
+
+PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features) {
+	PrismResult result = {0};
+	prism_transpile_file_into(&result, input_file, features);
 	return result;
 }
 
 #ifdef PRISM_LIB_MODE
-PRISM_API
-PrismResult prism_transpile_source(const char *source, const char *filename, PrismFeatures features) {
+static void prism_transpile_source_into(PrismResult *result, const char *source, const char *filename,
+				       PrismFeatures features) {
 	pparse_ctx_init();
 	PPARSE_CTX();
-	PrismResult result = {0};
 	if (!source) {
-		result.status = PRISM_ERR_IO;
-		result.error_msg = strdup("source is NULL");
-		return result;
+		result->status = PRISM_ERR_IO;
+		result->error_msg = strdup("source is NULL");
+		return;
 	}
 
 	const char *fname = filename ? filename : "<source>";
 	error_recovery_init();
-	if (setjmp(_pc->error_jmp) != 0) return error_recovery_result();
+	if (setjmp(_pc->error_jmp) != 0) {
+		error_recovery_result(result);
+		return;
+	}
 	apply_features(features);
 	pparse_ensure_keyword_cache();
 	PParseToken *tok;
@@ -6142,24 +5950,30 @@ PrismResult prism_transpile_source(const char *source, const char *filename, Pri
 	size_t src_len = strlen(source);
 	buf = malloc(src_len + 8);
 	if (!buf) {
-		result.status = PRISM_ERR_IO;
-		result.error_msg = strdup("Out of memory");
+		result->status = PRISM_ERR_IO;
+		result->error_msg = strdup("Out of memory");
 		goto src_cleanup;
 	}
 	memcpy(buf, source, src_len);
 	memset(buf + src_len, 0, 8);
 	tok = pparse_tokenize_buffer((char *)fname, buf);
 	if (!tok) {
-		result.status = PRISM_ERR_SYNTAX;
-		result.error_msg = strdup("Failed to pparse_tokenize");
+		result->status = PRISM_ERR_SYNTAX;
+		result->error_msg = strdup("Failed to pparse_tokenize");
 		pparse_tokenizer_teardown(false);
 		goto src_cleanup;
 	}
 
-	result = transpile_to_result(tok);
+	*result = transpile_to_result(tok);
 
 src_cleanup:
 	_pc->error_jmp_set = false;
+}
+
+PRISM_API
+PrismResult prism_transpile_source(const char *source, const char *filename, PrismFeatures features) {
+	PrismResult result = {0};
+	prism_transpile_source_into(&result, source, filename, features);
 	return result;
 }
 #endif // PRISM_LIB_MODE
@@ -6411,24 +6225,10 @@ static char **cli_expand_response_files(int argc,
 			/* rc > 0: unreadable @file — GCC keeps the arg literally. */
 			if (rc > 0)
 				rc = rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a) ? 0
-													    : -1;
-			if (rc < 0) {
-				for (int j = 0; j < owned_count; j++) free(owned[j]);
-				free(owned);
-				free(out);
-				*out_argc = 0;
-				*owned_out = NULL;
-				*owned_count_out = 0;
-				return NULL;
-			}
+											    : -1;
+			if (rc < 0) goto fail;
 		} else if (!rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a)) {
-			for (int j = 0; j < owned_count; j++) free(owned[j]);
-			free(owned);
-			free(out);
-			*out_argc = 0;
-			*owned_out = NULL;
-			*owned_count_out = 0;
-			return NULL;
+			goto fail;
 		}
 	}
 	pparse_VEC_ENSURE_REALLOC(out, count + 1, cap, 16);
@@ -6437,6 +6237,14 @@ static char **cli_expand_response_files(int argc,
 	*owned_out = owned;
 	*owned_count_out = owned_count;
 	return out;
+
+fail:
+	for (int j = 0; j < owned_count; j++) free(owned[j]);
+	free(owned);
+	free(out);
+	*out_argc = *owned_count_out = 0;
+	*owned_out = NULL;
+	return NULL;
 }
 
 static bool prism_handles_x_lang(const char *lang) {
@@ -6630,20 +6438,7 @@ static Cli cli_parse(int argc, char **argv) {
 			 * (backend would emit `-.o:` as the dep target). */
 			cli.passthrough = true;
 		} else if (a[1] == 'f') {
-			/* Both polarities of every feature flag are accepted. GCC's
-			 * convention is that -fno-X implies -fX exists, and a build that
-			 * inherits -fno-zeroinit from a parent needs some way to turn it
-			 * back on for one target. Through 1.1.5 only -fbounds-check and
-			 * -fflatten-headers had a positive form; -fzeroinit, -fdefer,
-			 * -forelse, -fauto-static and the rest fell through to the C
-			 * compiler, which rejected them with "unrecognized command-line
-			 * option" naming a flag the user reasonably believed was Prism's.
-			 *
-			 * Matching is exact after the optional "no-", so unrelated
-			 * compiler flags (-fno-strict-aliasing, -fdefer-pop) still fall
-			 * through to CC untouched. Note the two inversions: `safety`
-			 * drives warn_safety, and `link-pragma` drives no_link_pragma, so
-			 * both store the complement. */
+			/* Accept exact positive/negative Prism feature flags. */
 			const char *fb = a + 2;
 			bool on = true;
 			if (!strncmp(fb, "no-", 3)) {
@@ -6903,14 +6698,7 @@ static const char *get_install_path(void) {
 	return INSTALL_PATH;
 }
 
-/* Create the directory holding `p`, including any missing parents.
- *
- * This used to be a single mkdir, which cannot create `$PREFIX/bin` unless
- * $PREFIX already exists. The failure was not reported as "could not create
- * the directory" either: the caller treats a false return as a permissions
- * problem and retries the whole install under sudo, so
- * `PREFIX=$HOME/.local prism install` prompted for a root password and then
- * failed, on a path the user could write to perfectly well. */
+/* Create the directory holding `p`, including missing parents. */
 static bool ensure_install_dir(const char *p) {
 	char dir[PATH_MAX];
 	strncpy(dir, p, PATH_MAX - 1);
@@ -7008,16 +6796,7 @@ static void check_path_shadow(const char *install_path) {
 	}
 }
 
-/* Do two paths name the same file?
- *
- * The install self-check used to be strcmp, which only matches when the user
- * spells the destination exactly as argv[0]. Running the already-installed
- * copy through a symlink, a relative path, or any equivalent spelling slipped
- * past it and fell through to copying the file onto itself. On Linux that is
- * ETXTBSY, because the file is currently executing, so `prism install` from an
- * installed prism reported "Failed to install" and then escalated to sudo,
- * which also failed. Comparing device and inode answers the question the code
- * was actually asking; realpath alone would still miss hard links. */
+/* Compare path identity, including hard links. */
 static bool paths_are_same_file(const char *a, const char *b) {
 #ifdef _WIN32
 	char ra[PATH_MAX], rb[PATH_MAX];
@@ -7782,8 +7561,7 @@ static void collect_link_pragmas_file(const char *path, Cli *cli, const char *ho
 			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
 			size_t tlen = (size_t)(p - tok);
 			if (!match || tlen == 0) continue;
-			if (tok[0] == '-') {
-				// the flag's value — we don't special-case it here;
+			if (tok[0] == '-' || macos) {
 				char *dup = malloc(tlen + 1);
 				if (!dup) {
 					free(line);
@@ -7792,17 +7570,7 @@ static void collect_link_pragmas_file(const char *path, Cli *cli, const char *ho
 				}
 				memcpy(dup, tok, tlen);
 				dup[tlen] = 0;
-				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
-			} else if (macos) {
-				char *dup = malloc(tlen + 1);
-				if (!dup) {
-					free(line);
-					fclose(f);
-					die("out of memory");
-				}
-				memcpy(dup, tok, tlen);
-				dup[tlen] = 0;
-				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
+				if (tok[0] != '-') CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
 				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
 			} else {
 				char *buf = malloc(tlen + 3);
