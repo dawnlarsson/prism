@@ -423,9 +423,8 @@ static PParseToken *try_bounds_checks(PParseToken *t);
  * Ten copies of this existed in three spellings: with and without the
  * PPARSE_F_BOUNDS_CHECK fast path, and with or without a `bc != t` test. The
  * fast path only skips the call - try_bounds_checks returns NULL when the
- * feature is off either way - and `bc != t` is dead, because both
- * try_bounds_check_subscript and try_bounds_check_deref_add return either NULL
- * or a token past the construct, never the token they were handed.
+ * feature is off either way - and `bc != t` is dead because a rewrite always
+ * returns a token past the construct.
  *
  * Expands to a statement that advances `t` and continues the enclosing walk
  * when a bounds rewrite fired, so it composes with the other handlers. */
@@ -944,7 +943,6 @@ static void defer_add(PParseToken *defer_keyword, PParseToken *start, PParseToke
 
 static inline bool emit_newline_before_decl_after_stmt_boundary(PParseToken *prev, PParseToken *tok) {
 	PRISM_STATE();
-	PPARSE_CTX();
 	if (!prev || !tok) return false;
 	/* Cheapest, most selective test first: only a `;`/`}` predecessor can
 	 * trigger this. Rejecting here avoids in_struct_body()'s scope-stack walk
@@ -954,11 +952,7 @@ static inline bool emit_newline_before_decl_after_stmt_boundary(PParseToken *pre
 	if (_ps->aggregate_member_nest > 0) return false;
 	if (in_struct_body()) return false;
 	if (pparse_at_bol(tok)) return false;
-	if (pparse_ann(tok) & P1_IS_DECL) return true;
-	return (tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_STORAGE | PPARSE_TT_TYPEDEF | PPARSE_TT_INLINE |
-			    PPARSE_TT_TYPEOF | PPARSE_TT_ALIGNAS | PPARSE_TT_BITINT)) ||
-	       pparse_is_type_keyword(tok) || pparse_is_known_typedef(tok) || pparse_is_c23_attr(tok) ||
-	       ((tok->tag & PPARSE_TT_ATTR) && pparse_next(_pc, tok) && pparse_match_ch(pparse_next(_pc, tok), '('));
+	return (pparse_ann(tok) & P1_IS_DECL) != 0;
 }
 
 static PRISM_HOT void emit_tok(PParseToken *tok) {
@@ -1022,8 +1016,6 @@ static PRISM_HOT void emit_tok(PParseToken *tok) {
 	else if (pparse_match_ch(tok, '}') && _ps->aggregate_member_nest > 0)
 		_ps->aggregate_member_nest--;
 }
-
-static inline void reject_defer_in_expr_context(PParseToken *t);
 
 static inline PParseToken *emit_tok_checked(PParseToken *t) {
 	PParseToken *r = try_strip_raw(t);
@@ -1176,7 +1168,7 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 				 * handle (or correctly suppress) injection. */
 				if (pparse_feat(PPARSE_F_AUTO_UNREACHABLE) && defer_stack[i].stmt &&
 				    !pparse_match_ch(defer_stack[i].stmt, '{')) {
-					PParseToken *nr = pparse_try_detect_noreturn_call(defer_stack[i].stmt);
+					PParseToken *nr = pparse_noreturn_call_end(defer_stack[i].stmt);
 					if (nr) EMIT_UNREACHABLE();
 				}
 			}
@@ -1252,62 +1244,25 @@ static void check_defer_var_shadow(PParseToken *var_name) {
 	}
 }
 
-// Called from Pass 2 at statement-start for enum definitions and typedef
-// declarations
-static void enum_pass2_shadow_cb(PParseToken *t, void *ud) {
-	(void)ud;
-	check_defer_var_shadow(t);
-}
-
-static void check_enum_body_defer_shadow(PParseToken *brace) {
-	pparse_for_each_enum_constant(brace, enum_pass2_shadow_cb, NULL);
-}
-
 static void check_enum_typedef_defer_shadow(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!pparse_feat(PPARSE_F_DEFER) || defer_count == 0 || emit_block_depth <= 0) return;
-	if (tok->tag & PPARSE_TT_SUE) {
-		if (!pparse_is_enum_kw(tok)) return;
-		PParseToken *brace = pparse_find_struct_body_brace(tok);
-		if (brace) check_enum_body_defer_shadow(brace);
-		return;
-	}
-
-	if (tok->tag & PPARSE_TT_TYPEDEF) {
-		PParseToken *type_start = pparse_next(_pc, tok);
-		if (!type_start) return;
-		PParseTypeSpec type = pparse_type_specifier(type_start);
-		if (!type.saw_type) return;
-		PPARSE_FOR_RANGE(s, type_start, type.end) {
-			if (pparse_is_enum_kw(s)) {
-				PParseToken *brace = pparse_find_struct_body_brace(s);
-				if (brace) check_enum_body_defer_shadow(brace);
-			}
-		}
-		PParseToken *t = type.end;
-		while (t && t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
-			PParseDecl decl = pparse_declarator(t);
-			if (decl.var_name) check_defer_var_shadow(decl.var_name);
-			if (!decl.end) break;
-			t = decl.end;
-			if (pparse_match_ch(t, ',')) t = pparse_next(_pc, t);
-			else
-				break;
-		}
-		return;
+	if (!(tok->tag & PPARSE_TT_TYPEDEF) && !pparse_is_enum_kw(tok)) return;
+	int depth = 0;
+	PPARSE_FOR_TAIL(t, tok) {
+		if (pparse_ann(t) & P1_DEFER_SHADOW_NAME) check_defer_var_shadow(t);
+		if (t->flags & PPARSE_TF_OPEN)
+			depth++;
+		else if (t->flags & PPARSE_TF_CLOSE) {
+			if (depth > 0) depth--;
+		} else if (depth == 0 && pparse_match_ch(t, ';'))
+			break;
 	}
 }
 
 static inline bool is_orelse_keyword(PParseToken *tok) {
 	/* Phase 1 sets P1_IS_ORELSE_KW; Pass 2 only runs after annotation. */
 	return (pparse_ann(tok) & P1_IS_ORELSE_KW) != 0;
-}
-
-static inline bool raw_token_is_sue_tag_name(PParseToken *t) {
-	PPARSE_CTX();
-	if (!t || !(t->flags & PPARSE_TF_RAW)) return false;
-	PParseToken *prev = pparse_walk_back(pparse_idx(_pc, t), PPARSE_WB_PAST_NOISE);
-	return (prev && (prev->tag & PPARSE_TT_SUE)) || pparse_token_ends_sue_type_specifier(t);
 }
 
 static void emit_type_range(PParseToken *start, PParseToken *end, bool strip_const, bool strip_sue_body) {
@@ -1321,11 +1276,13 @@ static void emit_type_range(PParseToken *start, PParseToken *end, bool strip_con
 		EMIT_SKIP_STMT_EXPR(t)
 		if (pparse_match_ch(t, '{')) raw_depth++;
 		if (pparse_match_ch(t, '}')) raw_depth--;
-		if (raw_depth == 0 && (t->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(t) &&
-		    !raw_token_is_sue_tag_name(t)) {
-			PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, t));
+		PParseToken *after_raw = raw_depth == 0 ? pparse_raw_strip_recipe(t) : NULL;
+		if (after_raw) {
 			PParseToken *last = t;
-			pparse_SKIP_RAW(after, last);
+			while (after_raw && pparse_raw_strip_recipe(after_raw)) {
+				last = after_raw;
+				after_raw = pparse_raw_strip_recipe(after_raw);
+			}
 			emit_noise_between_raws(t, last);
 			t = pparse_next(_pc, last);
 			continue;
@@ -1339,42 +1296,12 @@ static void emit_type_range(PParseToken *start, PParseToken *end, bool strip_con
 			continue;
 		}
 		EMIT_TRY_BOUNDS(t)
-		if (strip_sue_body && pparse_match_ch(t, '{')) {
-			PParseToken *kw = NULL;
-			for (PParseToken *s = start; s != t; s = pparse_next(_pc, s))
-				if (s->tag & PPARSE_TT_SUE) kw = s;
-			bool keep = false;
-			if (kw && !pparse_is_enum_kw(kw)) {
-				PPARSE_FOR_RANGE(u, pparse_next(_pc, kw), t) {
-					if (pparse_match_ch(u, ')') && pparse_pair(_pc, u) &&
-					    pparse_loc(_pc, pparse_pair(_pc, u)) < pparse_loc(_pc, kw)) {
-						keep = true;
-						break;
-					}
-				}
-				if (!keep) {
-					keep = true;
-					PPARSE_FOR_RANGE(u, pparse_next(_pc, kw), t) {
-						if ((u->flags & PPARSE_TF_OPEN) &&
-						    (pparse_match_ch(u, '(') || (u->flags & PPARSE_TF_C23_ATTR))) {
-							u = pparse_pair(_pc, u);
-							if (!u || u == t) break;
-							continue;
-						}
-						if (pparse_is_valid_varname(u) &&
-						    !(u->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_ATTR | PPARSE_TT_TYPEOF))) {
-							keep = false;
-							break;
-						}
-					}
-				}
-			}
-			if (!keep) {
-				raw_depth--;
-				t = pparse_skip_balanced_group(t);
-				if (t == end) break;
-				continue;
-			}
+		if (strip_sue_body && pparse_match_ch(t, '{') &&
+		    (pparse_ann(t) & P1_SUE_SPLIT_STRIP)) {
+			raw_depth--;
+			t = pparse_skip_balanced_group(t);
+			if (t == end) break;
+			continue;
 		}
 		{
 			PParseToken *r = try_strip_raw(t);
@@ -1397,43 +1324,22 @@ static PParseToken *emit_expr_to_stop(PParseToken *tok, PParseToken *stop, bool 
 		if (pparse_match_ch(tok, ';') || (stop && tok == stop)) break;
 		if (check_orelse && is_orelse_keyword(tok)) break;
 		EMIT_TRY_TYPEOF_ORELSE(tok)
-		reject_defer_in_expr_context(tok);
 		tok = emit_advance(tok);
 	}
 	return tok;
 }
 
-static PParseToken *try_strip_raw_slow(PParseToken *t) {
-	PPARSE_CTX();
-	if (raw_token_is_sue_tag_name(t)) return NULL;
-	/* Force multiplication in subscripts: arr[raw * x] — never strip `raw`. */
-	if (pparse_raw_after_subscript_open_bracket(t)) return NULL;
-	PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, t));
-	/* Variable / enum-constant shadows named `raw` are identifiers. */
-	if (pparse_identifier_binding_kind(t) == PPARSE_BINDING_VALUE) return NULL;
-	/* Typedef named `raw` is the type in `raw x` / `raw *p`. Strip only when
-	 * it is a keyword prefix before another type (`raw raw x`, `raw int x`). */
-	if (pparse_is_known_typedef(t)) {
-		if (!(after && (pparse_is_type_keyword(after) || pparse_is_known_typedef(after) ||
-				(after->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_STORAGE | PPARSE_TT_INLINE |
-					       PPARSE_TT_TYPEDEF)) ||
-				(after->flags & PPARSE_TF_RAW))))
-			return NULL;
-	} else if (t->td_entry) {
-		return NULL;
-	}
-	if (pparse_is_raw_strip_context(t, after)) {
-		PParseToken *last = t;
-		pparse_SKIP_RAW(after, last);
-		emit_noise_between_raws(t, last);
-		return pparse_next(_pc, last);
-	}
-	return NULL;
-}
-
 static inline PParseToken *try_strip_raw(PParseToken *t) {
-	if (__builtin_expect(!(t->flags & PPARSE_TF_RAW), 1)) return NULL;
-	return try_strip_raw_slow(t);
+	PPARSE_CTX();
+	PParseToken *after = pparse_raw_strip_recipe(t);
+	if (__builtin_expect(!after, 1)) return NULL;
+	PParseToken *last = t;
+	while (after && pparse_raw_strip_recipe(after)) {
+		last = after;
+		after = pparse_raw_strip_recipe(after);
+	}
+	emit_noise_between_raws(t, last);
+	return pparse_next(_pc, last);
 }
 
 static void emit_ret_type_tokens(PParseToken *start, PParseToken *end) {
@@ -1492,39 +1398,14 @@ static PParseToken *try_orelse_expr_rewrites(PParseToken *tok) {
 
 enum { COLON_REQUIRE_BLOCK = 1 };
 
-/* True if `prev` can end a label name before ':' — identifier, or the closing
- * delimiter of attrs between the name and colon (`done [[x]]:` /
- * `__attribute__`). */
-static inline bool label_name_predecessor(PParseToken *prev) {
-	PPARSE_CTX();
-	if (!prev) return false;
-	if (pparse_is_identifier_like(prev) || prev->kind == PPARSE_TK_NUM) return true;
-	if (pparse_match_ch(prev, ']') && pparse_pair(_pc, prev) && (pparse_pair(_pc, prev)->flags & PPARSE_TF_C23_ATTR)) return true;
-	if (pparse_match_ch(prev, ')') && pparse_pair(_pc, prev)) {
-		PParseToken *before = pparse_walk_back(pparse_idx(_pc, pparse_pair(_pc, prev)), PPARSE_WB_ATTR_NOISE);
-		return before && (before->tag & PPARSE_TT_ATTR);
-	}
-	return false;
-}
-
-/* Returns true if colon was consumed as a label/case terminator (caller should
- * continue). */
-static bool consume_stmt_colon(PParseToken **tok_p, int *ternary_depth, bool *pending_case_colon, unsigned flags) {
+static bool consume_stmt_colon(PParseToken **tok_p, unsigned flags) {
 	PParseToken *tok = *tok_p;
-	if (!pparse_match_ch(tok, ':')) return false;
-	if (*ternary_depth > 0) {
-		(*ternary_depth)--;
-		*pending_case_colon = false;
-		return false;
-	}
-	if (!in_generic() && last_emitted && (label_name_predecessor(last_emitted) || *pending_case_colon) &&
-	    !in_struct_body() && (!(flags & COLON_REQUIRE_BLOCK) || emit_block_depth > 0)) {
-		*pending_case_colon = false;
+	if (pparse_match_ch(tok, ':') && (pparse_ann(tok) & P1_STMT_COLON) &&
+	    (!(flags & COLON_REQUIRE_BLOCK) || emit_block_depth > 0)) {
 		*tok_p = emit_advance(tok);
 		emit_at_stmt_start = true;
 		return true;
 	}
-	*pending_case_colon = false;
 	return false;
 }
 
@@ -1532,29 +1413,23 @@ static bool consume_stmt_colon(PParseToken **tok_p, int *ternary_depth, bool *pe
  * back to `(name)(params)`. Expression `_Generic` keeps SCOPE_GENERIC. */
 static PParseToken *emit_generic_open(PParseToken *tok) {
 	PPARSE_CTX();
-	if (last_emitted &&
-	    (pparse_match_ch(last_emitted, '*') || pparse_match_ch(last_emitted, ')') ||
-	     (last_emitted->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_SKIP_DECL | PPARSE_TT_ATTR | PPARSE_TT_INLINE |
-				   PPARSE_TT_STORAGE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT)) ||
-	     pparse_is_known_typedef(last_emitted))) {
-		PParseToken *name = NULL, *params_open = NULL, *params_close = NULL, *after = NULL;
-		if (pparse_generic_decl_rewrite_target(tok, &name, &params_open, &params_close, &after)) {
+	PParseGenericDeclRecipe recipe;
+	if (pparse_generic_decl_recipe(tok, &recipe)) {
 			out_char('(');
-			OUT_TOK(name);
+			OUT_TOK(recipe.name);
 			out_char(')');
-			emit_range(params_open, pparse_next(_pc, params_close));
+			emit_range(recipe.params_open, pparse_next(_pc, recipe.params_close));
 			PParseToken *gen_close = pparse_pair(_pc, pparse_next(_pc, tok));
 			PParseToken *scan_start = gen_close;
 			PParseToken *after_gen = pparse_skip_noise(_pc, pparse_next(_pc, gen_close));
-			if (after_gen == params_open) scan_start = params_close;
-			PPARSE_FOR_RANGE(a, pparse_next(_pc, scan_start), after) {
+			if (after_gen == recipe.params_open) scan_start = recipe.params_close;
+			PPARSE_FOR_RANGE(a, pparse_next(_pc, scan_start), recipe.after) {
 				emit_tok(a);
 				last_emitted = a;
 			}
-			last_emitted = params_close ? params_close : name;
+			last_emitted = recipe.params_close;
 			emit_at_stmt_start = false;
-			return after;
-		}
+			return recipe.after;
 	}
 	tok = emit_advance(tok);
 	if (tok && pparse_match_ch(tok, '(')) {
@@ -1568,9 +1443,7 @@ static PParseToken *emit_generic_open(PParseToken *tok) {
 static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode mode) {
 	PPARSE_CTX();
 	PParseToken *unreachable_tok = NULL;
-	int ternary_depth = 0;
 	bool dr_braceless_body = false;
-	bool pending_case_colon = false;
 	while (tok && tok != end && tok->kind != PPARSE_TK_EOF) {
 		if (pparse_match_ch(tok, '{')) {
 			if (mode == EMIT_DEFER_BODY) {
@@ -1613,8 +1486,7 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 			continue;
 		}
 
-		if (pparse_match_ch(tok, '?')) ternary_depth++;
-		if (consume_stmt_colon(&tok, &ternary_depth, &pending_case_colon, 0)) continue;
+		if (consume_stmt_colon(&tok, 0)) continue;
 
 		if (__builtin_expect(tok->kind == PPARSE_TK_PREP_DIR, 0)) {
 			tok = emit_advance(tok);
@@ -1654,36 +1526,18 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 
 		if (emit_at_stmt_start) {
 			if (mode == EMIT_DEFER_BODY) {
-				PParseToken *probe = tok;
-				while (probe && probe->kind != PPARSE_TK_EOF) {
-					PParseToken *sn = pparse_skip_noise(_pc, probe);
-					if (sn != probe) {
-						probe = sn;
-						continue;
+				PParseToken *brace = pparse_cached_decl_sue_body(tok);
+				if (brace && pparse_pair(_pc, brace)) {
+					PParseToken *close = pparse_pair(_pc, brace);
+					while (tok && tok != end && tok->kind != PPARSE_TK_EOF) {
+						PParseToken *cur = tok;
+						tok = emit_advance(tok);
+						if (cur == close) break;
 					}
-					if (probe->tag &
-					    (PPARSE_TT_INLINE | PPARSE_TT_TYPEDEF | PPARSE_TT_STORAGE | PPARSE_TT_QUALIFIER)) {
-						probe = pparse_next(_pc, probe);
-						if (probe && pparse_match_ch(probe, '(') && pparse_pair(_pc, probe))
-							probe = pparse_next(_pc, pparse_pair(_pc, probe));
-						continue;
-					}
-					break;
+					emit_at_stmt_start = false;
+					continue;
 				}
-				if (probe && (probe->tag & PPARSE_TT_SUE) && !pparse_is_known_typedef(probe)) {
-					PParseToken *brace = pparse_find_struct_body_brace(probe);
-					if (brace && pparse_pair(_pc, brace)) {
-						PParseToken *close = pparse_pair(_pc, brace);
-						while (tok && tok != end && tok->kind != PPARSE_TK_EOF) {
-							PParseToken *cur = tok;
-							tok = emit_advance(tok);
-							if (cur == close) break;
-						}
-						emit_at_stmt_start = false;
-						continue;
-					}
-				}
-			} else if ((tok->tag & PPARSE_TT_SUE) && !pparse_is_known_typedef(tok)) {
+			} else if ((tok->tag & PPARSE_TT_SUE) && !(pparse_ann(tok) & P1_IS_TYPEDEF)) {
 				PParseToken *next = handle_sue_body(tok);
 				if (next) {
 					tok = next;
@@ -1693,7 +1547,7 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 		}
 
 		if (emit_at_stmt_start && (tok->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH)) &&
-		    !pparse_is_known_typedef(tok)) {
+		    !(pparse_ann(tok) & P1_IS_TYPEDEF)) {
 			if (pparse_is_else_or_do(tok)) {
 				tok = emit_advance(tok);
 				ctrl_state.pending = true;
@@ -1741,7 +1595,6 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 			}
 		}
 
-		if (tok->tag & (PPARSE_TT_CASE | PPARSE_TT_DEFAULT)) pending_case_colon = true;
 		emit_at_stmt_start = false;
 		tok = emit_advance(tok);
 	}
@@ -1826,8 +1679,6 @@ static PParseToken *try_bracket_orelse(PParseToken *tok) {
 	return NULL;
 }
 
-static PParseToken *try_bounds_check_deref_add(PParseToken *tok);
-
 /* Emit `a[__prism_bchk(idx, sizeof(a)/sizeof(a[0]))]`.
  *
  * The decision — whether this subscript can be checked at all, which array the
@@ -1837,7 +1688,7 @@ static PParseToken *try_bounds_check_deref_add(PParseToken *tok);
 static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 	PPARSE_CTX();
 	PParseBoundsPlan plan;
-	if (!pparse_bounds_plan_subscript(tok, last_emitted, in_struct_body(), &plan)) return NULL;
+	if (!pparse_cached_bounds_plan(tok, &plan)) return NULL;
 
 	PParseToken *close = plan.close;
 	OUT_LIT("[__prism_bchk((__prism_bchk_size_t)(");
@@ -1877,49 +1728,19 @@ static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 	return pparse_next(_pc, close);
 }
 
-static PParseToken *try_bounds_check_deref_add(PParseToken *tok) {
-	PPARSE_CTX();
-	/* Never wraps anything — `*(a+i)` cannot be checked, only reported. */
-	if (pparse_bounds_deref_add_is_unverifiable(tok)) {
-		if (pparse_feat(PPARSE_F_WARN_SAFETY))
-			pparse_warn_tok(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
-		else
-			pparse_error_tok(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
-	}
-	return NULL;
-}
-
 static inline PParseToken *try_bounds_checks(PParseToken *t) {
-	/* Only '[' (subscript) and '*' (pointer-arith deref) can be bounds sites;
-	 * cheap ch0 gate avoids two call+pparse_feat+pparse_match_ch per ordinary token. */
-	if (t->ch0 != '[' && t->ch0 != '*') return NULL;
-	PParseToken *n = try_bounds_check_subscript(t);
-	return n ? n : try_bounds_check_deref_add(t);
-}
-
-static inline void reject_defer_in_expr_context(PParseToken *t) {
-	PPARSE_CTX();
-	/* Release+debug: mid-expression `defer` (e.g. `x=1, defer g();` /
-	 * `return defer g(), 0;`) must not leak the keyword to the C backend.
-	 * Statement-form defer is consumed by handle_defer_keyword and never
-	 * reaches emit_tok. */
-	if (__builtin_expect(pparse_feat(PPARSE_F_DEFER) && (t->tag & PPARSE_TT_DEFER), 0) && !pparse_is_known_function_call(t) &&
-	    !(last_emitted && (last_emitted->tag & PPARSE_TT_MEMBER)) &&
-	    (!pparse_token_has_binding(t) || pparse_match_ch(pparse_next(_pc, t), '{')) && pparse_next(_pc, t) &&
-	    (pparse_is_identifier_like(pparse_next(_pc, t)) || pparse_match_ch(pparse_next(_pc, t), '{')))
-		pparse_error_tok(t,
-			  "'defer' cannot be used in expression context "
-			  "(comma expressions, return values, array dimensions, etc.)");
+	return t->ch0 == '[' ? try_bounds_check_subscript(t) : NULL;
 }
 
 static inline bool walk_balanced_tail(PParseToken **tp) {
 	PPARSE_CTX();
 	PParseToken *t = *tp;
 	if (pparse_feat(PPARSE_F_DEFER) && defer_count > 0 && pparse_is_enum_kw(t)) {
-		PParseToken *brace = pparse_find_struct_body_brace(t);
-		if (brace) check_enum_body_defer_shadow(brace);
+		PParseToken *brace = pparse_sue_body_recipe(t);
+		PParseToken *end = brace ? pparse_pair(_pc, brace) : NULL;
+		PPARSE_FOR_RANGE(e, brace ? pparse_next(_pc, brace) : NULL, end)
+			if (pparse_ann(e) & P1_DEFER_SHADOW_NAME) check_defer_var_shadow(e);
 	}
-	reject_defer_in_expr_context(t);
 	*tp = emit_advance(t);
 	return true;
 }
@@ -1993,7 +1814,6 @@ static void emit_token_range_nested(PParseToken *start, PParseToken *end, bool w
 				continue;
 			}
 		}
-		reject_defer_in_expr_context(t);
 		t = emit_advance(t);
 	}
 }
@@ -2341,97 +2161,6 @@ static void emit_noise_between_raws(PParseToken *first_raw, PParseToken *last_ra
 	}
 }
 
-static PParseToken *emit_raw_verbatim_to_semicolon(PParseToken *tok) {
-	PPARSE_CTX();
-	while (tok && tok->kind != PPARSE_TK_EOF && !pparse_match_ch(tok, ';')) {
-		if (tok->flags & PPARSE_TF_OPEN) tok = walk_balanced(tok);
-		else if (pparse_feat(PPARSE_F_ORELSE) && (tok->tag & PPARSE_TT_TYPEOF)) {
-			PParseToken *next = try_typeof_orelse(tok);
-			if (next) {
-				tok = next;
-				continue;
-			}
-			tok = emit_advance(tok);
-		} else {
-			tok = emit_advance(tok);
-		}
-	}
-	if (tok && pparse_match_ch(tok, ';')) {
-		tok = emit_advance(tok);
-	}
-	return tok;
-}
-
-/* Idempotence: when the statements immediately following this declaration
- * already contain Prism's own canonical zeroing for `var` (a prior pass's
- * output re-entering the pipeline — -save-temps .i recompiles, library-mode
- * round trips, --prism-verify's second pass), do not zero again.  Only the
- * exact canonical shapes are recognized:
- *   __builtin_memset([(void *)]&var, 0, sizeof(var));
- *   { [volatile] char *__prism_p_N = ...; for (...) __prism_p_N[...] = 0; }
- * A user's hand-written identical memset is also skipped — semantically
- * equivalent (the object is fully zeroed either way).  Partial or nonzero
- * user memsets do not match and zero-init still applies.                   */
-static bool prism_memset_follows(PParseToken *var) {
-	PPARSE_CTX();
-	if (!var) return false;
-	/* Find the terminating ';' of the declaration statement. */
-	PParseToken *t = var;
-	for (int guard = 0; t && t->kind != PPARSE_TK_EOF && guard < 4096; guard++) {
-		if ((t->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {
-			t = pparse_next(_pc, pparse_pair(_pc, t));
-			continue;
-		}
-		if (pparse_match_ch(t, ';')) break;
-		if (pparse_match_ch(t, '}')) return false;
-		t = pparse_next(_pc, t);
-	}
-	if (!t || !pparse_match_ch(t, ';')) return false;
-	t = pparse_next(_pc, t);
-	/* Scan across a small run of canonical zeroing statements (earlier
-	 * declarators' memsets precede this var's in multi-decl splits). */
-	for (int stmts = 0; t && t->kind != PPARSE_TK_EOF && stmts < 8; stmts++) {
-		if (t->kind == PPARSE_TK_IDENT && t->len == 16 && prism_memeq_static(pparse_loc(_pc, t), "__builtin_memset", 16)) {
-			PParseToken *p = pparse_next(_pc, t);
-			if (!p || !pparse_match_ch(p, '(') || !pparse_pair(_pc, p)) return false;
-			PParseToken *close = pparse_pair(_pc, p);
-			PParseToken *a = pparse_next(_pc, p);
-			/* optional (void *) cast */
-			if (a && pparse_match_ch(a, '(') && pparse_pair(_pc, a)) a = pparse_next(_pc, pparse_pair(_pc, a));
-			if (a && pparse_match_ch(a, '&')) a = pparse_next(_pc, a);
-			if (a && a->kind == PPARSE_TK_IDENT && a->len == var->len &&
-			    prism_memeq_runtime_sized(pparse_loc(_pc, a), pparse_loc(_pc, var), var->len))
-				return true;
-			t = pparse_next(_pc, close);
-			if (t && pparse_match_ch(t, ';')) t = pparse_next(_pc, t);
-			continue;
-		}
-		if (pparse_match_ch(t, '{') && pparse_pair(_pc, t)) {
-			/* candidate byte-loop block: require a __prism_p_ ident and
-			 * `& var` in its opening tokens */
-			PParseToken *close = pparse_pair(_pc, t);
-			bool has_p = false, has_var = false;
-			int k = 0;
-			for (PParseToken *s = pparse_next(_pc, t); s && s != close && k < 16; s = pparse_next(_pc, s), k++) {
-				if (s->kind == PPARSE_TK_IDENT && s->len >= 10 &&
-				    prism_memeq_static(pparse_loc(_pc, s), "__prism_p_", 10))
-					has_p = true;
-				if (pparse_match_ch(s, '&') && pparse_next(_pc, s) &&
-				    pparse_next(_pc, s)->kind == PPARSE_TK_IDENT &&
-				    pparse_next(_pc, s)->len == var->len &&
-				    prism_memeq_runtime_sized(pparse_loc(_pc, pparse_next(_pc, s)), pparse_loc(_pc, var), var->len))
-					has_var = true;
-			}
-			if (!has_p) return false;
-			if (has_var) return true;
-			t = pparse_next(_pc, close);
-			continue;
-		}
-		return false;
-	}
-	return false;
-}
-
 static void emit_typeof_memsets(PParseToken **vars, int count, bool has_volatile, bool has_const) {
 	PRISM_STATE();
 	PPARSE_CTX();
@@ -2439,7 +2168,6 @@ static void emit_typeof_memsets(PParseToken **vars, int count, bool has_volatile
 	int vol_len = has_volatile ? 9 : 0;
 	bool use_loop = has_volatile || target_is_msvc();
 	for (int i = 0; i < count; i++) {
-		if (prism_memset_follows(vars[i])) continue;
 		// Byte loop for volatile (memset drops volatile) and MSVC (no
 		// __builtin_memset).
 		if (use_loop) {
@@ -2516,7 +2244,7 @@ static PParseToken *emit_goto_defer(PParseToken *tok) {
 	PParseToken *goto_tok = tok;
 	tok = pparse_next(_pc, tok);
 	if (pparse_feat(PPARSE_F_DEFER) && pparse_is_identifier_like(tok)) {
-		int td = emit_block_depth - (int)goto_tok->parse_data;
+		int td = emit_block_depth - pparse_goto_block_exits(goto_tok);
 		if (td < 0) td = 0;
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
@@ -2724,7 +2452,7 @@ static InitWalkResult emit_decl_init_walk(PParseToken *tok) {
 			break;
 		}
 		if (pparse_feat(PPARSE_F_AUTO_UNREACHABLE) && !in_ctrl_paren()) {
-			PParseToken *nr = pparse_try_detect_noreturn_call(r.tok);
+			PParseToken *nr = pparse_noreturn_call_end(r.tok);
 			if (nr) r.unreachable_tok = nr;
 		}
 		EMIT_TRY_BOUNDS(r.tok)
@@ -2754,8 +2482,8 @@ static bool process_init_orelse_hit(PParseToken **tok_p,
 	PParseToken *tok = *tok_p;
 	out_char(';');
 	flush_typeof_memsets(_ps->typeof_vars, &_ps->typeof_var_count, type, typeof_var_base);
+	PParseToken *stop_comma = pparse_orelse_payload(tok);
 	tok = pparse_next(_pc, tok); // skip 'orelse'
-	PParseToken *stop_comma = pparse_find_boundary_comma(tok);
 	tok = emit_orelse_action(tok,
 				 decl->var_name,
 				 type->has_volatile || type->has_atomic,
@@ -2776,7 +2504,7 @@ static bool process_const_orelse_decl(PParseToken **tok_p,
 	PPARSE_CTX();
 	PParseToken *val_start = pparse_next(_pc, decl->end); // First value token after '='
 	PParseToken *tok = pparse_next(_pc, orelse_tok);	// skip 'orelse'
-	PParseToken *stop_comma = pparse_find_boundary_comma(tok);
+	PParseToken *stop_comma = pparse_orelse_payload(orelse_tok);
 	tok = handle_const_orelse_fallback(
 	    tok, orelse_tok, val_start, decl_start, decl, type_start, type, pragma_start, stop_comma);
 	flush_typeof_memsets(_ps->typeof_vars, &_ps->typeof_var_count, type, typeof_var_base);
@@ -2787,7 +2515,6 @@ static bool process_const_orelse_decl(PParseToken **tok_p,
 
 static PParseToken *process_declarators(PParseToken *tok,
 				  PParseTypeSpec *type,
-				  bool is_raw,
 				  PParseToken *type_start,
 				  PParseToken *pragma_start,
 				  PParseToken *raw_tok,
@@ -2799,21 +2526,22 @@ static PParseToken *process_declarators(PParseToken *tok,
 	bool need_type_emit = false; // Set after orelse comma — deferred to after next lookahead
 	while (tok && tok->kind != PPARSE_TK_EOF) {
 		PParseToken *decl_start = tok;
-		bool decl_is_raw = is_raw;
 		PParseToken *raw_probe = pparse_skip_noise(_pc, tok);
-		PParseToken *after = pparse_raw_decl_strip_after(raw_probe);
+		PParseToken *after = pparse_raw_strip_recipe(raw_probe);
 		if (after) {
 			emit_declarator(tok, raw_probe);
 			PParseToken *last_raw = raw_probe;
-			pparse_SKIP_RAW(after, last_raw);
+			while (after && pparse_raw_strip_recipe(after)) {
+				last_raw = after;
+				after = pparse_raw_strip_recipe(after);
+			}
 			emit_noise_between_raws(raw_probe, last_raw);
 			decl_start = pparse_next(_pc, last_raw);
 			tok = after;
-			decl_is_raw = true;
 		}
 
-		PParseDecl decl = pparse_declarator(tok);
-		if (!decl.end || !decl.var_name) {
+		PParseDecl decl;
+		if (!pparse_cached_declarator(tok, &decl) || !decl.end || !decl.var_name) {
 			if (!first_decl) {
 				if (need_type_emit) {
 					emit_type_range(type_start, type->end, false, true);
@@ -2856,8 +2584,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 		if (first_decl) {
 			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
-				if ((recipe & P1_DECL_AUTO_STATIC) &&
-				    !pparse_range_has_attribute(pragma_start, type_start, PPARSE_TT_ASM))
+				if (recipe & P1_DECL_AUTO_STATIC)
 					OUT_LIT("static ");
 				emit_type_with_pragma_prelude(
 				    pragma_start, type_start, type->end, raw_tok, false);
@@ -2902,7 +2629,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 				OUT_LIT(" = 0");
 		}
 
-		if (emit_zk == P1Z_MEMSET) {
+		if (emit_zk == P1Z_MEMSET && !(recipe & P1_DECL_ALREADY_ZERO)) {
 			PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena,
 					 _ps->typeof_vars,
 					 _ps->typeof_var_count + 1,
@@ -2976,152 +2703,23 @@ static PParseToken *try_zero_init_decl(PParseToken *tok) {
 	PPARSE_CTX();
 	if (emit_block_depth <= 0 || in_struct_body()) return NULL;
 	if (!pparse_feat(PPARSE_F_ZEROINIT) && !pparse_feat(PPARSE_F_ORELSE) && !pparse_feat(PPARSE_F_AUTO_STATIC)) return NULL;
-	if (!pparse_feat(PPARSE_F_ZEROINIT) && !pparse_feat(PPARSE_F_AUTO_STATIC)) {
-		bool has_bo = false;
-		PPARSE_FOR_TAIL(s, tok) {
-			if (pparse_match_ch(s, ';') || pparse_match_ch(s, '{')) break;
-			if (pparse_ann(s) & (P1_OE_BRACKET | P1_OE_DECL_INIT)) {
-				has_bo = true;
-				break;
-			}
-		}
-		if (!has_bo) return NULL;
-	}
-
 	if (tok->kind >= PPARSE_TK_STR) // Fast reject: strings, numbers, prep directives,
 				 // EOF can't start a declaration
 		return NULL;
-	ScopeNode *_bt = scope_block_top();
-	bool in_switch_scope_unbraced = _bt && _bt->is_switch;
-	PParseToken *warn_loc = tok;
 	PParseToken *pragma_start = tok;
 	tok = pparse_skip_noise(_pc, tok);
 	PParseToken *start = tok;
-	bool is_raw = false;
-	PParseToken *raw_tok = NULL;
-	PParseToken *raw_last = NULL; // last raw in chain (for deferred emit_noise_between_raws)
-	if ((tok->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(tok)) {
-		PParseToken *after_raw = pparse_skip_noise(_pc, pparse_next(_pc, tok));
-		if (pparse_is_raw_declaration_context(tok, after_raw)) {
-			is_raw = true;
-			raw_tok = tok;
-			PParseToken *last_raw = tok;
-			pparse_SKIP_RAW(after_raw, last_raw);
-			raw_last = last_raw;
-			start = pparse_next(_pc, last_raw);
-			tok = after_raw;
-			if (pragma_start == raw_tok) pragma_start = start;
-			warn_loc = after_raw;
-		}
-	}
-
-	if (!is_raw) {
-		PParseToken *probe = start;
-		while (probe && probe->kind != PPARSE_TK_EOF) {
-			pparse_SKIP_NOISE_CONTINUE(probe);
-			if (probe->tag & PPARSE_TT_QUALIFIER) {
-				probe = pparse_next(_pc, probe);
-				continue;
-			}
-			if ((probe->tag & (PPARSE_TT_STORAGE | PPARSE_TT_TYPEDEF))) {
-				probe = pparse_next(_pc, probe);
-				continue;
-			}
-			break;
-		}
-		if (probe && (probe->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(probe)) {
-			PParseToken *after_raw = pparse_skip_noise(_pc, pparse_next(_pc, probe));
-			if (pparse_is_raw_declaration_context(probe, after_raw)) {
-				PParseToken *last_raw = probe;
-				pparse_SKIP_RAW(after_raw, last_raw);
-				if (pparse_has_storage_in(pragma_start, last_raw)) {
-					emit_range(pragma_start, probe);
-					emit_noise_between_raws(probe, last_raw);
-					return emit_raw_verbatim_to_semicolon(pparse_next(_pc, last_raw));
-				}
-				is_raw = true;
-				raw_tok = probe;
-			}
-		}
-	}
 
 	pparse_ASSERT_NOT_NOISE(tok);
 	if ((tok->tag & PPARSE_TT_SKIP_DECL) && !(tok->tag & PPARSE_TT_STORAGE)) // Control flow, etc. (not storage class)
-	{
-		if (is_raw) {
-			return emit_raw_verbatim_to_semicolon(start);
-		}
 		return NULL;
-	}
-
-	if (!(tok->tag & PPARSE_TT_DECL_START) && !pparse_is_known_typedef(tok)) return NULL;
-	// Phase 1 fast gate: skip past storage/inline prefix to reach the
-	// type-start token that Phase 1D annotated with P1_IS_DECL.
-	{
-		PParseToken *ann = tok;
-		while (ann && ann->kind != PPARSE_TK_EOF) {
-			pparse_SKIP_NOISE_CONTINUE(ann);
-			if (ann->tag & (PPARSE_TT_STORAGE | PPARSE_TT_INLINE | PPARSE_TT_SKIP_DECL)) {
-				ann = pparse_next(_pc, ann);
-				continue;
-			}
-			break;
-		}
-		if (ann && !(pparse_ann(ann) & P1_IS_DECL)) return NULL;
-	}
-
-	PParseTypeSpec type = pparse_type_specifier(tok);
-	if (!type.saw_type) return NULL;
-	// pparse_type_specifier now detects embedded raw (e.g. const raw int)
-	if (type.has_raw && !is_raw) {
-		is_raw = true;
-		PPARSE_FOR_RANGE(r, start, type.end)
-			if ((r->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(r)) {
-				raw_tok = r;
-				break;
-			}
-	}
-
-	PParseDecl probe = pparse_declarator(type.end);
-	{
-		if (!probe.var_name || !probe.end) return NULL;
-		if (pparse_match_ch(probe.end, '=')) {
-			PParseToken *aeq = pparse_next(_pc, probe.end);
-			if (aeq && pparse_is_stmt_expr_open(aeq) && pparse_pair(_pc, aeq)) {
-				PParseToken *se_close = pparse_pair(_pc, aeq);
-				PParseToken *after_se = pparse_next(_pc, se_close);
-				bool is_orelse =
-				    after_se && (after_se->tag & PPARSE_TT_ORELSE) && !(se_close->tag & PPARSE_TT_MEMBER);
-				if (is_orelse && pparse_token_has_binding(after_se) &&
-				    !pparse_orelse_shadow_is_kw(se_close))
-					is_orelse = false;
-				if (!after_se || (!pparse_match_ch(after_se, ',') && !is_orelse)) {
-					if (!(ctrl_state.pending && ctrl_state.parens_just_closed))
-						check_defer_var_shadow(probe.var_name);
-					return NULL;
-				}
-			}
-		}
-	}
-
-	if (pparse_feat(PPARSE_F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init()) {
-		// Mirror Phase 1D's narrower gate: only fire on the
-		bool _has_init = probe.var_name && probe.end && pparse_match_ch(probe.end, '=');
-		bool _has_explicit_intent = _has_init || type.is_typedef || type.is_struct || type.is_enum ||
-					    type.has_static || type.has_extern || type.has_thread_local ||
-					    type.has_register || type.has_atomic || type.has_constexpr ||
-					    type.has_alignas;
-		if (!_has_explicit_intent)
-			SAFETY_DIAG(warn_loc,
-				    "variable declaration directly in switch body without braces "
-				    "(zero-init may be skipped by case labels); wrap in braces "
-				    "or use 'raw'");
-	}
+	if (!(pparse_ann(tok) & P1_IS_DECL)) return NULL;
+	PParseTypeSpec type;
+	if (!pparse_cached_type_specifier(tok, &type) || !type.saw_type) return NULL;
 
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
 	if (brace_wrap) ctrl_reset();
-	if (is_raw && raw_tok && raw_last) emit_noise_between_raws(raw_tok, raw_last);
-	return process_declarators(type.end, &type, is_raw, start, pragma_start, raw_tok, brace_wrap);
+	return process_declarators(type.end, &type, start, pragma_start, NULL, brace_wrap);
 }
 
 static PParseToken *emit_expr_to_semicolon(PParseToken *tok) {
@@ -3155,7 +2753,6 @@ static PParseToken *emit_expr_to_semicolon(PParseToken *tok) {
 		}
 
 		EMIT_TRY_TYPEOF_ORELSE(tok)
-		reject_defer_in_expr_context(tok);
 		{
 			PParseToken *r = emit_tok_checked(tok);
 			if (r) {
@@ -3187,8 +2784,7 @@ static PParseToken *try_handle_defer_flow_kw(PParseToken *tok) {
 		/* Statement-shaped `defer` that handle_defer_keyword declined
 		 * (mid-expression after comma / in a return value, etc.): reject
 		 * rather than leaking the keyword. Identifier uses of a shadowed
-		 * name fall through — reject_defer_in_expr_context allows them. */
-		reject_defer_in_expr_context(tok);
+		 * name fall through; Phase 1 rejects expression-context keywords. */
 	}
 	if (pparse_feat(PPARSE_F_DEFER) && (tag & (PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE))) {
 		PParseToken *next = handle_control_exit_defer(tok);
@@ -3262,8 +2858,10 @@ static PParseToken *handle_defer_keyword(PParseToken *tok) {
 	PParseToken *defer_keyword = tok;
 	tok = pparse_skip_noise(_pc, pparse_next(_pc, tok));
 	PParseToken *stmt_start = tok;
-	if (pparse_match_ch(stmt_start, '{') && pparse_pair(_pc, stmt_start)) {
-		PParseToken *close = pparse_pair(_pc, stmt_start);
+	PParseToken *body_end = pparse_defer_body_end(defer_keyword);
+	if (!body_end) pparse_error_tok(defer_keyword, "internal: missing defer body recipe");
+	if (pparse_match_ch(stmt_start, '{')) {
+		PParseToken *close = body_end;
 		PParseToken *after = pparse_next(_pc, close);
 		PParseToken *stmt_end = after; // exclusive boundary — emits up to but not including
 		defer_add(defer_keyword, stmt_start, stmt_end);
@@ -3275,8 +2873,7 @@ static PParseToken *handle_defer_keyword(PParseToken *tok) {
 		return tok;
 	}
 
-	PParseToken *stmt_end = pparse_skip_to_semicolon(tok, NULL);
-	reject_defer_unterminated(defer_keyword, stmt_start, stmt_end);
+	PParseToken *stmt_end = body_end;
 	defer_add(defer_keyword, stmt_start, stmt_end);
 	tok = (stmt_end->kind != PPARSE_TK_EOF) ? pparse_next(_pc, stmt_end) : stmt_end;
 	end_statement_after_semicolon();
@@ -3485,7 +3082,7 @@ static PParseToken *handle_goto_keyword(PParseToken *tok) {
 		}
 
 		if (pparse_is_identifier_like(after_attrs)) {
-			int target_depth = emit_block_depth - (int)goto_tok->parse_data;
+			int target_depth = emit_block_depth - pparse_goto_block_exits(goto_tok);
 			if (target_depth < 0) target_depth = 0;
 
 			if (goto_has_defers(target_depth)) {
@@ -3514,7 +3111,7 @@ static PParseToken *handle_goto_keyword(PParseToken *tok) {
 }
 
 static PParseToken *handle_sue_body(PParseToken *tok) {
-	PParseToken *brace = pparse_find_struct_body_brace(tok);
+	PParseToken *brace = pparse_sue_body_recipe(tok);
 	if (!brace) return NULL;
 	emit_range(tok, brace);
 	return handle_open_brace(brace);
@@ -5561,8 +5158,7 @@ static PParseToken *skip_stmt_prefixes(PParseToken *tok) {
 		}
 		if (pparse_is_identifier_like(tok)) {
 			PParseToken *colon = pparse_skip_noise(_pc, pparse_next(_pc, tok));
-			if (colon && pparse_match_ch(colon, ':') &&
-			    !(pparse_next(_pc, colon) && pparse_match_ch(pparse_next(_pc, colon), ':'))) {
+			if (colon && (pparse_ann(colon) & P1_STMT_COLON)) {
 				tok = pparse_next(_pc, colon);
 				continue;
 			}
@@ -5636,23 +5232,15 @@ bare_emit_fallback_expr(PParseToken *t, bool comma_term, PParseToken *lhs, PPars
 static PParseToken *emit_bare_orelse_impl(PParseToken *t, PParseToken *end, bool comma_term, bool brace_wrap) {
 	PRISM_STATE();
 	PPARSE_CTX();
-	PParseToken *orelse_tok = find_bare_orelse(t);
+	PParseToken *orelse_tok = pparse_bare_orelse_recipe(t);
 	if (!orelse_tok || (end && pparse_loc(_pc, orelse_tok) >= pparse_loc(_pc, end))) return NULL;
-
-	PParseExprTopLevel top = pparse_scan_expr_top_level(t, orelse_tok);
-	PParseToken *last_comma = comma_term ? top.last_comma : NULL;
+	uint32_t recipe = pparse_ann(orelse_tok);
+	if (!(recipe & P1_OE_BARE_RECIPE)) return NULL;
+	PParseToken *bare_assign_eq = pparse_orelse_payload(orelse_tok);
+	PParseToken *last_comma = comma_term ? pparse_bare_orelse_last_comma(bare_assign_eq) : NULL;
 	PParseToken *post_comma_t = last_comma ? pparse_next(_pc, last_comma) : t;
 	PParseToken *bare_lhs_start = post_comma_t;
-	PParseToken *bare_assign_eq = comma_term ? top.segment_assignment : top.last_assignment;
-	if (bare_assign_eq && !pparse_match_ch(bare_assign_eq, '='))
-		pparse_error_tok(bare_assign_eq,
-			  "bare assignment with 'orelse' cannot use compound operators "
-			  "(e.g. +=, -=); use a plain '=' assignment");
-
 	PParseToken *after_orelse = pparse_next(_pc, orelse_tok);
-	bool is_bare_fallback = bare_assign_eq && is_orelse_value_fallback(after_orelse);
-
-	if (!is_bare_fallback) return NULL; // caller handles non-bare fallback
 
 	if (brace_wrap) OUT_LIT(" {");
 	if (last_comma) {
@@ -5669,28 +5257,13 @@ static PParseToken *emit_bare_orelse_impl(PParseToken *t, PParseToken *end, bool
 			_ps->last_line_no++;
 		}
 	}
-	bool fallback_has_compound_literal = false;
-	int fallback_depth = 0;
-	PParseToken *fallback_prev = NULL;
-	PPARSE_FOR_TAIL(s, after_orelse) {
-		if (pparse_match_ch(s, '{') &&
-		    (fallback_depth == 0 || (fallback_prev && pparse_match_ch(fallback_prev, ')')))) {
-			fallback_has_compound_literal = true;
-			break;
-		}
-		if (s->flags & PPARSE_TF_OPEN) fallback_depth++;
-		else if (s->flags & PPARSE_TF_CLOSE)
-			fallback_depth--;
-		else if (fallback_depth == 0 && bare_is_stmt_end(s, comma_term))
-			break;
-		fallback_prev = s;
-	}
-
 	out_char(' ');
 	// a constraint violation (C23 §6.7.2.5p2).
 	// function return types are never VM (C11 §6.7.6.3p1).
-	bool lhs_has_indirection = bare_assign_eq &&
-				   bare_lhs_has_indirection(bare_lhs_start, bare_assign_eq);
+	bool fallback_has_compound_literal =
+	    recipe & (comma_term ? P1_OE_FALLBACK_CL_COMMA : P1_OE_FALLBACK_CL_SEMI);
+	bool lhs_has_indirection =
+	    recipe & (comma_term ? P1_OE_LHS_INDIRECT : P1_OE_FULL_LHS_INDIRECT);
 	if (fallback_has_compound_literal) {
 		OUT_LIT("(");
 		emit_balanced_range(bare_lhs_start, orelse_tok);
@@ -5700,12 +5273,7 @@ static PParseToken *emit_bare_orelse_impl(PParseToken *t, PParseToken *end, bool
 	} else {
 		// (C23 §6.7.2.5p2), covered by the . / -> check.
 		unsigned oe_id = _ps->ret_counter++;
-		bool rhs_has_member = false;
-		PPARSE_FOR_RANGE(s, pparse_next(_pc, bare_assign_eq), orelse_tok)
-			if (s->tag & PPARSE_TT_MEMBER) {
-				rhs_has_member = true;
-				break;
-			}
+		bool rhs_has_member = (recipe & P1_OE_RHS_MEMBER) != 0;
 		OUT_LIT("{ ");
 		emit_typeof_keyword();
 		out_char('(');
@@ -5824,7 +5392,7 @@ static PParseToken *emit_orelse_condition_wrap(PParseToken *t, PParseToken *orel
 static PParseToken *emit_deferred_orelse(PParseToken *t, PParseToken *end) {
 	PPARSE_CTX();
 	PParseToken *body = skip_stmt_prefixes(t);
-	PParseToken *orelse_tok = find_bare_orelse(body);
+	PParseToken *orelse_tok = pparse_bare_orelse_recipe(body);
 	if (!orelse_tok || (end && pparse_loc(_pc, orelse_tok) >= pparse_loc(_pc, end))) return NULL;
 	t = emit_through(t, body);
 	PParseToken *result = emit_bare_orelse_impl(t, end, false, false);
@@ -5860,7 +5428,7 @@ static inline PParseToken *try_process_stmt_token(PParseToken *t, PParseToken *e
 		if (r) return r;
 	}
 	if (pparse_feat(PPARSE_F_AUTO_UNREACHABLE) && !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
-		PParseToken *nr = pparse_try_detect_noreturn_call(t);
+		PParseToken *nr = pparse_noreturn_call_end(t);
 		if (nr && nr != end) *unreachable_tok = nr;
 	}
 	return NULL;
@@ -5927,9 +5495,7 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 	}
 
 	int next_func_idx = 0;
-	int ternary_depth = 0;
 	PParseToken *pending_unreachable_tok = NULL;
-	bool pending_case_colon = false;
 	const uint32_t feat = _pc->features;
 #undef pparse_feat
 #define pparse_feat(f) (feat & (f))
@@ -5956,7 +5522,6 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 
 		PParseToken *next;
 		uint32_t tag = tok->tag;
-		if (pparse_match_ch(tok, '?')) ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
 	{                                                                                                    \
@@ -5968,17 +5533,8 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 	}
 
 		if (__builtin_expect(!tag && !emit_at_stmt_start, 1)) {
-			if (__builtin_expect((tok->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(tok), 0))
+			if (__builtin_expect(pparse_raw_strip_recipe(tok) != NULL, 0))
 				goto slow_path;
-			if (__builtin_expect(pparse_feat(PPARSE_F_BOUNDS_CHECK) && _ps->raw_block_depth == 0 &&
-						 tok->ch0 == '*',
-					     0)) {
-				PParseToken *bc_da = try_bounds_check_deref_add(tok);
-				if (bc_da) {
-					tok = bc_da;
-					continue;
-				}
-			}
 			track_common_token_state(tok);
 			tok = emit_advance(tok);
 			continue;
@@ -6016,7 +5572,7 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 			if (pparse_feat(PPARSE_F_ORELSE) && _ps->raw_block_depth == 0 && emit_block_depth > 0 &&
 			    !in_struct_body() && !(tok->tag & (PPARSE_TT_NON_EXPR_STMT | PPARSE_TT_DEFER))) {
 				PParseToken *body = skip_stmt_prefixes(tok);
-				PParseToken *orelse_tok = find_bare_orelse(body);
+				PParseToken *orelse_tok = pparse_bare_orelse_recipe(body);
 				if (orelse_tok) {
 					tok = emit_through(tok, body);
 
@@ -6054,7 +5610,7 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 				if (pparse_feat(PPARSE_F_AUTO_UNREACHABLE) && _ps->raw_block_depth == 0 &&
 				    emit_block_depth > 0 && !in_ctrl_paren() &&
 				    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
-					PParseToken *nr = pparse_try_detect_noreturn_call(tok);
+					PParseToken *nr = pparse_noreturn_call_end(tok);
 					if (nr) pending_unreachable_tok = nr;
 				}
 			}
@@ -6077,7 +5633,6 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 			}
 		} // end if (tag)
 
-		if (tag & (PPARSE_TT_CASE | PPARSE_TT_DEFAULT)) pending_case_colon = true;
 		track_generic_token(tok);
 		if (tag & PPARSE_TT_SUE) // struct/union/enum body
 			DISPATCH(handle_sue_body);
@@ -6109,8 +5664,7 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 				}
 				continue;
 			}
-			if (c == ':' && consume_stmt_colon(
-					    &tok, &ternary_depth, &pending_case_colon, COLON_REQUIRE_BLOCK))
+			if (c == ':' && consume_stmt_colon(&tok, COLON_REQUIRE_BLOCK))
 				continue;
 		}
 
