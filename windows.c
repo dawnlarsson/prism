@@ -612,6 +612,16 @@ static int mkstemps(char *tmpl, int suffix_len) {
 	size_t x_start = x_end;
 	while (x_start > 0 && tmpl[x_start - 1] == 'X') x_start--;
 	size_t x_count = x_end - x_start;
+	/* POSIX mkstemp rejects a template with no X's (EINVAL). Without this the
+	 * shim substituted nothing, so all 10,000 attempts opened the *same*
+	 * fixed path: no hang, but Windows would quietly hand back a predictable
+	 * temp filename where POSIX refuses outright. Platform halves that
+	 * disagree about failing open versus closed are how this file has bitten
+	 * before, so match POSIX. */
+	if (x_count == 0) {
+		errno = EINVAL;
+		return -1;
+	}
 
 	// Seed with PID + high-resolution timer + tick count for better entropy
 	// Avoids collisions in parallel build systems (e.g., ninja -j32)

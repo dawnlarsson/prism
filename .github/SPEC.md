@@ -34,24 +34,41 @@ The transpiler operates in two passes:
 
 Defined in `parse.c`. Produces a flat pool of `PParseToken` structs.
 
-### PParseToken structure: 24 bytes, hot path
+### PParseToken structure: 32 bytes, hot path
+
+Exactly 32 bytes, two per cache line, with no padding. `prism_assert_token_32`
+fails the build if that stops being true, so this table and the struct cannot
+drift apart silently again.
 
 | Field | Type | Description |
 |---|---|---|
 | `tag` | `uint32_t` | Bitmask of `TT_*` keyword/semantic tags |
-| `next_idx` | `uint32_t` | Pool index of next token (0 = NULL) |
-| `match_idx` | `uint32_t` | Pool index of matching delimiter (0 = none) |
-| `len` | `uint32_t` | Byte length of the token text |
+| `parse_data` | `uint32_t` | Token-specific parser payload. Holds the lexer's identifier hash until finalization may repurpose it; on a token flagged `PPARSE_TF_LINK_JUMP` it is instead the index of the next token |
+| `match_idx` | `uint32_t` | Byte offset of the token text within `_pc->token_source` — *not* a delimiter link |
+| `len` | `uint32_t` | Byte length of the token text (must exceed 65535 for large literals) |
+| `pair_idx` / `td_entry` | `uint32_t` | Union. On a delimiter, the paired token's pool index (0 = none); on an identifier, binding scratch. The kinds are disjoint, so they share the word |
+| `line_no` | `int32_t : 18` | Source line |
+| `file_idx` | `uint32_t : 14` | Index into the input-file table |
 | `kind` | `uint8_t` | `PPARSE_TK_IDENT`, `PPARSE_TK_KEYWORD`, `PPARSE_TK_PUNCT`, `PPARSE_TK_STR`, `PPARSE_TK_NUM`, `PPARSE_TK_PREP_DIR`, `PPARSE_TK_EOF` |
-| `flags` | `uint8_t` | `PPARSE_TF_AT_BOL`, `PPARSE_TF_HAS_SPACE`, `PPARSE_TF_IS_FLOAT`, `PPARSE_TF_OPEN`, `PPARSE_TF_CLOSE`, `PPARSE_TF_C23_ATTR`, `PPARSE_TF_RAW`, `PPARSE_TF_SIZEOF` (also set on `__builtin_offsetof` and `offsetof`) |
-| `ann` | `uint16_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`, `P1_DECL_BRACKET`, `P1_UNEVAL_BRACKET`, `P1_IS_ORELSE_KW`). Zeroed by `pparse_new_token()` on allocation. |
 | `ch0` | `uint8_t` | First source byte: avoids `pparse_loc()` indirection in hot paths |
+| `flags` | `uint16_t` | `TF_*` bitmask. 16 bits, not 8: `PPARSE_TF_SOFT_KW` occupies bit 8 |
+| `ann` | `uint32_t` | Pass 1 annotations and emitter recipes (`P1_*`). Zeroed by `pparse_new_token()` on allocation |
 
-Cold path data (`PParseTokenCold`, separate array): `loc_offset`, `line_no` (18-bit), `file_idx` (14-bit).
+There is no separate cold-side array. `line_no` and `file_idx` are the bitfields
+above; the space freed by sharing `pair_idx`/`td_entry` absorbs them.
 
 ### Delimiter matching
 
-Every `(`, `[`, `{` gets a `match_idx` pointing to its closing pair. Every `)`, `]`, `}` points back. This is computed during tokenization and is used pervasively in both passes.
+Every `(`, `[`, `{` gets a `pair_idx` pointing to its closing pair. Every `)`,
+`]`, `}` points back. This is computed during tokenization and is used
+pervasively in both passes. Note the neighbouring `match_idx` is a source
+offset, not a link; the two names are easy to confuse.
+
+Tokenizing for token *spellings* only — counting dialect keywords in emitted
+text that has not been through `cc -E` — sets `_pc->lex_only`, which drops the
+unclosed-delimiter error. A macro body may legitimately open a delimiter it
+never closes, and pairing is meaningless to such a caller. Every consumer of
+`pair_idx` runs on preprocessed input.
 
 ### Keyword tagging
 
@@ -411,6 +428,17 @@ Calls `pparse_validate_defer_statement` for every `defer` keyword encountered. T
 
 **Critical rule:** Always called with `in_loop=false`, `in_switch=false`. Defer bodies create their own control-flow context; `break`/`continue` inside a defer body must not affect the enclosing loop/switch.
 
+**Recursion budget:** every defer walker draws on one shared depth counter,
+capped at `PPARSE_DEFER_MAX_DEPTH` (4096). Statement nesting exceeding it is
+`braceless control flow nesting depth exceeds 4096`; parenthesised group nesting
+exceeding it is `expression nesting depth inside 'defer' exceeds 4096`. Group
+nesting was previously uncounted — `pparse_defer_scan_orelse_in_group` recursed
+once per nested `(`/`[` and forwarded its depth argument unchanged — so
+`defer g((((…1…))))` at 100k parens exhausted the C stack and died by signal,
+while the identical expression without `defer` transpiled normally. 4095 levels
+still transpile inside a 512 KB thread stack, which is the smallest the suite's
+tier workers run with.
+
 Rejected patterns inside defer bodies:
 - `return`
 - `goto`
@@ -681,7 +709,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 **Paren-wrapped decl-init orelse:** `int x = (f() orelse 0);`: similar macro-hygiene pattern for declaration initializers. Phase 1D's `p1d_scan_init_orelse` unlinks the wrap parens from the token chain at annotation time: **only** when they are the first token of the initializer (i.e., the `(` immediately follows `=`) and span the entire initializer with no inner depth-0 comma. When the parens appear mid-expression (e.g., `int x = 1 + (f() orelse 5)`), the orelse is inside a sub-expression where paren-stripping would corrupt the AST (rejected by the paren rule). The gate is `init_is_first`: the paren-spanning-to-end check (`P1_OE_DECL_INIT` tagging + strip) only fires on the first paren encountered during the initializer walk. Pass 2's `scan_decl_orelse` therefore emits from an already-stripped stream and is a pure locator: a depth-0 walk for the `P1_IS_ORELSE_KW` bit, with no chain mutation.
 
-**Volatile safety:** All forms that include an assignment in the condition use the C assignment-expression value: `(LHS = expr)` yields `expr`'s value without re-reading `LHS`. This makes bare orelse safe for volatile pointer-dereference targets such as MMIO registers: `*uart_tx = get_byte() orelse 0xFF` emits `{ if (!(*uart_tx = get_byte())) *uart_tx = (0xFF); }` with no hidden re-read of the register. **Declaration** initializers with value fallback additionally use single-eval lowering when the target object is **`volatile`** or **`_Atomic`** (§5). Compound-literal fallbacks use a `(LHS = RHS) ? (void)0 : (void)(LHS = (fb))` ternary which evaluates the LHS address expression twice: Phase 1D (primary; Pass 2 keeps a `PRISM_DEBUG` assert) rejects pointer dereference (`*`), member access (`->`, `.`), and array subscript (`[]`) in the LHS when the fallback contains a compound literal, since the ternary path would produce double memory access (double bus transactions for volatile MMIO registers). For non-compound-literal bare-assignment orelse with value fallback, `emit_bare_orelse_impl` hoists the RHS into a temp variable using `typeof(LHS) temp = (RHS)`. The temp is typed using `typeof(LHS)` (not `typeof(RHS)`) to avoid double evaluation when the RHS expression yields a variably-modified (VM) type (C23 §6.7.2.5p3: `typeof(EXPR)` evaluates its operand when the expression type is VM). When the LHS has indirection (`*`, `[]`, `.`, `->`), `typeof(LHS)` itself may yield a VM type, so `typeof(RHS)` is used instead: function return types are never VM (C11 §6.7.6.2p2). However, `typeof(RHS)` physically emits the RHS tokens twice at compile time (once inside the `typeof()` operator and once for the assignment initialization). When the RHS expression type is VM, `typeof(RHS)` evaluates its operand at runtime (C23 §6.7.2.5p3), causing double evaluation of any side effects embedded in the RHS. Since Prism cannot determine VM-ness at the token level (it would require full type inference), the RHS is conservatively scanned for side effects via `reject_orelse_side_effects` when `lhs_has_indirection` is true. This rejects `++`, `--`, assignment operators (`=`, `+=`, etc.), function calls (`ident(` and `)(` patterns), depth-0 comma operators, and control-flow keywords (`goto`/`return`/`break`/`continue`/`defer`). **Exception:** when the *entire* RHS is a strictly bare function call with no preceding cast (e.g. `*pp = get_ptr() orelse 0`), the check is bypassed, because function return types are never VM (C11 §6.7.6.2p2), so `typeof(f(...))` never evaluates `f(...)` at runtime. Cast expressions are **not** skipped: a cast like `(int (*)[n])` can introduce a VM type (ISO C11 §6.7.6.2: pointer to VLA is VM), causing `typeof()` to evaluate the operand at runtime and triggering double evaluation of the cast's sub-expression. For example, `*pp = (int (*)[n]) get_ptr() orelse 0` is rejected because the cast changes the expression type to a VM pointer-to-VLA, even though `get_ptr()` itself returns `void *` (not VM). Users must hoist the cast result to a variable first: `int (*tmp)[n] = (int (*)[n]) get_ptr(); *pp = tmp orelse 0;`. Function calls *embedded* in larger expressions (e.g. `*pp = arrays[get_idx()] orelse 0`) are also rejected because the enclosing subscript/dereference may yield a VM type. The control-flow keyword check also prevents Prism state-machine corruption: `emit_balanced_range` traverses the tokens at compile time, so control-flow keywords in statement expressions would be processed twice, corrupting the defer stack (double registration → double-free) or desynchronizing `goto_entry_cursor`. The LHS is guaranteed side-effect-free by `reject_orelse_side_effects`, so `typeof(LHS)` is always safe. Both single-link and chained orelse use if/else blocks with per-link `typeof(LHS)` temps: `{ typeof(LHS) t0=(a); if(t0){ LHS=t0; }else{ LHS=(fb); } }`. This ensures each assignment to LHS undergoes independent simple-assignment conversions (ISO C §6.5.16.1), avoiding the usual arithmetic conversions that a conditional operator (§6.5.15) would force between the temp and fallback operands. Chained example: `{ typeof(LHS) t0=(a); if(t0){LHS=t0;}else{ typeof(LHS) t1=(b); if(t1){ LHS=t1; }else{ LHS=(c); } } }`.
+**Volatile safety:** All forms that include an assignment in the condition use the C assignment-expression value: `(LHS = expr)` yields `expr`'s value without re-reading `LHS`. This makes bare orelse safe for volatile pointer-dereference targets such as MMIO registers: `*uart_tx = get_byte() orelse 0xFF` emits `{ __typeof__(get_byte()) __prism_oe_0 = (get_byte()); if (__prism_oe_0) { *uart_tx = __prism_oe_0; } else { *uart_tx = (0xFF); } }`, which writes the register on exactly one branch and never reads it back. **Declaration** initializers with value fallback additionally use single-eval lowering when the target object is **`volatile`** or **`_Atomic`** (§5). Compound-literal fallbacks use a `(LHS = RHS) ? (void)0 : (void)(LHS = (fb))` ternary which evaluates the LHS address expression twice: Phase 1D (primary; Pass 2 keeps a `PRISM_DEBUG` assert) rejects pointer dereference (`*`), member access (`->`, `.`), and array subscript (`[]`) in the LHS when the fallback contains a compound literal, since the ternary path would produce double memory access (double bus transactions for volatile MMIO registers). For non-compound-literal bare-assignment orelse with value fallback, `emit_bare_orelse_impl` hoists the RHS into a temp variable using `typeof(LHS) temp = (RHS)`. The temp is typed using `typeof(LHS)` (not `typeof(RHS)`) to avoid double evaluation when the RHS expression yields a variably-modified (VM) type (C23 §6.7.2.5p3: `typeof(EXPR)` evaluates its operand when the expression type is VM). When the LHS has indirection (`*`, `[]`, `.`, `->`), `typeof(LHS)` itself may yield a VM type, so `typeof(RHS)` is used instead: function return types are never VM (C11 §6.7.6.2p2). However, `typeof(RHS)` physically emits the RHS tokens twice at compile time (once inside the `typeof()` operator and once for the assignment initialization). When the RHS expression type is VM, `typeof(RHS)` evaluates its operand at runtime (C23 §6.7.2.5p3), causing double evaluation of any side effects embedded in the RHS. Since Prism cannot determine VM-ness at the token level (it would require full type inference), the RHS is conservatively scanned for side effects via `reject_orelse_side_effects` when `lhs_has_indirection` is true. This rejects `++`, `--`, assignment operators (`=`, `+=`, etc.), function calls (`ident(` and `)(` patterns), depth-0 comma operators, and control-flow keywords (`goto`/`return`/`break`/`continue`/`defer`). **Exception:** when the *entire* RHS is a strictly bare function call with no preceding cast (e.g. `*pp = get_ptr() orelse 0`), the check is bypassed, because function return types are never VM (C11 §6.7.6.2p2), so `typeof(f(...))` never evaluates `f(...)` at runtime. Cast expressions are **not** skipped: a cast like `(int (*)[n])` can introduce a VM type (ISO C11 §6.7.6.2: pointer to VLA is VM), causing `typeof()` to evaluate the operand at runtime and triggering double evaluation of the cast's sub-expression. For example, `*pp = (int (*)[n]) get_ptr() orelse 0` is rejected because the cast changes the expression type to a VM pointer-to-VLA, even though `get_ptr()` itself returns `void *` (not VM). Users must hoist the cast result to a variable first: `int (*tmp)[n] = (int (*)[n]) get_ptr(); *pp = tmp orelse 0;`. Function calls *embedded* in larger expressions (e.g. `*pp = arrays[get_idx()] orelse 0`) are also rejected because the enclosing subscript/dereference may yield a VM type. The control-flow keyword check also prevents Prism state-machine corruption: `emit_balanced_range` traverses the tokens at compile time, so control-flow keywords in statement expressions would be processed twice, corrupting the defer stack (double registration → double-free) or desynchronizing `goto_entry_cursor`. The LHS is guaranteed side-effect-free by `reject_orelse_side_effects`, so `typeof(LHS)` is always safe. Both single-link and chained orelse use if/else blocks with per-link `typeof(LHS)` temps: `{ typeof(LHS) t0=(a); if(t0){ LHS=t0; }else{ LHS=(fb); } }`. This ensures each assignment to LHS undergoes independent simple-assignment conversions (ISO C §6.5.16.1), avoiding the usual arithmetic conversions that a conditional operator (§6.5.15) would force between the temp and fallback operands. Chained example: `{ typeof(LHS) t0=(a); if(t0){LHS=t0;}else{ typeof(LHS) t1=(b); if(t1){ LHS=t1; }else{ LHS=(c); } } }`.
 
 **Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, function calls, control-flow keywords `goto`/`return`/`break`/`continue`/`defer`; for array-dimension operands additionally volatile reads via `*`/`->`/`.`/`[]`: inside `typeof` operands those reads are permitted, since the duplicated operand is unevaluated unless the type is variably modified) to prevent double evaluation. Control-flow keywords inside statement expressions in duplicated ranges would desynchronize `goto_entry_cursor` (goto) and the defer unwinding stack (return/break/continue), or double defer registration (defer). Block-form orelse (`orelse { … }`) uses the if-guard pattern (single LHS evaluation) and is not subject to this restriction. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns. **Chained bracket orelse** (e.g. `int arr[0 orelse get_size() orelse 10]`) is subject to an additional chain-aware side-effect check: Phase 1G scans depth-0 orelses and calls `reject_orelse_side_effects` on the range between consecutive depth-0 orelses (the intermediate LHS that would be duplicated in the ternary), and checks nested-depth chains against the innermost group's LHS; Pass 2's `emit_token_range_orelse` retains the same check as a `PRISM_DEBUG` assert.
 
@@ -928,8 +956,7 @@ Emitted once per translation unit at the top of the preamble:
 // expansion; `unsigned long` would truncate on LLP64 (MinGW / Clang-on-
 // Windows x64, where `size_t` is 64 bits but `unsigned long` is 32 bits).
 typedef unsigned long long __prism_bchk_size_t;
-static inline __attribute__((always_inline)) __prism_bchk_size_t
-__prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
+static __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
     if (__builtin_expect(__i >= __n, 0)) __builtin_trap();
     return __i;
 }
@@ -946,7 +973,7 @@ static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, _
 
 No `#include` is emitted: in flatten mode the transpiled output is fed to the backend as already-preprocessed (`-x cpp-output` under GCC), where a `#` directive would be a syntax error; in non-flatten mode, re-including `<stdlib.h>` on top of already-emitted system headers causes struct redefinitions under MSVC.
 
-The helper is an inline function (not a macro) so `idx` is evaluated exactly once: no double-eval, no side-effect rejection needed at the call site. `__builtin_expect` marks the failure path cold; branch prediction keeps the hot path near-zero cost.
+The helper is a function (not a macro) so `idx` is evaluated exactly once: no double-eval, no side-effect rejection needed at the call site. It is emitted `static` with no `inline` or `always_inline` attribute: a single-basic-block `static` function used within one TU is inlined by GCC and Clang at any optimization level, and forcing it would defeat `-O0` debuggability for no gain. MSVC gets `__forceinline` because its `/Od` inliner will not take it otherwise. `__builtin_expect` marks the failure path cold; branch prediction keeps the hot path near-zero cost.
 
 #### Eligibility
 
@@ -1044,6 +1071,7 @@ In `PRISM_LIB_MODE`, `pparse_error_tok` triggers `longjmp(pparse_ctx->error_jmp)
 |---|---|---|
 | Scope count (scope_id) | 65,534 | `scope tree: too many scopes (>65534)` |
 | Braceless control flow nesting depth | 4,096 | `braceless control flow nesting depth exceeds 4096` |
+| Expression nesting depth inside `defer` | 4,096 | `expression nesting depth inside 'defer' exceeds 4096` |
 | Array dimension nesting depth | 256 | `array dimension nesting depth exceeds 256` |
 | Braceless switch synthetic scopes | Limited by remaining scope_id range | `too many scopes + braceless switches (>65535)` |
 | Pointer depth in declarator | 1,024 | Warning (zero-init skipped, not a hard error) |
@@ -1058,10 +1086,26 @@ These limits are enforced with hard errors. Exceeding any limit halts transpilat
 | Compile (default) | `prism src.c -o out` | Transpile + pipe to backend CC |
 | Run | `prism run src.c [-- args]` | Compile to temp executable → execute (args forwarded to binary) |
 | Transpile | `prism transpile src.c` | Emit transformed C to stdout |
-| Install | `prism install` | Install binary to `/usr/local/bin/prism` |
+| Emit | `prism --prism-emit[=<file>] src.c` | Same output as `transpile`, to stdout or `<file>` |
+| Check | `prism check <tool> [args…]` | Transpile sources to temps, run a static analyzer against them |
+| Install | `prism install [src.c…]` | Install binary to `/usr/local/bin/prism` |
 | Passthrough | `prism -v` (no source files) | Forward all args to backend CC |
 | Help | `prism --help` | Print usage |
 | Version | `prism --version` | Print version + CC version |
+
+### `check` mode: static-analysis profile
+
+`prism check <tool> [args…]` runs a C static analyzer (cppcheck, clang-tidy, …) against transpiled artifacts rather than against Prism source, which no C analyzer can parse. The first non-flag token after `check` is the analyzer executable; everything after it is forwarded verbatim, except that each argument matching a recorded source path is substituted for that source's transpiled temp file. The analyzer's exit status is propagated, so `check` works as a build gate. Temps are removed afterwards via `cleanup_temp_range`.
+
+`check` overrides three features for the analysis artifact only (the shipping build is unaffected):
+
+| Feature | Forced | Reason |
+|---|---|---|
+| `flatten_headers` | off | `#include` lines stay intact so the analyzer resolves headers normally instead of reading one flattened TU |
+| `bounds_check` | off | bare subscripts stay bare; a `__prism_bchk(…)` wrapper hides constant indices from the analyzer's own range analysis |
+| `line_directives` | **on** | `#line` is what maps findings back to the original source lines, so it is forced on even if the user passed `-fno-line-directives` |
+
+Analyzing the transpiled output is strictly stronger than analyzing the source for `defer`: cleanup is lowered to ordinary statements on every exit path, so an analyzer can see a double-free that pairs a manual `fclose(f)` with a deferred one.
 
 ### Program arguments in `run` mode
 
@@ -1091,10 +1135,17 @@ The `run` subcommand is the only mode that consumes `prog_args`; in every other 
 | `-fno-flatten-headers` | Disable header flattening |
 | `-fno-auto-unreachable` | Disable auto-unreachable injection after noreturn calls |
 | `-fno-auto-static` | Disable auto-static promotion of const arrays with literal inits |
+| `-fno-bounds-check` | Disable runtime bounds checks on local, static and file-scope array subscripts (see §6.10) |
 | `-fno-link-pragma` | Ignore `#pragma link` directives (see §8.x) |
 | `--prism-cc=<compiler>` | Use specific compiler backend |
 | `--prism-verbose` | Show commands being executed |
+| `--prism-prof` | Print per-phase timing breakdown |
+| `--prism-cache-info` | Print the preprocessor cache location and size, then exit |
+| `--prism-cache-clear` | Delete all cached preprocessor output, then exit |
+| `--prism-emit[=<file>]` | Write transpiled C to stdout, or to `<file>` (see §8 CLI Modes) |
 | `--prism-verify` | Translation validation: after emitting, re-run the entire pipeline on the emitted C and require a fixed point (byte-identical modulo preprocessor linemarker lines). Any operator-position `defer`/`orelse` that leaked into the output would transform or reject on the second pass; the output must also re-survive every Phase 1 constraint and CFG verification. Generalizes the self-host stage1==stage2 invariant to every compile. Also enabled by the `PRISM_VERIFY` environment variable (any value). On failure prism reports the first divergent line and the compile fails. See `.github/PROOFS.md`. |
+
+Every `-fno-X` feature flag above also accepts the positive `-fX` form to re-enable it (`prism.c` strips a leading `no-` and sets the field accordingly), so `-fbounds-check`, `-fdefer`, `-fauto-static` and friends are all valid. Defaults are set by `prism_defaults()`: `defer`, `zeroinit`, `line_directives`, `flatten_headers`, `orelse`, `auto_unreachable`, `auto_static` and `bounds_check` are **all on**; `warn_safety` is off (safety violations are errors). `--prism-cache-info` and `--prism-cache-clear` run immediately and exit, ignoring the rest of argv.
 
 **Cross-feature invariant:** Feature flags disable their own transformations but must never suppress error checking for other enabled features. Validation that spans multiple features uses disjunctive gates (e.g. `pparse_feat(PPARSE_F_ORELSE) || pparse_feat(PPARSE_F_DEFER)` for `check_orelse_in_parens` call sites). The `defer`-in-parens check inside `check_orelse_in_parens` is internally gated by `pparse_feat(PPARSE_F_DEFER)`, while `orelse`-in-parens checking requires no gate (it is trivially safe when orelse is disabled: the keyword is parsed as an identifier, so `PPARSE_TT_ORELSE` is never set).
 
@@ -1292,7 +1343,7 @@ The transpiled C output of stage1 and stage2 is identical. Binary differences be
 
 ### CI Matrix
 
-Linux x86_64, macOS x86_64/arm64, Windows build-only, Linux arm64, Linux riscv64.
+Six jobs: Linux x86_64, macOS x86_64, macOS arm64, Windows x86_64 (MSVC `cl`), Linux arm64, Linux riscv64. Every job runs the full three-stage bootstrap, installs stage 2, and runs the test suite (`prism run .github/test.c`); Windows included. The Linux x86_64 job additionally generates the defer/orelse torture tier and runs translation validation (`--prism-verify`) on non-self-referential targets.
 
 ---
 
