@@ -155,8 +155,8 @@ static const char PPARSE_ERR_BRACKET_OE_ANON_AGG[] = "bracket orelse / zero-init
 					      "add a tag name or use a typedef";
 static const char PPARSE_ERR_ORELSE_ARRAY_NEVER_NULL[] = "orelse on array variable '%.*s' will never trigger "
 						  "(array address is never NULL); remove the orelse clause";
-static const char PPARSE_ERR_CONST_UNAVOIDABLE_MEMSET[] = "'const' variable requiring unavoidable memset "
-						   "(union, VLA, or _Atomic aggregate) cannot be safely "
+static const char PPARSE_ERR_CONST_UNAVOIDABLE_MEMSET[] = "'const' variable requiring unavoidable post-declaration memset "
+						   "cannot be safely "
 						   "zero-initialized: modifying a const object is "
 						   "undefined behavior. Remove 'const', provide an "
 						   "explicit initializer, or use 'raw' to opt out.";
@@ -465,11 +465,14 @@ typedef struct {
 	bool is_param : 1;
 	bool has_volatile_member : 1;
 	bool is_atomic : 1;	     // _Atomic(...) spelling baked into this typedef name
+	bool is_long_double : 1;      // scalar long double (including _Complex)
 	bool is_constexpr : 1;	     // C23 'constexpr' shadow: usable as an array-dimension ICE
 	bool is_struct_tag : 1;	     // struct/union tag (not a typedef name)
 	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	uint8_t array_rank;	     // # of array dimensions (0 if not array);
 } PParseTypedefEntry; // 16 bytes — four entries per 64-byte cache line
+
+typedef char prism_assert_typedef_entry_16[(sizeof(PParseTypedefEntry) == 16) ? 1 : -1];
 typedef struct PParseTimelineItem {
 	int entry_idx, prev_cover;
 } PParseTimelineItem;
@@ -2353,13 +2356,19 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 							if (prev->tag &
 							    (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE | PPARSE_TT_SUE))
 								continue;
+							/* `(void)callee()` is still a call edge, but a casted
+							 * bare identifier is commonly a local-use idiom. Treating
+							 * `(void)local;` as a reference to an equally named file-scope
+							 * function falsely taints the containing function. */
 							if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE) &&
 							    prev->pair_idx) {
 								PParseToken *open = pparse_pair(_pc, prev);
 								PParseToken *inner = open ? pparse_p0_next(open) : NULL;
+								PParseToken *next = pparse_p0_next(b);
 								if (inner &&
 								    (inner->tag &
-								     (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE)))
+								     (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE)) &&
+								    (!next || !pparse_match_ch(next, '(')))
 									continue;
 							}
 						}
@@ -2665,6 +2674,7 @@ typedef struct {
 	bool is_vla : 1;
 	bool has_typeof : 1;
 	bool has_atomic : 1;
+	bool has_long_double : 1;
 	bool has_register : 1;
 	bool has_volatile : 1;
 	bool has_const : 1;
@@ -2924,6 +2934,7 @@ enum {
 	PPARSE_TDF_UNION = 4096,
 	PPARSE_TDF_ATOMIC = 8192,
 	PPARSE_TDF_CONSTEXPR = 16384, // C23 'constexpr': value is an integer constant expression
+	PPARSE_TDF_LONG_DOUBLE = 32768,
 };
 
 // Apply typedef traits to a parsed type.
@@ -2942,6 +2953,7 @@ static inline void pparse_typedef_apply_tdf_flags(PParseTypeSpec *r, PParseToken
 	if (tflags & PPARSE_TDF_HAS_VOL_MEMBER)
 		r->has_volatile_member = r->has_hidden_volatile = true;
 	if (tflags & PPARSE_TDF_ATOMIC) r->has_atomic = true;
+	if (tflags & PPARSE_TDF_LONG_DOUBLE) r->has_long_double = true;
 	if (tflags & PPARSE_TDF_PTR) r->is_ptr = true;
 	if (tflags & PPARSE_TDF_FUNC) r->is_func = true;
 	if (tflags & PPARSE_TDF_ARRAY) {
@@ -3012,15 +3024,53 @@ static inline PParseToken *pparse_skip_prep_dirs_until(PParseToken *tok, PParseT
 	return tok;
 }
 
-static bool pparse_is_pp_conditional(PParseToken *s) {
+enum {
+	PPARSE_PP_COND_NONE,
+	PPARSE_PP_COND_OPEN,
+	PPARSE_PP_COND_BRANCH,
+	PPARSE_PP_COND_CLOSE,
+};
+
+static int pparse_pp_conditional_kind(PParseToken *s) {
 	PPARSE_CTX();
-	if (s->kind != PPARSE_TK_PREP_DIR) return false;
+	if (s->kind != PPARSE_TK_PREP_DIR) return PPARSE_PP_COND_NONE;
 	const char *dp = pparse_loc(_pc, s);
-	if (*dp == '#') dp++;
-	while (*dp == ' ' || *dp == '\t') dp++;
-	return strncmp(dp, "ifdef", 5) == 0 || strncmp(dp, "ifndef", 6) == 0 || strncmp(dp, "elif", 4) == 0 ||
-	       strncmp(dp, "else", 4) == 0 || strncmp(dp, "endif", 5) == 0 ||
-	       (strncmp(dp, "if", 2) == 0 && (dp[2] == ' ' || dp[2] == '\t' || dp[2] == '('));
+	const char *end = dp + s->len;
+	if (dp < end && *dp == '#') dp++;
+	else if (end - dp >= 2 && dp[0] == '%' && dp[1] == ':') dp += 2;
+	else if (end - dp >= 3 && dp[0] == '?' && dp[1] == '?' && dp[2] == '=') dp += 3;
+	else return PPARSE_PP_COND_NONE;
+	while (dp < end && (*dp == ' ' || *dp == '\t')) dp++;
+	const char *word = dp;
+	while (dp < end && ((*dp >= 'a' && *dp <= 'z') || (*dp >= 'A' && *dp <= 'Z') || *dp == '_')) dp++;
+	size_t n = (size_t)(dp - word);
+	if ((n == 2 && !memcmp(word, "if", 2)) ||
+	    (n == 5 && !memcmp(word, "ifdef", 5)) ||
+	    (n == 6 && !memcmp(word, "ifndef", 6)))
+		return PPARSE_PP_COND_OPEN;
+	if ((n == 4 && !memcmp(word, "elif", 4)) ||
+	    (n == 4 && !memcmp(word, "else", 4)))
+		return PPARSE_PP_COND_BRANCH;
+	if (n == 5 && !memcmp(word, "endif", 5)) return PPARSE_PP_COND_CLOSE;
+	return PPARSE_PP_COND_NONE;
+}
+
+static bool pparse_is_pp_conditional(PParseToken *s) {
+	return pparse_pp_conditional_kind(s) != PPARSE_PP_COND_NONE;
+}
+
+static bool pparse_token_in_pp_conditional(PParseToken *tok) {
+	PPARSE_CTX();
+	int depth = 0;
+	uint32_t end = pparse_idx(_pc, tok);
+	for (uint32_t i = 1; i < end; i++) {
+		PParseToken *s = &pparse_token_pool[i];
+		if (s->file_idx != tok->file_idx || s->kind != PPARSE_TK_PREP_DIR) continue;
+		int kind = pparse_pp_conditional_kind(s);
+		if (kind == PPARSE_PP_COND_OPEN) depth++;
+		else if (kind == PPARSE_PP_COND_CLOSE && depth > 0) depth--;
+	}
+	return depth > 0;
 }
 
 static PParseToken *pparse_span_find_pp_conditional(PParseToken *start, PParseToken *end, bool stop_at_semi) {
@@ -3339,6 +3389,7 @@ enum {
 	PPARSE_BIND_ATOMIC = 1u << 4,
 	PPARSE_BIND_AGGREGATE = 1u << 5,
 	PPARSE_BIND_CONSTEXPR = 1u << 6,
+	PPARSE_BIND_LONG_DOUBLE = 1u << 7,
 };
 
 static inline void pparse_binding_apply_traits(PParseTypedefEntry *entry, unsigned traits) {
@@ -3348,6 +3399,7 @@ static inline void pparse_binding_apply_traits(PParseTypedefEntry *entry, unsign
 	if (traits & PPARSE_BIND_VOLATILE) entry->is_volatile = true;
 	if (traits & PPARSE_BIND_VOLATILE_MEMBER) entry->has_volatile_member = true;
 	if (traits & PPARSE_BIND_ATOMIC) entry->is_atomic = true;
+	if (traits & PPARSE_BIND_LONG_DOUBLE) entry->is_long_double = true;
 	if (traits & PPARSE_BIND_AGGREGATE) entry->is_aggregate = true;
 	if (traits & PPARSE_BIND_CONSTEXPR) entry->is_constexpr = true;
 }
@@ -3462,7 +3514,9 @@ static inline PRISM_PURE int pparse_typedef_flags_(PParseToken *tok, bool includ
 	if (e->is_shadow) {
 		int fl = (e->is_volatile ? PPARSE_TDF_VOLATILE : 0) |
 			 (e->has_volatile_member ? PPARSE_TDF_HAS_VOL_MEMBER : 0) |
-			 (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) | (e->is_array ? PPARSE_TDF_ARRAY : 0) |
+			 (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) |
+			 (e->is_long_double ? PPARSE_TDF_LONG_DOUBLE : 0) |
+			 (e->is_array ? PPARSE_TDF_ARRAY : 0) |
 			 (e->is_constexpr ? PPARSE_TDF_CONSTEXPR : 0);
 		/* Decayed params must not inherit PPARSE_TDF_ARRAY from an outer
 		 * file-scope array of the same name. */
@@ -3484,7 +3538,8 @@ static inline PRISM_PURE int pparse_typedef_flags_(PParseToken *tok, bool includ
 	       (e->is_ptr ? PPARSE_TDF_PTR : 0) | (e->is_array ? PPARSE_TDF_ARRAY : 0) |
 	       (e->is_aggregate ? PPARSE_TDF_AGGREGATE : 0) | (e->is_func ? PPARSE_TDF_FUNC : 0) |
 	       (e->has_volatile_member ? PPARSE_TDF_HAS_VOL_MEMBER : 0) | (e->is_union ? PPARSE_TDF_UNION : 0) |
-	       (e->is_atomic ? PPARSE_TDF_ATOMIC : 0);
+	       (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) |
+	       (e->is_long_double ? PPARSE_TDF_LONG_DOUBLE : 0);
 }
 
 #define pparse_typedef_flags(tok) pparse_typedef_flags_((tok), true)
@@ -5650,6 +5705,7 @@ static bool pparse_typespec_typedef_name_finishes(PParseToken *tok, bool soft) {
 static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 	PPARSE_CTX();
 	PParseTypeSpec r = {.end = tok};
+	bool saw_long = false, saw_double = false;
 	while (tok && tok->kind != PPARSE_TK_EOF) {
 		PParseToken *next = pparse_skip_noise(_pc, tok);
 		if (next != tok) {
@@ -5690,6 +5746,9 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 		}
 
 		uint32_t tag = tok->tag;
+		if (pparse_equal(tok, "long")) saw_long = true;
+		if (pparse_equal(tok, "double")) saw_double = true;
+		if (saw_long && saw_double) r.has_long_double = true;
 		bool is_type = (tag & PPARSE_TT_TYPE) || (tflags & PPARSE_TDF_TYPEDEF);
 		if (r.saw_type && pparse_is_soft_keyword_identifier(tok) && pparse_soft_keyword_decl_name_boundary(tok))
 			break;
@@ -5839,6 +5898,22 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 				PParseToken *inner = pparse_next(_pc, tok);
 				if (inner && pparse_equal(inner, "void") && pparse_next(_pc, inner) == close)
 					r.has_void = true;
+				/* Resolve the traits of a direct identifier operand. Scanning
+				 * every identifier inside an arbitrary expression is unsound:
+				 * `typeof(sizeof(atomic_var))` is size_t, not atomic. */
+				PParseToken *operand = inner, *operand_close = close;
+				while (operand && operand_close && pparse_match_ch(operand, '(') &&
+				       pparse_pair(_pc, operand) &&
+				       pparse_next(_pc, pparse_pair(_pc, operand)) == operand_close) {
+					operand_close = pparse_pair(_pc, operand);
+					operand = pparse_next(_pc, operand);
+				}
+				if (operand && operand_close && pparse_next(_pc, operand) == operand_close &&
+				    pparse_is_identifier_like(operand)) {
+					int operand_flags = pparse_typedef_flags(operand);
+					if (!is_unqual && (operand_flags & PPARSE_TDF_ATOMIC)) r.has_atomic = true;
+					if (operand_flags & PPARSE_TDF_LONG_DOUBLE) r.has_long_double = true;
+				}
 				pparse_scan_type_constructor(inner, end, &r, false, !is_unqual);
 				r.is_func |= pparse_typeof_operand_is_function(inner, close);
 				tok = end;
@@ -5976,6 +6051,7 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 				added->is_aggregate = type_spec.is_struct && !type_spec.is_enum &&
 						      !decl.is_pointer && !decl.is_func_ptr;
 				added->is_union = type_spec.is_union && !decl.is_pointer && !decl.is_func_ptr;
+				added->is_long_double = type_spec.has_long_double && !is_ptr && !is_array;
 				if (decl.is_func_decl) added->is_func = true;
 				if (type_spec.has_atomic) added->is_atomic = true;
 				if (!decl.end) {
@@ -7827,11 +7903,10 @@ static inline bool is_defer_kw(PParseToken *tok, PParseToken *prev) {
 	PPARSE_CTX();
 	if (!(tok->tag & PPARSE_TT_DEFER)) return false;
 	PParseToken *nx = pparse_next(_pc, tok);
-	/* `defer()` empty-call spelling — not a statement keyword. */
-	if (nx && pparse_match_ch(nx, '(') && pparse_function_symbol(tok)) {
-		PParseToken *close = pparse_pair(_pc, nx);
-		if (close && pparse_next(_pc, nx) == close) return false;
-	}
+	/* A declared function named `defer` wins for every call spelling. The
+	 * previous empty-argument-only exception let `defer(1);` be silently
+	 * lowered as the keyword plus a parenthesized deferred expression. */
+	if (nx && pparse_match_ch(nx, '(') && pparse_function_symbol(tok)) return false;
 	/* Typedef *type* named `defer` stays an identifier except `defer {…}`
 	 * (unambiguous keyword). Variable/param/enum-constant shadows
 	 * (`is_shadow`) must still allow braceless `defer stmt;` — otherwise the
@@ -8338,29 +8413,32 @@ static uint8_t p1_decl_zero_plan(PParseToken *var,
 	if (automatic && !type->has_register && (flags & P1DP_CONST)) {
 		bool brace_unsafe = (traits & PPARSE_OBJ_ZERO_UNSAFE) != 0;
 		bool needs = (!decl->is_pointer || decl->is_array) &&
-			     (type->has_typeof || (type->has_atomic && (shape & P1DS_AGG)) ||
+			     (type->has_typeof || type->has_long_double ||
+			      (type->has_atomic && (shape & P1DS_AGG)) ||
 			      (shape & (P1DS_EFF_VLA | P1DS_UNION)) || brace_unsafe);
 		bool explicit_const = pparse_decl_const_flags(type, decl) & PPARSE_DECL_CONST_EXPLICIT;
 		bool const_member = !explicit_const && (traits & PPARSE_OBJ_CONST_SUBOBJECT);
-		if (needs && (explicit_const || const_member) &&
-		    (!(flags & P1DP_INIT_STMT) || (shape & P1DS_EFF_VLA))) {
+		if (needs && (explicit_const || const_member)) {
+			/* A declaration initializer may write a const object while a
+			 * delayed memset may not. Prefer the form valid for both scalar
+			 * and aggregate typeof objects whenever the type is brace-safe.
+			 * Atomic objects and VLAs have no equally portable generic form. */
+			if (!(shape & P1DS_EFF_VLA) && !brace_unsafe && !type->has_atomic &&
+			    !type->has_long_double)
+				return P1Z_AGG;
 			if (const_member)
 				pparse_error_tok(var,
 					  "aggregate containing a const-qualified subobject requires unavoidable "
 					  "memset zero-initialization, which would modify a const object and cause "
 					  "undefined behavior. Provide an explicit initializer or use 'raw' to opt out.");
-			bool unavoidable = (shape & (P1DS_UNION | P1DS_EFF_VLA)) || brace_unsafe ||
-					   (type->has_atomic &&
-					    ((shape & P1DS_AGG) ||
-					     (type->has_typeof &&
-					      (type->is_array || type->is_struct || type->is_union))));
-			if (unavoidable) pparse_error_tok(var, PPARSE_ERR_CONST_UNAVOIDABLE_MEMSET);
+			pparse_error_tok(var, PPARSE_ERR_CONST_UNAVOIDABLE_MEMSET);
 		}
 	}
 
 	if (!automatic || (shape & P1DS_FUNC)) return P1Z_NONE;
 	bool memset = !type->has_register && (!decl->is_pointer || decl->is_array) &&
-		      (type->has_typeof || (type->has_atomic && (shape & P1DS_AGG)) ||
+		      (type->has_typeof || type->has_long_double ||
+		       (type->has_atomic && (shape & P1DS_AGG)) ||
 		       (shape & (P1DS_EFF_VLA | P1DS_UNION)) ||
 		       (traits & PPARSE_OBJ_ZERO_UNSAFE));
 	if (type->has_register && (traits & PPARSE_OBJ_ZERO_UNSAFE)) return P1Z_NONE;
@@ -8715,6 +8793,7 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 	bool plain = !decl->is_pointer && !decl->is_func_ptr;
 	bool is_vol = plain && (type->has_volatile || type->has_volatile_member);
 	bool is_atomic = plain && type->has_atomic;
+	bool is_long_double = plain && !type->is_ptr && type->has_long_double;
 	bool is_const = track_const &&
 			(pparse_decl_const_flags(type, decl) & PPARSE_DECL_CONST_EFFECTIVE);
 	bool is_aggregate = brace_depth > 0 && type->is_struct && !type->is_enum && plain &&
@@ -8724,7 +8803,7 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 		      (decl->var_name->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE |
 					     PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN)) ||
 		      (decl->var_name->flags & PPARSE_TF_RAW) ||
-		      pparse_function_symbol(decl->var_name) || is_vol || is_atomic || is_const ||
+		      pparse_function_symbol(decl->var_name) || is_vol || is_atomic || is_long_double || is_const ||
 		      decl->is_func_decl || is_aggregate;
 	if (create) {
 		unsigned bind = (decl->is_func_decl ? PPARSE_BIND_FUNC : 0) |
@@ -8732,6 +8811,7 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 				(type->has_volatile && is_vol ? PPARSE_BIND_VOLATILE : 0) |
 				(type->has_volatile_member && is_vol ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
 				(is_atomic ? PPARSE_BIND_ATOMIC : 0) |
+				(is_long_double ? PPARSE_BIND_LONG_DOUBLE : 0) |
 				(is_aggregate ? PPARSE_BIND_AGGREGATE : 0) |
 				(type->has_constexpr && plain ? PPARSE_BIND_CONSTEXPR : 0);
 		pparse_register_shadow_traits(decl->var_name, brace_depth, bind);
@@ -9314,6 +9394,16 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 	    !(cur_sid > 0 && cur_sid < pparse_scope_tree_count &&
 	      (pparse_scope_tree[cur_sid].is_struct || pparse_scope_tree[cur_sid].is_init)))
 		pparse_error_tok(tok, "defer outside of any scope");
+	/* In library mode the caller's conditionals have not been resolved by
+	 * cc -E. Moving a deferred action past its closing #endif would make it
+	 * unconditional. Reject that source shape rather than silently changing
+	 * its runtime semantics; the CLI never sees it because preprocessing has
+	 * already selected one arm. */
+	if (pparse_token_in_pp_conditional(tok))
+		pparse_error_tok(tok,
+			  "'defer' inside an unresolved preprocessor conditional cannot be "
+			  "lowered safely; preprocess the source first or move the conditional "
+			  "inside the defer body");
 	// Context validation (moved from Pass 2 handle_defer_keyword)
 	if (p1d_cur_func >= 0) {
 		reject_defer_context(tok,
@@ -10960,7 +11050,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				PParseFunctionSymbolKind proto_tag = pparse_function_decl_returns_aggregate(ps->tok)
 								 ? PPARSE_FS_AGGREGATE_RETURN
 								 : PPARSE_FS_FUNCTION;
-				if (ps->brace_depth == 0) {
+				if (ps->brace_depth == 0 && pparse_paren_is_function_params(nx)) {
 					pparse_function_symbol_put(ps->tok, proto_tag);
 					is_func_decl = true;
 				} else {

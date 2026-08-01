@@ -5398,14 +5398,18 @@ static PRISM_HOT int transpile_tokens(PParseToken *tok, FILE *fp) {
 	out_buf_pos = 0;
 	out_total_flushed = 0;
 	reset_transpiler_state();
+	/* Target-dependent text starts with the diagnostic prologue. Resolve the
+	 * effective compiler before emitting it; otherwise the first library call
+	 * targeting MSVC inherits the previous/default false cache value, emits a
+	 * GCC push, then closes it with an MSVC pop after the cache is updated. */
+	const char *cc = _ps->extra_compiler ? _ps->extra_compiler : PRISM_DEFAULT_CC;
+	is_msvc_cached = cc_is_msvc(cc);
 	if (pparse_feat(PPARSE_F_FLATTEN)) {
 		emit_system_header_diag_push();
 		out_char('\n');
 	}
 
 	system_includes_reset();
-	const char *cc = _ps->extra_compiler ? _ps->extra_compiler : PRISM_DEFAULT_CC;
-	is_msvc_cached = cc_is_msvc(cc);
 	bool already_has_bchk = pparse_analyze(tok);
 	if (!pparse_feat(PPARSE_F_FLATTEN)) {
 		collect_system_includes();

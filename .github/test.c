@@ -361,7 +361,16 @@ static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures 
 	return ok;
 }
 
-static int run_internal(const Recipe *r) {
+/* Keep the oversized-write length opaque to GCC's inliner. The public
+ * out_str dispatch is what this test covers, but folding its deliberately
+ * over-buffer constant through two nested helpers produces a false-positive
+ * -Wstringop-overflow warning on GCC 15 even though the slow branch writes
+ * directly to the FILE. */
+static PRISM_COLD void exercise_out_str_dispatch(const char *s, int len) {
+	out_str(s, len);
+}
+
+static int run_internal(const Recipe *r, char *failed_action) {
 	int ok = 1;
 	for (const char *p = r->sequence; p && *p; p++) {
 		int before = ok;
@@ -486,7 +495,7 @@ static int run_internal(const Recipe *r) {
 			if (!wide) { out_close(); ok = 0; continue; }
 			memset(wide, 'w', OUT_BUF_SIZE + 16);
 			wide[OUT_BUF_SIZE + 16] = 0;
-			out_str(wide, OUT_BUF_SIZE + 16);
+			exercise_out_str_dispatch(wide, OUT_BUF_SIZE + 16);
 			free(wide);
 			out_close();
 			ok = ok && out_total_flushed > 0;
@@ -682,8 +691,13 @@ static int run_internal(const Recipe *r) {
 				ok = ok && transpile_to_stdout(in);
 				prism_reset();
 				fflush(stdout);
+				/* transpile_to_stdout writes through a separately opened
+				 * /dev/stdout descriptor. musl does not update this FILE's
+				 * cached position from that descriptor, so synchronize it
+				 * with the shared underlying file before asking for its size. */
+				if (fseek(sink, 0, SEEK_END) != 0) ok = 0;
 				long z = ftell(sink);
-				rewind(sink);
+				if (z >= 0) rewind(sink);
 				char *emitted = z >= 0 ? malloc((size_t)z + 1) : NULL;
 				if (emitted) {
 					fread(emitted, 1, (size_t)z, sink);
@@ -702,6 +716,7 @@ static int run_internal(const Recipe *r) {
 			ok = ok && z.status == PRISM_ERR_IO && z.error_msg && strstr(z.error_msg, "NULL");
 			prism_free(&z);
 		}
+		if (before && !ok && failed_action && !*failed_action) *failed_action = *p;
 		if (getenv("PRISM_INTERNAL_TRACE"))
 			fprintf(stderr, "internal %c: %s%s\n", *p, ok ? "ok" : "failed",
 				before ? "" : " (earlier failure)");
@@ -859,6 +874,10 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 	int ok = result_shape_ok;
 	if (oracle & O_ANY_STATUS) {
 		ok = x.status >= PRISM_OK && x.status <= PRISM_ERR_IO;
+		/* A locked non-success corpus result must remain an explained
+		 * diagnostic, not merely the same numeric status. */
+		if (expected_status_plus_one && x.status != PRISM_OK)
+			ok = ok && x.error_msg && x.error_msg[0];
 	} else if (oracle & O_TRICHOTOMY) {
 		if (x.status != PRISM_OK) {
 			ok = x.error_msg && x.error_msg[0];
@@ -953,10 +972,12 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 		}
 		if (r->oracle & O_INTERNAL) {
 			const AxisValue *none[4] = {0};
+			char failed_action = 0;
 			st->cells++;
 #ifndef _WIN32
-			if (run_internal(r)) st->passed++;
-			else fail(st, r, none, "internal action sequence %s failed", r->sequence);
+			if (run_internal(r, &failed_action)) st->passed++;
+			else fail(st, r, none, "internal action %c failed in sequence %s",
+				  failed_action ? failed_action : '?', r->sequence);
 #else
 			st->skipped++;
 #endif
@@ -1178,6 +1199,11 @@ static const AxisValue api_feature_values[] = {
 };
 static const Axis ax_api_features = {"state", api_feature_values, N(api_feature_values)};
 
+static const AxisValue msvc_target_values[] = {
+	{.tag="cl", .api_field=AF_COMPILER, .api_compiler="cl"},
+};
+static const Axis ax_msvc_target = {"compiler", msvc_target_values, N(msvc_target_values)};
+
 /* Whole translation units used through prism_transpile_file.  This is the
  * preprocessor/driver-facing alphabet: every row is crossed with the same
  * feature axis, so adding one lexical or declaration form exercises every
@@ -1394,6 +1420,10 @@ static const Axis ax_runtime_orelse_defer = {
 static const AxisValue runtime_zero_values[] = {
 	{"scalar", "int main(void){dirty();int v;return nz(&v,sizeof v);}", 0, 0},
 	{"pointer", "int main(void){dirty();char *v;return nz(&v,sizeof v);}", 0, 0},
+	{"long-double", "int main(void){dirty();long double v;return nz(&v,sizeof v);}", 0, 0},
+	{"long-double-typedef", "typedef long double LD;int main(void){dirty();LD v;return nz(&v,sizeof v);}", 0, 0},
+	{"long-double-complex", "int main(void){dirty();_Complex long double v;return nz(&v,sizeof v);}", 0, 0},
+	{"long-double-volatile", "int main(void){dirty();volatile long double v;return nz((const void*)&v,sizeof v);}", 0, 0},
 	{"char-array", "int main(void){dirty();char v[13];return nz(&v,sizeof v);}", 0, 0},
 	{"array-2d", "int main(void){dirty();int v[3][4];return nz(&v,sizeof v);}", 0, 0},
 	{"struct-padding", "struct P{char a;int b;char c;};int main(void){dirty();struct P v;return nz(&v,sizeof v);}", 0, 0},
@@ -1411,6 +1441,58 @@ static const AxisValue runtime_zero_values[] = {
 	{"typeof-vla", "int main(int n,char**v){(void)v;dirty();n+=3;int a[n];typeof(a)b;return nz(&b,sizeof b);}", 0, 0},
 };
 static const Axis ax_runtime_zero = {"shape", runtime_zero_values, N(runtime_zero_values)};
+
+static const AxisValue defer_ident_next_op_values[] = {
+	{"lt", "<", 0, 0}, {"gt", ">", 0, 0}, {"mod", "%", 0, 0},
+	{"xor", "^", 0, 0}, {"or", "|", 0, 0}, {"div", "/", 0, 0},
+	{"le", "<=", 0, 0}, {"shl", "<<", 0, 0}, {"ge", ">=", 0, 0},
+	{"shr", ">>", 0, 0}, {"eq", "==", 0, 0}, {"ne", "!=", 0, 0},
+	{"and", "&&", 0, 0}, {"lor", "||", 0, 0},
+};
+static const Axis ax_defer_ident_next_op = {
+	"operator", defer_ident_next_op_values, N(defer_ident_next_op_values)
+};
+
+static const AxisValue defer_ident_prev_op_values[] = {
+	{"plus", "+", 0, 0}, {"minus", "-", 0, 0}, {"div", "/", 0, 0},
+	{"mod", "%", 0, 0}, {"or", "|", 0, 0}, {"xor", "^", 0, 0},
+	{"lt", "<", 0, 0}, {"gt", ">", 0, 0}, {"shl", "<<", 0, 0},
+	{"shr", ">>", 0, 0}, {"eq", "==", 0, 0}, {"ne", "!=", 0, 0},
+	{"and", "&&", 0, 0}, {"lor", "||", 0, 0},
+};
+static const Axis ax_defer_ident_prev_op = {
+	"operator", defer_ident_prev_op_values, N(defer_ident_prev_op_values)
+};
+
+static const AxisValue defer_ident_shape_values[] = {
+	{"scalar", "int f(void){int defer=2;return defer;}", 0, 0},
+	{"parameter", "int f(int defer){return defer;}", 0, 0},
+	{"postfix", "int f(void){int defer=0;defer++;defer--;return defer;}", 0, 0},
+	{"subscript", "int f(void){int defer[2]={1,2};return defer[1];}", 0, 0},
+	{"member", "struct S{int defer;};int f(struct S s){return s.defer;}", 0, 0},
+	{"pointer-member", "struct S{int defer;};int f(struct S*p){return p->defer;}", 0, 0},
+	{"label", "int f(void){goto defer;defer:return 0;}", 0, 0},
+	{"function-empty-stmt", "int defer(void);void f(void){defer();}", 0, 0},
+	{"function-arg-stmt", "void defer(int);void f(void){defer(1);}", 0, 0},
+};
+static const Axis ax_defer_ident_shape = {
+	"shape", defer_ident_shape_values, N(defer_ident_shape_values)
+};
+
+static const AxisValue orelse_ident_shape_values[] = {
+	{"scalar", "int f(void){int orelse=2;return orelse;}", 0, 0},
+	{"parameter", "int f(int orelse){return orelse;}", 0, 0},
+	{"postfix", "int f(void){int orelse=0;orelse++;orelse--;return orelse;}", 0, 0},
+	{"subscript", "int f(void){int orelse[2]={1,2};return orelse[1];}", 0, 0},
+	{"member", "struct S{int orelse;};int f(struct S s){return s.orelse;}", 0, 0},
+	{"pointer-member", "struct S{int orelse;};int f(struct S*p){return p->orelse;}", 0, 0},
+	{"label", "int f(void){goto orelse;orelse:return 0;}", 0, 0},
+	{"function-empty-stmt", "int orelse(void);void f(void){orelse();}", 0, 0},
+	{"function-arg-stmt", "void orelse(int);void f(void){orelse(1);}", 0, 0},
+};
+static const Axis ax_orelse_ident_shape = {
+	"shape", orelse_ident_shape_values, N(orelse_ident_shape_values)
+};
 
 static const AxisValue runtime_bounds_oob_values[] = {
 	{"read", "return a[i];", 0, 0},
@@ -1510,6 +1592,9 @@ static const char *const av_run_sep[] = {"prism", "run", "x.c", "--", "--flag"};
 static const Recipe recipes[] = {
 	{"internal/platform", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "KCSPODAFJTN"},
+	{"api/msvc-first-call-prologue", "int f(void){int a[1];return a[0];}", NULL,
+	 {&ax_msvc_target}, O_OK, 0, FB_LINE, 0,
+	 "#pragma warning(push, 0)|#pragma warning(pop)", "#pragma GCC diagnostic"},
 	{"contexts/expression", "@2@", PRE, {&ax_expr, &ax_expr_wrap, &ax_expr_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"contexts/statement", "@1@", NULL, {&ax_stmt, &ax_stmt_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"declarations/product", "@1@", NULL, {&ax_decl, &ax_decl_ctx, &ax_features}, O_OK | O_FIXED, 0, FB_LINE, 0},
@@ -1532,7 +1617,7 @@ static const Recipe recipes[] = {
 	{"runtime/passthrough-equivalence", "@0@", NULL, {&ax_passthrough},
 	 O_OK | O_OUTPUT_EQ_OFF | O_REFERENCE_RUN, 0, FB_LINE, CAP_POSIX},
 	{"corpus/retired-regressions", "@0@", NULL, {&ax_corpus},
-	 O_TRICHOTOMY | O_REPLAY, 0, FB_LINE, 0},
+	 O_ANY_STATUS | O_REPLAY, 0, FB_LINE, 0},
 	{"bounds/product", "@1@", NULL, {&ax_bounds, &ax_bounds_ctx}, O_TRICHOTOMY, FB_BOUNDS, FB_LINE, 0},
 	{"runtime/orelse-product",
 	 "static int __lhs,__rhs,__value,__need_fb;static int src(void){__lhs++;return @0@;}"
@@ -1570,6 +1655,18 @@ static const Recipe recipes[] = {
 	 "static int nz(const void*p,unsigned long n){const unsigned char*b=p;int k=0;"
 	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
 	 {&ax_runtime_zero}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX | CAP_VLA},
+	{"differential/defer-identifier-next-operator", "int f(int defer){return defer @0@ 1;}", NULL,
+	 {&ax_defer_ident_next_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"differential/defer-identifier-prev-operator", "int f(int defer){return 1 @0@ defer;}", NULL,
+	 {&ax_defer_ident_prev_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"differential/defer-identifier-shapes", "@0@", NULL,
+	 {&ax_defer_ident_shape}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"differential/orelse-identifier-next-operator", "int f(int orelse){return orelse @0@ 1;}", NULL,
+	 {&ax_defer_ident_next_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"differential/orelse-identifier-prev-operator", "int f(int orelse){return 1 @0@ orelse;}", NULL,
+	 {&ax_defer_ident_prev_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"differential/orelse-identifier-shapes", "@0@", NULL,
+	 {&ax_orelse_ident_shape}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"runtime/bounds-traps", "int main(void){int a[4]={0},m[4][4]={{0}};volatile unsigned long i=4;@0@}",
 	 NULL, {&ax_runtime_bounds_oob}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
 	{"runtime/bounds-vla-trap",
@@ -1598,6 +1695,45 @@ static const Recipe recipes[] = {
 	 {0}, O_OK, 0, FB_LINE, 0, "g() orelse 2", NULL},
 	{"exact/constexpr-array", "void f(void){constexpr int N=4;int a[N];(void)a;}", NULL,
 	 {0}, O_OK, 0, FB_LINE, 0, NULL, "memset"},
+	{"exact/const-typeof-scalar-brace-init",
+	 "void f(void){const typeof(int) x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/const-typeof-union-brace-init",
+	 "union U{int i;double d;};void f(void){const typeof(union U) x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/const-union-brace-init",
+	 "union U{int i;double d;};void f(void){const union U x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/const-typeof-pointer-to-vla-brace-init",
+	 "void f(int n){const typeof(int (*)[n]) p;(void)sizeof(p);}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX | CAP_VLA, "= {0}", "memset"},
+	{"exact/const-typeof-array-brace-init",
+	 "void f(void){__typeof__(int *const[5]) a,b;(void)a;(void)b;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/long-double-full-object-zero",
+	 "void f(void){long double x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = 0"},
+	{"exact/long-double-typedef-full-object-zero",
+	 "typedef long double LD;void f(void){LD x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = 0"},
+	{"reject/const-long-double-auto-zero",
+	 "void f(void){const long double x;(void)x;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-typeof-long-double-binding",
+	 "void f(void){long double source;const typeof(source) copy;(void)source;(void)copy;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"exact/typeof-sizeof-atomic-is-not-atomic",
+	 "void f(void){_Atomic int source;const typeof(sizeof(source)) n;(void)source;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", NULL},
+	{"reject/const-atomic-typeof-scalar-memset",
+	 "void f(void){const _Atomic typeof(int) x;(void)x;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-atomic-typeof-expression-memset",
+	 "struct S{int a,b;};void f(void){struct S s;const _Atomic(typeof(s)) c;(void)s;(void)c;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-typeof-atomic-binding-memset",
+	 "void f(void){_Atomic int source;const typeof(source) copy;(void)source;(void)copy;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
 	{"exact/constexpr-dimension-not-vla",
 	 "int f(void){goto L;raw constexpr int N=4;raw int a[N];L:return 0;}", NULL,
 	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
@@ -1612,6 +1748,18 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, CAP_VLA},
 	{"exact/pp-straddle", "int g(void);void f(void){int x=\n#if 1\ng() orelse 1\n#else\n2\n#endif\n;(void)x;}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "preprocessor"},
+	{"reject/defer-inside-unresolved-pp-conditional",
+	 "void c(void);void f(void){\n#ifdef ENABLE_CLEANUP\ndefer c();\n#endif\n}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "preprocessor conditional"},
+	{"reject/defer-inside-digraph-pp-conditional",
+	 "void c(void);void f(void){\n%:ifdef ENABLE_CLEANUP\ndefer c();\n%:endif\n}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "preprocessor conditional"},
+	{"exact/defer-after-closed-pp-conditional",
+	 "void c(void);\n#ifdef UNUSED\nint x;\n#endif\nvoid f(void){defer c();}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "c();", NULL},
+	{"exact/pp-conditional-inside-defer-body",
+	 "void c(void);void f(void){defer {\n#ifdef ENABLE_CLEANUP\nc();\n#endif\n}}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "#ifdef ENABLE_CLEANUP", NULL},
 	{"exact/raw-block-bracket-orelse", "int g(void);void f(void){raw {int a[g() orelse 4];(void)a;}}", NULL,
 	 {0}, O_OK, 0, FB_LINE, 0, "g() orelse 4", "__prism_oe_|__prism_dim_"},
 	{"exact/repeated-raw-prefix", "void f(void){raw raw int x;(void)x;}", NULL,
@@ -1624,16 +1772,28 @@ static const Recipe recipes[] = {
 	 {0}, O_OK, FB_AUR, FB_LINE, 0, NULL, "__builtin_unreachable"},
 	{"exact/generic-decl-plain",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr,default:memchr)(const void*,int,Z);", NULL,
-	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
 	{"exact/generic-decl-paren",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:(memchr),default:(memchr))(const void*,int,Z);", NULL,
-	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
 	{"exact/generic-decl-associated-params",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr(const void*,int,Z),default:memchr(const void*,int,Z));", NULL,
-	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
 	{"exact/generic-decl-cast-wrapped",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:(const char *)(memchr)(const void*,int,Z),default:(const char *)(memchr)(const void*,int,Z));", NULL,
-	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
+	{"exact/generic-decl-distinct-targets",
+	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr,default:other)(const void*,int,Z);", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "_Generic", NULL},
+	{"exact/generic-decl-distinct-associated-params",
+	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr(const void*,int,Z),default:memchr(void*,int,Z));", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "_Generic", NULL},
+	{"exact/generic-decl-mixed-call-and-name-targets",
+	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr(const void*,int,Z),default:memchr)(const void*,int,Z);", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "_Generic", NULL},
+	{"exact/generic-decl-nonidentifier-target",
+	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr,default:(void*)0)(const void*,int,Z);", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "_Generic", NULL},
 	{"exact/typedef-named-raw-prefix", "typedef int raw;void f(void){raw raw x;(void)x;}", NULL,
 	 {0}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX, NULL, "raw raw"},
 	{"exact/typedef-named-raw-before-builtin", "typedef int raw;void f(void){raw int x;(void)x;}", NULL,
@@ -1672,6 +1832,16 @@ static const Recipe recipes[] = {
 	 "static void outer(jmp_buf p){int touched=1;inner(p);(void)touched;}"
 	 "void c(void);void f(jmp_buf p){defer c();outer(p);}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "setjmp"},
+	{"reject/special-wrapper-transitive-cast",
+	 "#include <setjmp.h>\nstatic void inner(jmp_buf p){setjmp(p);}"
+	 "static void outer(jmp_buf p){int touched=1;(void)inner(p);(void)touched;}"
+	 "void c(void);void f(jmp_buf p){defer c();outer(p);}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "setjmp"},
+	{"exact/special-shadowed-cast-not-call",
+	 "#include <setjmp.h>\nstatic void hazardous(jmp_buf p){setjmp(p);}"
+	 "void c(void);void innocent(jmp_buf p){int hazardous=1;(void)hazardous;"
+	 "defer c();(void)p;}", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0},
 
 	{"reject/defer-filescope", "defer (void)0;", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
 	{"reject/defer-return", "void f(void){defer return;}", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
