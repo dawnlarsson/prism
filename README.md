@@ -592,7 +592,7 @@ immediately overwrite a variable. Suppress that id or read it as intentional.
 Prism uses a GCC-compatible interface. Most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.6 - Robust C transpiler
+Prism v1.1.7 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
        prism [options] run src.c [-- prog_args...]

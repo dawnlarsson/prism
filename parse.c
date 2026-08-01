@@ -235,13 +235,9 @@ static const char PPARSE_ERR_ORELSE_DEFN_DIM[] =
 #define PPARSE_ARENA_ALIGN (__alignof__(long double))
 #endif
 
-#define pparse_equal(                                                                                                                     \
-    tok,                                                                                                                           \
-    s) /* known-length strings of 1/2 bytes use branchless comparisons; others use memcmp. Runtime strings fall back to strlen. */ \
-	(__builtin_constant_p(s) ? (__builtin_strlen(s) == 1   ? pparse_equal_1(tok, (s)[0])                                             \
-				    : __builtin_strlen(s) == 2 ? pparse_equal_2(_pc, tok, s)                                             \
-							       : pparse_equal_n(_pc, tok, s, (uint32_t)__builtin_strlen(s)))              \
-				 : pparse_equal_n(_pc, tok, s, (uint32_t)strlen(s)))
+/* Every call site passes a string literal of at least two bytes. sizeof keeps
+ * the length compile-time and lets the optimizer fold short memcmp calls. */
+#define pparse_equal(tok, s) pparse_equal_n(_pc, tok, s, (uint32_t)(sizeof(s) - 1))
 
 #define pparse_KEYWORD_HASH(key, len)                                                                               \
 	((len) == 0 ? 0                                                                                      \
@@ -256,30 +252,6 @@ static inline size_t pparse_vec_grow_cap(size_t cap, size_t need, size_t init_ca
 	while (new_cap < need) new_cap *= 2;
 	return new_cap;
 }
-
-/* need = minimum used count the array must hold (typically count or count+1). */
-#define pparse_VEC_ENSURE_REALLOC(arr, need, cap, init_cap)                                                         \
-	do {                                                                                                 \
-		if ((size_t)(need) > (size_t)(cap)) {                                                        \
-			size_t _new_cap = pparse_vec_grow_cap((size_t)(cap), (size_t)(need), (size_t)(init_cap));   \
-			if (_new_cap > SIZE_MAX / sizeof(*(arr))) pparse_error("allocation overflow");              \
-			void *_tmp = realloc((arr), sizeof(*(arr)) * _new_cap);                              \
-			if (!_tmp) pparse_error("out of memory");                                                   \
-			(arr) = _tmp;                                                                        \
-			(cap) = _new_cap;                                                                    \
-		}                                                                                            \
-	} while (0)
-
-#define PPARSE_ARENA_ENSURE_CAP(arena, arr, count, cap, init_cap, T)                                                \
-	do {                                                                                                 \
-		if ((size_t)(count) >= (size_t)(cap)) {                                                      \
-			size_t old_cap = (size_t)(cap);                                                      \
-			size_t new_cap = pparse_vec_grow_cap(old_cap, (size_t)(count), (size_t)(init_cap));         \
-			if (new_cap > SIZE_MAX / sizeof(T)) pparse_error("allocation overflow");                    \
-			(arr) = pparse_arena_realloc((arena), (arr), sizeof(T) * old_cap, sizeof(T) * new_cap);     \
-			(cap) = new_cap;                                                                     \
-		}                                                                                            \
-	} while (0)
 
 static const uint8_t pparse_ident_char[256] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -708,6 +680,53 @@ static void *pparse_arena_realloc(PParseArena *arena, void *old, size_t old_size
 }
 
 typedef struct {
+	void *ptr;
+	size_t capacity;
+} PParseGrowResult;
+
+/* Centralize capacity checks so generic call sites do not duplicate three
+ * control-flow branches apiece. Both helpers inline in optimized builds. */
+static inline PParseGrowResult
+pparse_vec_ensure_realloc(void *ptr, size_t elem_size, size_t need, size_t cap, size_t init_cap) {
+	if (need <= cap) return (PParseGrowResult){ptr, cap};
+	size_t new_cap = pparse_vec_grow_cap(cap, need, init_cap);
+	if (new_cap > SIZE_MAX / elem_size) pparse_error("allocation overflow");
+	ptr = realloc(ptr, elem_size * new_cap);
+	if (!ptr) pparse_error("out of memory");
+	return (PParseGrowResult){ptr, new_cap};
+}
+
+static inline PParseGrowResult pparse_arena_ensure_cap(PParseArena *arena,
+						       void *ptr,
+						       size_t elem_size,
+						       size_t count,
+						       size_t cap,
+						       size_t init_cap) {
+	if (count < cap) return (PParseGrowResult){ptr, cap};
+	size_t new_cap = pparse_vec_grow_cap(cap, count, init_cap);
+	if (new_cap > SIZE_MAX / elem_size) pparse_error("allocation overflow");
+	ptr = pparse_arena_realloc(arena, ptr, elem_size * cap, elem_size * new_cap);
+	return (PParseGrowResult){ptr, new_cap};
+}
+
+/* need is the minimum used count (typically count or count+1). */
+#define pparse_VEC_ENSURE_REALLOC(arr, need, cap, init_cap)                                             \
+	do {                                                                                             \
+		PParseGrowResult _pparse_grow = pparse_vec_ensure_realloc(                                \
+		    (arr), sizeof(*(arr)), (size_t)(need), (size_t)(cap), (size_t)(init_cap));            \
+		(arr) = _pparse_grow.ptr;                                                                \
+	(cap) = _pparse_grow.capacity;                                                           \
+	} while (0)
+
+#define PPARSE_ARENA_ENSURE_CAP(arena, arr, count, cap, init_cap, T)                                    \
+	do {                                                                                             \
+		PParseGrowResult _pparse_grow = pparse_arena_ensure_cap(                                  \
+		    (arena), (arr), sizeof(T), (size_t)(count), (size_t)(cap), (size_t)(init_cap));       \
+		(arr) = _pparse_grow.ptr;                                                                \
+	(cap) = _pparse_grow.capacity;                                                           \
+	} while (0)
+
+typedef struct {
 	PParseArenaBlock *block;
 	size_t used;
 } PParseArenaMark;
@@ -761,8 +780,11 @@ static inline PRISM_PURE PParseToken *pparse_next(PParseContext *_pc, PParseToke
 	return &pparse_token_pool[tok->parse_data];
 }
 
-static inline PRISM_PURE PParseToken *pparse_pair(PParseContext *_pc, PParseToken *tok) {
-	return tok->pair_idx ? &pparse_token_pool[tok->pair_idx] : NULL;
+/* Tokenization rejects unbalanced input before analysis. Once a delimiter
+ * flag has proved the token is an opener/closer, its pair index is nonzero. */
+static inline PRISM_ALWAYS_INLINE PRISM_PURE PParseToken *pparse_pair_known(PParseToken *tok) {
+	PPARSE_CTX();
+	return &pparse_token_pool[tok->pair_idx];
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE uint32_t pparse_idx(PParseContext *_pc, PParseToken *tok) {
@@ -1030,33 +1052,34 @@ static PRISM_COLD void pparse_warn_tok(PParseToken *tok, const char *fmt, ...) {
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool
 pparse_equal_n(PParseContext *_pc, PParseToken *tok, const char *op, uint32_t len) {
-	/* Operator/keyword spellings are short; caller proves len fits the bound. */
+	/* Operator/keyword spellings are short and len is at least two. */
 	return tok->len == len && tok->ch0 == (uint8_t)op[0] &&
-	       (len <= 1 || prism_memeq_runtime(pparse_loc(_pc, tok) + 1, op + 1, (size_t)len - 1u));
+	       prism_memeq_runtime(pparse_loc(_pc, tok) + 1, op + 1, (size_t)len - 1u);
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_equal_1(PParseToken *tok, char c) {
-	return tok->len == 1 && tok->ch0 == (uint8_t)c;
+	return (tok->len == 1) & (tok->ch0 == (uint8_t)c);
 }
 
 #define pparse_match_ch pparse_equal_1
 
 #define pparse_CH(c) (1ULL << ((c) - 32))
 #define pparse_match_set(tok, mask)                                                                                 \
-	((tok)->len == 1 && (unsigned)((tok)->ch0 - 32) < 64u && ((mask) & (1ULL << ((tok)->ch0 - 32))))
+	(((tok)->len == 1) & ((unsigned)((tok)->ch0 - 32) < 64u) &                                              \
+	 (((mask) >> (((tok)->ch0 - 32) & 63)) & 1u))
 
 #define pparse_is_stmt_expr_open(t) ((t)->flags & PPARSE_TF_STMT_EXPR)
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_is_else_kw(PParseToken *t) {
-	return (t->tag & PPARSE_TT_IF) && t->ch0 == 'e';
+	return ((t->tag & PPARSE_TT_IF) != 0) & (t->ch0 == 'e');
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_is_do_kw(PParseToken *t) {
-	return (t->tag & PPARSE_TT_LOOP) && t->ch0 == 'd';
+	return ((t->tag & PPARSE_TT_LOOP) != 0) & (t->ch0 == 'd');
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_is_else_or_do(PParseToken *t) {
-	return pparse_is_else_kw(t) || pparse_is_do_kw(t);
+	return pparse_is_else_kw(t) | pparse_is_do_kw(t);
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE bool
@@ -1354,11 +1377,11 @@ static inline PParseToken *pparse_p0_next(PParseToken *tok) {
 static PParseToken *pparse_p0_attribute_group_end(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!tok) return NULL;
-	if ((tok->flags & PPARSE_TF_C23_ATTR) && pparse_pair(_pc, tok)) return pparse_pair(_pc, tok);
+	if (tok->flags & PPARSE_TF_C23_ATTR) return pparse_pair_known(tok);
 	if (tok->kind <= PPARSE_TK_KEYWORD &&
 	    (pparse_equal(tok, "__attribute__") || pparse_equal(tok, "__attribute") || pparse_equal(tok, "__declspec"))) {
 		PParseToken *open = pparse_p0_next(tok);
-		if (open && open->ch0 == '(' && pparse_pair(_pc, open)) return pparse_pair(_pc, open);
+		if (open && open->ch0 == '(') return pparse_pair_known(open);
 	}
 	return NULL;
 }
@@ -1369,8 +1392,8 @@ static PParseToken *pparse_p0_attr_owner_backward(PParseContext *_pc, PParseToke
 		PParseToken *pt = &pparse_token_pool[pi - 1];
 		if (pt->kind == PPARSE_TK_PREP_DIR) continue;
 		if (pt->ch0 == ';' || pt->ch0 == '{' || pt->ch0 == '}') break;
-		if ((pt->ch0 == ')' || pt->ch0 == ']') && pparse_pair(_pc, pt)) {
-			pi = pparse_idx(_pc, pparse_pair(_pc, pt)) + 1;
+		if (pt->ch0 == ')' || pt->ch0 == ']') {
+			pi = pparse_idx(_pc, pparse_pair_known(pt)) + 1;
 			continue;
 		}
 		if (pparse_p0_token_can_name_function(pt) && pparse_p0_next(pt) &&
@@ -1447,31 +1470,6 @@ pparse_keyword_lookup(PParseContext *_pc, char *key, int keylen) {
 			return ent->value;
 	}
 	return 0;
-}
-static inline PRISM_ALWAYS_INLINE int pparse_read_ident(char *start) {
-	char *p = start;
-	int ucn = pparse_read_ucn(p);
-	if (ucn)
-		p += ucn;
-	else if ((unsigned char)*p >= 0x80)
-		p++;
-	else if (PPARSE_IS_ALPHA(*p))
-		p++;
-	else
-		return 0;
-	for (;;) {
-		if (pparse_ident_char[(unsigned char)*p]) {
-			p++;
-			continue;
-		}
-		ucn = pparse_read_ucn(p);
-		if (ucn) {
-			p += ucn;
-			continue;
-		}
-		break;
-	}
-	return p - start;
 }
 static int pparse_read_punct(char *p) {
 	switch (*p) {
@@ -1653,7 +1651,6 @@ static inline void pparse_classify_punct(PParseToken *t) {
 	}
 }
 static bool pparse_p0_soft_noreturn_is_decl_specifier(PParseToken *tok) {
-	PPARSE_CTX();
 	PParseToken *next = pparse_p0_next(tok);
 	if (!next || next->kind == PPARSE_TK_EOF ||
 	    pparse_match_set(next, pparse_CH('=') | pparse_CH('(') | pparse_CH('[') | pparse_CH(',') | pparse_CH(';') | pparse_CH(')')))
@@ -1680,7 +1677,7 @@ static bool pparse_p0_soft_noreturn_is_decl_specifier(PParseToken *tok) {
 	if (prev->tag &
 	    (PPARSE_TT_TYPE | PPARSE_TT_STORAGE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_ATTR | PPARSE_TT_INLINE))
 		return true;
-	if (prev->ch0 == ']' && pparse_pair(_pc, prev) && (pparse_pair(_pc, prev)->flags & PPARSE_TF_C23_ATTR)) return true;
+	if (prev->ch0 == ']' && (pparse_pair_known(prev)->flags & PPARSE_TF_C23_ATTR)) return true;
 	return false;
 }
 static bool pparse_p0_attribute_inside_parameter_list(PParseToken *attr) {
@@ -1691,17 +1688,15 @@ static bool pparse_p0_attribute_inside_parameter_list(PParseToken *attr) {
 	return false;
 }
 static PParseToken *pparse_find_wrapper_callee(PParseToken *body) {
-	PPARSE_CTX();
-	PParseToken *end = pparse_pair(_pc, body);
-	if (!end) return NULL;
+	PParseToken *end = pparse_pair_known(body);
 	PParseToken *tok = pparse_p0_next(body);
 	while (tok && tok != end && tok->ch0 == ';') tok = pparse_p0_next(tok);
 	if (tok && tok != end && (tok->tag & PPARSE_TT_RETURN)) tok = pparse_p0_next(tok);
 	while (tok && tok != end && tok->ch0 == ';') tok = pparse_p0_next(tok);
 	if (!tok || tok == end || !pparse_p0_token_can_name_function(tok)) return NULL;
 	PParseToken *open = pparse_p0_next(tok);
-	if (!open || open->ch0 != '(' || !pparse_pair(_pc, open)) return NULL;
-	PParseToken *after = pparse_p0_next(pparse_pair(_pc, open));
+	if (!open || open->ch0 != '(') return NULL;
+	PParseToken *after = pparse_p0_next(pparse_pair_known(open));
 	while (after && after != end && after->ch0 == ';') after = pparse_p0_next(after);
 	return after == end ? tok : NULL;
 }
@@ -1861,7 +1856,7 @@ enum {
 	PCC_ALPHA = 1 << 1,   /* PPARSE_IS_ALPHA, plus >= 0x80    */
 	PCC_DIGIT = 1 << 2,   /* 0-9                              */
 	PCC_LITPFX = 1 << 3,  /* u U L R - may open a literal     */
-	PCC_QUOTE = 1 << 4,   /* " '                              */
+	PCC_QUOTE = 1 << 4,   /* " ', plus \\ for UCN dispatch     */
 	PCC_SLASH = 1 << 5,   /* / - may open a comment           */
 	PCC_DOT = 1 << 6,     /* . - may open a pp-number         */
 	PCC_NEWLINE = 1 << 7, /* \n                               */
@@ -1879,7 +1874,7 @@ static const uint8_t pparse_char_class[256] = {
 	0x01, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20,  /* 0x20 */
 	0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 0x30 */
 	0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0A, 0x02, 0x02, 0x02,  /* 0x40 */
-	0x02, 0x02, 0x0A, 0x02, 0x02, 0x0A, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02,  /* 0x50 */
+	0x02, 0x02, 0x0A, 0x02, 0x02, 0x0A, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00, 0x10, 0x00, 0x00, 0x02,  /* 0x50 */
 	0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,  /* 0x60 */
 	0x02, 0x02, 0x02, 0x02, 0x02, 0x0A, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 0x70 */
 	0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,  /* 0x80 */
@@ -1914,6 +1909,8 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 	uint32_t *noreturn_candidates = NULL;
 	uint32_t last_prism_idx = 0;
 	while (*p) {
+		int ident_len;
+		char *ident_end;
 		if (ts.at_bol &&
 		    (*p == '#' || (p[0] == '%' && p[1] == ':') ||
 		     (p[0] == '?' && p[1] == '?' && p[2] == '='))) {
@@ -1944,16 +1941,19 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		unsigned cc0 = pparse_char_class[(unsigned char)*p];
 		if (__builtin_expect(cc0 == 0, 1)) goto do_punct;
 
-		if (p[0] == '/' && p[1] == '/') {
-			p = pparse_skip_line_comment(p + 2, &ts);
-			ts.has_space = true;
-			continue;
-		}
-		if (p[0] == '/' && p[1] == '*') {
-			p = pparse_skip_block_comment(p + 2, &ts);
-			ts.has_space = true;
-			continue;
-		}
+		switch (cc0) {
+		case PCC_SLASH:
+			if (p[1] == '/') {
+				p = pparse_skip_line_comment(p + 2, &ts);
+				ts.has_space = true;
+				continue;
+			}
+			if (p[1] == '*') {
+				p = pparse_skip_block_comment(p + 2, &ts);
+				ts.has_space = true;
+				continue;
+			}
+			goto do_punct;
 		/* Whitespace is the largest single class of loop iterations on real
 		 * preprocessed input: 95,924 of 288,375 on a 1.1 MB .i, 319 KB of the
 		 * bytes, averaging 3.3 bytes a run. The old body wrote all three state
@@ -1964,14 +1964,15 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		 * a following space -- so the writes hoist out and only the newline
 		 * count stays per byte. Worth 1.05x on the whole transpile, 20 of 22
 		 * interleaved pairs. */
-		if (cc0 & (PCC_SPACE | PCC_NEWLINE)) {
+		case PCC_SPACE:
+		case PCC_NEWLINE: {
 			int newlines = 0;
 			do {
 				newlines += (*p == '\n');
 				p++;
 			} while (pparse_char_class[(unsigned char)*p] & (PCC_SPACE | PCC_NEWLINE));
 			ts.line_no += newlines;
-			if (newlines) ts.at_bol = true;
+			ts.at_bol |= newlines != 0;
 			ts.has_space = (p[-1] != '\n');
 			continue;
 		}
@@ -1979,14 +1980,16 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		 * do NOT start with a string/char literal prefix (u/U/L/R). Jump
 		 * straight to identifier scanning, skipping ~15 literal-prefix branches.
 		 * u/U/L/R starts fall through so `u8"..."`, `L'x'`, `R"..."` still work. */
-		{
-			unsigned char c0 = (unsigned char)*p;
-			if (__builtin_expect((PPARSE_IS_ALPHA(c0) || c0 >= 0x80) && c0 != 'u' && c0 != 'U' &&
-						 c0 != 'L' && c0 != 'R',
-					     1))
-				goto do_ident;
+		case PCC_ALPHA: goto do_ident_fast;
+		case PCC_DIGIT: goto do_number;
+		case PCC_DOT:
+			if (pparse_char_class[(unsigned char)p[1]] & PCC_DIGIT) goto do_number;
+			goto do_punct;
+		case PCC_ALPHA | PCC_LITPFX:
+		case PCC_QUOTE: goto do_literal;
+		default: goto do_punct;
 		}
-		if (PPARSE_IS_DIGIT(*p) || (*p == '.' && PPARSE_IS_DIGIT(p[1]))) {
+	do_number: {
 			char *start = p;
 			p = pparse_scan_pp_number(p);
 			pparse_new_token(PPARSE_TK_NUM, start, p, &ts);
@@ -1996,10 +1999,9 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 		 * encoding prefix that may precede the quote. Six near-identical
 		 * branches used to spell out every combination of {"", u8, u, U, L} x
 		 * {R, ", '}; one prefix length drives all of them. */
-		{
-			int pfx = (p[0] == 'u' && p[1] == '8')				  ? 2
-				  : (p[0] == 'u' || p[0] == 'U' || p[0] == 'L') ? 1
-										: 0;
+	do_literal: {
+			int pfx = (((cc0 & PCC_LITPFX) != 0) & (*p != 'R')) +
+				  ((*p == 'u') & (p[1] == '8'));
 			char q = p[pfx];
 			if (q == 'R' && p[pfx + 1] == '"') {
 				PParseToken *nt = pparse_read_raw_string_literal(p, p + pfx + 1, &ts);
@@ -2013,32 +2015,41 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 				continue;
 			}
 		}
-		/* Braced so that `goto do_punct` above does not jump past ident_len's
-		 * declaration - Prism rejects that, and it is right to. */
-	do_ident:; {
-		int ident_len = pparse_read_ident(p);
-		if (ident_len) {
+		if (cc0 & PCC_ALPHA) goto do_ident_fast;
+		if (*p != '\\') goto do_punct;
+		ident_len = pparse_read_ucn(p);
+		if (!ident_len) goto do_punct;
+		ident_end = p + ident_len;
+		goto scan_ident_tail;
+	do_ident_fast:
+		ident_end = p + 1;
+	scan_ident_tail:
+		for (;;) {
+			while (pparse_ident_char[(unsigned char)*ident_end]) ident_end++;
+			int ucn = pparse_read_ucn(ident_end);
+			if (!ucn) break;
+			ident_end += ucn;
+		}
+		ident_len = (int)(ident_end - p);
+		{
 			PParseToken *t = pparse_new_token(PPARSE_TK_IDENT, p, p + ident_len, &ts);
 			t->parse_data = pparse_fast_hash(p, (uint32_t)ident_len);
 			uint64_t kw = pparse_keyword_lookup(_pc, p, ident_len);
-			if (kw_shadow_mask & (unsigned)(kw >> PPARSE_KW_SHADOW_SHIFT))
-				kw = 0;
+			kw *= (kw_shadow_mask & (unsigned)(kw >> PPARSE_KW_SHADOW_SHIFT)) == 0;
 			if (kw) {
-				if (kw & PPARSE_KW_MARKER) {
-					t->kind = PPARSE_TK_KEYWORD;
-					t->tag = (uint32_t)(kw & ~PPARSE_KW_MARKER);
-				} else
-					t->tag = (uint32_t)kw;
+				bool marked_keyword = (kw & PPARSE_KW_MARKER) != 0;
+				t->kind = (PParseTokenKind)(marked_keyword * PPARSE_TK_KEYWORD);
+				t->tag = (uint32_t)(kw & ~PPARSE_KW_MARKER);
 				t->flags |= (uint16_t)(kw >> PPARSE_KW_FLAGS_SHIFT);
 				tag_summary |= t->tag;
-				uint32_t ti = pparse_idx(_pc, t);
+				uint32_t ti = pparse_token_count - 1;
 				if (t->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE)) last_prism_idx = ti;
 				if (delimiter_n == 0 && (t->tag & (PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN))) {
 					pparse_push_u32(_pc, &builtin_candidates, &builtin_n, &builtin_cap, ti);
 				}
-				bool nr_spec = (t->tag & (PPARSE_TT_INLINE | PPARSE_TT_SKIP_DECL)) ==
+				bool nr_spec = ((t->tag & (PPARSE_TT_INLINE | PPARSE_TT_SKIP_DECL)) ==
 					       (PPARSE_TT_INLINE | PPARSE_TT_SKIP_DECL) &&
-					       (pparse_equal(t, "_Noreturn") || pparse_equal(t, "noreturn"));
+					       (pparse_equal(t, "_Noreturn") || pparse_equal(t, "noreturn")));
 				if ((t->tag & PPARSE_TT_ATTR) || nr_spec) {
 					pparse_push_u32(_pc, &noreturn_candidates, &noreturn_n, &noreturn_cap, ti);
 				}
@@ -2046,11 +2057,10 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			p += ident_len;
 			continue;
 		}
-		}
 	do_punct:;
 		int punct_len = pparse_read_punct(p);
 		if (punct_len) {
-			int abs_len = punct_len < 0 ? -punct_len : punct_len;
+			int abs_len = abs(punct_len);
 			PParseToken *t = pparse_new_token(PPARSE_TK_PUNCT, p, p + abs_len, &ts);
 			if (punct_len < 0) {
 				char norm;
@@ -2062,7 +2072,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 				}
 				p[0] = norm;
 				if (abs_len == 4) p[1] = '#'; // %:%: -> ##
-				t->len = (abs_len == 4) ? 2 : 1;
+				t->len = (uint8_t)(1 + (abs_len == 4));
 				t->ch0 = (uint8_t)norm;
 			}
 			pparse_classify_punct(t);
@@ -2070,35 +2080,40 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			 * tokenization. The pool survives library-mode resets, so clear
 			 * this one reused punctuation word at creation. */
 			if (t->ch0 == '[') t->parse_data = 0;
-			uint32_t ti = pparse_idx(_pc, t);
-			if (t->flags & PPARSE_TF_OPEN) {
-				pparse_push_u32(_pc, &delimiter_stack, &delimiter_n, &delimiter_cap, ti);
-				if (t->ch0 == '{') {
-					PParseToken *prev =
-					    pparse_walk_back(ti, PPARSE_WB_ATTR_NOISE | PPARSE_WB_JUMP_ATTR_PARENS);
-					if (prev && pparse_match_ch(prev, '(')) prev->flags |= PPARSE_TF_STMT_EXPR;
-				}
-				if (t->ch0 == '[' && ti > first_idx) {
-					PParseToken *prev = &pparse_token_pool[ti - 1];
-					if (prev->ch0 == '[' && (prev->flags & PPARSE_TF_OPEN)) {
-						prev->flags |= PPARSE_TF_C23_ATTR;
-						pparse_push_u32(_pc, &noreturn_candidates, &noreturn_n,
-								 &noreturn_cap, ti - 1);
+			uint32_t ti = pparse_token_count - 1;
+			uint16_t delimiter_flags = t->flags & (PPARSE_TF_OPEN | PPARSE_TF_CLOSE);
+			if (delimiter_flags) {
+				if (delimiter_flags & PPARSE_TF_OPEN) {
+					pparse_push_u32(_pc, &delimiter_stack, &delimiter_n, &delimiter_cap, ti);
+					if (t->ch0 == '{') {
+						PParseToken *prev =
+						    pparse_walk_back(ti, PPARSE_WB_ATTR_NOISE | PPARSE_WB_JUMP_ATTR_PARENS);
+						if (prev && pparse_match_ch(prev, '(')) prev->flags |= PPARSE_TF_STMT_EXPR;
 					}
+					if (t->ch0 == '[' && ti > first_idx) {
+						PParseToken *prev = &pparse_token_pool[ti - 1];
+						if (prev->ch0 == '[' && (prev->flags & PPARSE_TF_OPEN)) {
+							prev->flags |= PPARSE_TF_C23_ATTR;
+							pparse_push_u32(_pc, &noreturn_candidates, &noreturn_n,
+									 &noreturn_cap, ti - 1);
+						}
+					}
+				} else {
+					if (delimiter_n == 0) pparse_error_tok(t, "unmatched closing delimiter");
+					uint32_t open_idx = delimiter_stack[--delimiter_n];
+					PParseToken *open = &pparse_token_pool[open_idx];
+					unsigned expected_close = open->ch0 + 2 - (open->ch0 == '(');
+					if (t->ch0 != expected_close)
+						pparse_error_tok(t,
+								  "mismatched closing delimiter '%c' for opener '%c'",
+								  t->ch0,
+								  open->ch0);
+					open->pair_idx = ti;
+					t->pair_idx = open_idx;
+					if (open > pparse_token_pool + first_idx && ((open - 1)->tag & PPARSE_TT_ATTR))
+						for (PParseToken *u = open; u <= t; u++) u->ann |= P1_IN_ATTR_ARGS;
+					if (last_prism_idx > t->pair_idx) open->flags |= PPARSE_TF_HAS_PRISM;
 				}
-			} else if (t->flags & PPARSE_TF_CLOSE) {
-				if (delimiter_n == 0) pparse_error_tok(t, "unmatched closing delimiter");
-				PParseToken *open = &pparse_token_pool[delimiter_stack[--delimiter_n]];
-				if (open->ch0 == '(' ? t->ch0 != ')' : t->ch0 != open->ch0 + 2)
-					pparse_error_tok(t,
-							  "mismatched closing delimiter '%c' for opener '%c'",
-							  t->ch0,
-							  open->ch0);
-				open->pair_idx = ti;
-				t->pair_idx = pparse_idx(_pc, open);
-				if (open > pparse_token_pool + first_idx && ((open - 1)->tag & PPARSE_TT_ATTR))
-					for (PParseToken *u = open; u <= t; u++) u->ann |= P1_IN_ATTR_ARGS;
-				if (last_prism_idx > t->pair_idx) open->flags |= PPARSE_TF_HAS_PRISM;
 			}
 			p += abs_len;
 			continue;
@@ -2117,15 +2132,17 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 	}
 	pparse_new_token(PPARSE_TK_EOF, p, p, &ts);
 
-	PParseToken *first = first_idx ? &pparse_token_pool[first_idx] : NULL;
+	PParseToken *first = &pparse_token_pool[first_idx];
+	pparse_token_tag_summary = tag_summary;
+	if (_pc->lex_only) return first;
 	{
 		PParseHashMap user_builtin = {0};
 		for (int i = 0; i < builtin_n; i++) {
 			PParseToken *name = &pparse_token_pool[builtin_candidates[i]];
 			PParseToken *open = pparse_p0_next(name);
-			if (!open || !pparse_match_ch(open, '(') || !pparse_pair(_pc, open)) continue;
-			PParseToken *after = pparse_p0_next(pparse_pair(_pc, open));
-			while (after && after->kind != PPARSE_TK_EOF) {
+			if (!pparse_match_ch(open, '(')) continue;
+			PParseToken *after = pparse_p0_next(pparse_pair_known(open));
+			while (after->kind != PPARSE_TK_EOF) {
 				PParseToken *ae = pparse_p0_attribute_group_end(after);
 				if (ae) {
 					after = pparse_p0_next(ae);
@@ -2137,14 +2154,14 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 				}
 				break;
 			}
-			if (after && pparse_match_ch(after, '{'))
+			if (pparse_match_ch(after, '{'))
 				pparse_lex_token_map_put(&user_builtin, name, (void *)1);
 		}
 		/* User definitions of libc noreturn/special names are ordinary unless
 		 * explicitly annotated (_Noreturn / attr). Clear keyword-cache tags so
 		 * taint + auto-unreachable do not treat `int exit(void){…}` as builtin. */
 		if (user_builtin.used > 0) {
-			for (PParseToken *s = first; s && s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
+			for (PParseToken *s = first; s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
 				if ((s->tag & (PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN)) &&
 				    pparse_lex_token_map_get(&user_builtin, s))
 					s->tag &= ~(PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN);
@@ -2164,37 +2181,32 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			int function_count = 0;
 			int function_capacity = 0;
 			PParseToken *func_name = NULL;
-			for (PParseToken *t = first; t && t->kind != PPARSE_TK_EOF; t = pparse_p0_next(t)) {
+			for (PParseToken *t = first; t->kind != PPARSE_TK_EOF; t = pparse_p0_next(t)) {
 				PParseToken *attr_end = pparse_p0_attribute_group_end(t);
 				if (attr_end) {
 					t = attr_end;
 					continue;
 				}
 				PParseToken *next = pparse_p0_next(t);
-				if (t->kind <= PPARSE_TK_KEYWORD && next && next->ch0 == '(' &&
-				    (next->flags & PPARSE_TF_OPEN) &&
+				if (t->kind <= PPARSE_TK_KEYWORD && next->ch0 == '(' &&
 				    !(t->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE |
 					       PPARSE_TT_TYPEOF | PPARSE_TT_ATTR)))
 					func_name = t;
-				if (t->ch0 == '{' && (t->flags & PPARSE_TF_OPEN) && t->pair_idx) {
-					PParseToken *end = pparse_pair(_pc, t);
+				if (t->ch0 == '{' && (t->flags & PPARSE_TF_OPEN)) {
+					PParseToken *end = pparse_pair_known(t);
 					for (PParseToken *b = pparse_p0_next(t); b != end; b = pparse_p0_next(b)) {
 						if ((b->tag & PPARSE_TT_SPECIAL_FN) &&
-						    !(pparse_idx(_pc, b) >= 1 &&
-						      (pparse_token_pool[pparse_idx(_pc, b) - 1].tag & PPARSE_TT_MEMBER))) {
+						    !((b - 1)->tag & PPARSE_TT_MEMBER)) {
 							/* Skip declarator shadows: `void (*setjmp)(void)` /
 							 * `int vfork;` — not calls/refs. */
-							PParseToken *prev =
-							    pparse_idx(_pc, b) >= 1 ? &pparse_token_pool[pparse_idx(_pc, b) - 1]
-									    : NULL;
+							PParseToken *prev = b - 1;
 							PParseToken *nxt = pparse_p0_next(b);
 							bool decl_shadow =
-							    prev &&
 							    (pparse_match_ch(prev, '*') ||
 							     (prev->tag &
 							      (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE |
 							       PPARSE_TT_SUE))) &&
-							    nxt && nxt->ch0 != '(';
+							    nxt->ch0 != '(';
 							if (!decl_shadow) {
 								if (b->ch0 == 'v' && b->len == 5) {
 									t->tag |= PPARSE_TT_NORETURN_FN;
@@ -2211,7 +2223,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 							 * are not mistaken for asm-goto. */
 							bool saw_goto = false;
 							for (PParseToken *ag = pparse_p0_next(b);
-							     ag && ag != end;
+							     ag != end;
 							     ag = pparse_p0_next(ag)) {
 								if (ag->ch0 == '(') {
 									if (saw_goto) t->tag |= PPARSE_TT_ASM;
@@ -2231,9 +2243,8 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 								    pparse_equal(ag, "inline"))
 									continue;
 								if (ag->flags & PPARSE_TF_SOFT_KW) continue;
-								if ((ag->flags & PPARSE_TF_C23_ATTR) &&
-								    pparse_pair(_pc, ag)) {
-									ag = pparse_pair(_pc, ag);
+								if (ag->flags & PPARSE_TF_C23_ATTR) {
+									ag = pparse_pair_known(ag);
 									continue;
 								}
 								break;
@@ -2334,26 +2345,24 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 				for (int i = 0; i < function_count; i++) {
 					PParseToken *body = functions[i].body;
 					if (body->tag & (PPARSE_TT_SPECIAL_FN | PPARSE_TT_NORETURN_FN)) continue;
-					PParseToken *end = pparse_pair(_pc, body);
+					PParseToken *end = pparse_pair_known(body);
 					for (PParseToken *b = pparse_p0_next(body); b != end; b = pparse_p0_next(b)) {
 						if (!pparse_p0_token_can_name_function(b)) continue;
 						/* Skip declarator occurrences (`void (*f0)(void)`,
 						 * `int f0;`) — keep bare refs so FP chains like
 						 * `fp = f0; fp();` still propagate taint. */
-						if (pparse_idx(_pc, b) >= 1) {
-							PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, b) - 1];
-							PParseToken *n = pparse_p0_next(b);
-							if ((pparse_match_ch(prev, '*') ||
-							     (prev->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER |
-									   PPARSE_TT_STORAGE | PPARSE_TT_SUE))) &&
-							    n && n->ch0 != '(')
-								continue;
-						}
+						PParseToken *prev = b - 1;
+						PParseToken *n = pparse_p0_next(b);
+						if ((pparse_match_ch(prev, '*') ||
+						     (prev->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER |
+								   PPARSE_TT_STORAGE | PPARSE_TT_SUE))) &&
+						    n->ch0 != '(')
+							continue;
 						if (!(fn_bloom &
 						      (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
 							continue;
-						if (pparse_idx(_pc, b) > pparse_idx(_pc, body) + 1) {
-							PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, b) - 1];
+						if (b > body + 1) {
+							prev = b - 1;
 							if (prev->tag &
 							    (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE | PPARSE_TT_SUE))
 								continue;
@@ -2361,15 +2370,13 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 							 * bare identifier is commonly a local-use idiom. Treating
 							 * `(void)local;` as a reference to an equally named file-scope
 							 * function falsely taints the containing function. */
-							if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE) &&
-							    prev->pair_idx) {
-								PParseToken *open = pparse_pair(_pc, prev);
-								PParseToken *inner = open ? pparse_p0_next(open) : NULL;
+							if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE)) {
+								PParseToken *open = pparse_pair_known(prev);
+								PParseToken *inner = pparse_p0_next(open);
 								PParseToken *next = pparse_p0_next(b);
-								if (inner &&
-								    (inner->tag &
+								if ((inner->tag &
 								     (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE)) &&
-								    (!next || !pparse_match_ch(next, '(')))
+								    !pparse_match_ch(next, '('))
 									continue;
 							}
 						}
@@ -2462,8 +2469,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			PParseHashMap nr_map = {0};
 #define pparse_SKIP_ATTR_ARGS(a)                                                                                    \
 	do {                                                                                                 \
-		if ((a)->kind <= PPARSE_TK_KEYWORD && pparse_p0_next(a) && pparse_p0_next(a)->ch0 == '(' &&                      \
-		    pparse_p0_next(a)->pair_idx)                                                                   \
+		if ((a)->kind <= PPARSE_TK_KEYWORD && pparse_p0_next(a)->ch0 == '(')                              \
 			(a) = &pparse_token_pool[pparse_p0_next(a)->pair_idx];                                            \
 	} while (0)
 #define PPARSE_IS_NORETURN_NAME(a)                                                                                  \
@@ -2471,7 +2477,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 	 (pparse_equal((a), "noreturn") || pparse_equal((a), "_Noreturn") || pparse_equal((a), "__noreturn__")))
 #define pparse_ATTR_SPAN_HAS_NORETURN(start, end, out)                                                              \
 	do {                                                                                                 \
-		for (PParseToken *_a = (start); _a && _a < (end); _a = pparse_p0_next(_a)) {                              \
+		for (PParseToken *_a = (start); _a < (end); _a = pparse_p0_next(_a)) {                              \
 			if (PPARSE_IS_NORETURN_NAME(_a)) {                                                          \
 				(out) = true;                                                                \
 				break;                                                                       \
@@ -2491,11 +2497,11 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			     (pparse_equal(t, "noreturn") && pparse_p0_soft_noreturn_is_decl_specifier(t))))
 				is_noreturn = true;
 			// [[noreturn]] / [[_Noreturn]] / [[__noreturn__]] — C23 attribute
-			if (t->ch0 == '[' && (t->flags & PPARSE_TF_C23_ATTR) && t->pair_idx) {
+			if (t->ch0 == '[' && (t->flags & PPARSE_TF_C23_ATTR)) {
 				attribute_form = true;
 				PParseToken *inner = pparse_p0_next(t);
 				PParseToken *attr_end = &pparse_token_pool[t->pair_idx];
-				if (inner && inner->ch0 == '[')
+				if (inner->ch0 == '[')
 					pparse_ATTR_SPAN_HAS_NORETURN(pparse_p0_next(inner), attr_end, is_noreturn);
 				t = attr_end; // advance past [[ ... ]]
 				scan_start = t;
@@ -2505,12 +2511,12 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			    (pparse_equal(t, "__attribute__") || pparse_equal(t, "__attribute"))) {
 				attribute_form = true;
 				PParseToken *p1 = pparse_p0_next(t);
-				if (p1 && p1->ch0 == '(') {
+				if (p1->ch0 == '(') {
 					PParseToken *p2 = pparse_p0_next(p1);
-					if (p2 && p2->ch0 == '(' && p2->pair_idx) {
+					if (p2->ch0 == '(') {
 						PParseToken *close = &pparse_token_pool[p2->pair_idx];
 						pparse_ATTR_SPAN_HAS_NORETURN(pparse_p0_next(p2), close, is_noreturn);
-						t = pparse_pair(_pc, p1); // advance past __attribute__(( ... ))
+						t = pparse_pair_known(p1); // advance past __attribute__(( ... ))
 						scan_start = t;
 					}
 				}
@@ -2520,7 +2526,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			if (t->kind <= PPARSE_TK_KEYWORD && pparse_equal(t, "__declspec")) {
 				attribute_form = true;
 				PParseToken *p1 = pparse_p0_next(t);
-				if (p1 && p1->ch0 == '(' && p1->pair_idx) {
+				if (p1->ch0 == '(') {
 					PParseToken *close = &pparse_token_pool[p1->pair_idx];
 					pparse_ATTR_SPAN_HAS_NORETURN(pparse_p0_next(p1), close, is_noreturn);
 					t = close; // advance past __declspec( ... )
@@ -2545,7 +2551,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 			}
 			if (!fn_name) {
 				int fwd_depth = 0;
-				for (PParseToken *s = scan_start; s && s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
+				for (PParseToken *s = scan_start; s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
 					char ch = s->ch0;
 					if (ch == ';' || ch == '{') break;
 					/* Post-declarator attrs bind to the preceding name only. */
@@ -2555,7 +2561,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 						s = attr_end;
 						continue;
 					}
-					if ((s->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, s)) {
+					if (s->flags & PPARSE_TF_OPEN) {
 						fwd_depth++;
 						continue;
 					}
@@ -2564,7 +2570,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 						continue;
 					}
 					if (fwd_depth == 0 && pparse_p0_token_can_name_function(s) &&
-					    pparse_p0_next(s) && pparse_p0_next(s)->ch0 == '(') {
+					    pparse_p0_next(s)->ch0 == '(') {
 						if (s->tag & (PPARSE_TT_SKIP_DECL | PPARSE_TT_INLINE | PPARSE_TT_QUALIFIER |
 							      PPARSE_TT_TYPE | PPARSE_TT_STORAGE))
 							continue;
@@ -2597,7 +2603,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 					nr_bloom |= 1ULL
 						    << (((unsigned char)ent->key[0] ^ ent->key_len) & 63);
 			}
-			for (PParseToken *s = first; s && s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
+			for (PParseToken *s = first; s->kind != PPARSE_TK_EOF; s = pparse_p0_next(s)) {
 				if (pparse_p0_token_can_name_function(s) &&
 				    (nr_bloom & (1ULL << (((unsigned)s->ch0 ^ s->len) & 63))) &&
 				    !(pparse_idx(_pc, s) >= 1 && (pparse_token_pool[pparse_idx(_pc, s) - 1].tag & PPARSE_TT_MEMBER)) &&
@@ -2610,7 +2616,6 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 #undef pparse_ATTR_SPAN_HAS_NORETURN
 	}
 
-	pparse_token_tag_summary = tag_summary;
 	return first;
 }
 static PParseToken *pparse_tokenize_buffer(char *name, char *buf) {
@@ -2839,12 +2844,10 @@ enum {
 		(r).is_enum = false;                                                                 \
 	} while (0)
 
-/* Step over a group, tolerating an unmatched opener: the cursor advances to the
- * close when there is one and otherwise just moves on. Distinct from
- * PPARSE_SKIP_GROUP_ON_CLOSE, which declines to skip at all when unmatched. */
+/* Step over a group after tokenization has validated all delimiter pairs. */
 #define PPARSE_SKIP_GROUP_LENIENT(t)                                                                 \
 	if ((t)->flags & PPARSE_TF_OPEN) {                                                           \
-		if (pparse_pair(_pc, t)) (t) = pparse_pair(_pc, t);                                  \
+		(t) = pparse_pair_known(t);                                                          \
 		continue;                                                                            \
 	}
 
@@ -2901,25 +2904,25 @@ enum {
 
 /* Balanced-group skips for advancing and non-advancing loops. */
 #define PPARSE_SKIP_GROUP_ON_CLOSE(t)                                                                \
-	if (((t)->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {                                  \
-		(t) = pparse_pair(_pc, t);                                                           \
+	if ((t)->flags & PPARSE_TF_OPEN) {                                                           \
+		(t) = pparse_pair_known(t);                                                          \
 		continue;                                                                            \
 	}
 
 #define PPARSE_SKIP_GROUP_PAST(t)                                                                    \
-	if (((t)->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {                                  \
-		(t) = pparse_next(_pc, pparse_pair(_pc, t));                                         \
+	if ((t)->flags & PPARSE_TF_OPEN) {                                                           \
+		(t) = pparse_next(_pc, pparse_pair_known(t));                                        \
 		continue;                                                                            \
 	}
 
-/* Half-open token range, guarded against a missing end. */
+/* Half-open token range. Starts are real tokens; a missing end stops at EOF. */
 #define PPARSE_FOR_RANGE(t, from, to)                                                                \
-	for (PParseToken *t = (from); t && t != (to) && t->kind != PPARSE_TK_EOF;                    \
+	for (PParseToken *t = (from); t != (to) && t->kind != PPARSE_TK_EOF;                         \
 	     t = pparse_next(_pc, t))
 
 /* Walk from `from` to the end of the token stream. */
 #define PPARSE_FOR_TAIL(t, from)                                                                     \
-	for (PParseToken *t = (from); t && t->kind != PPARSE_TK_EOF; t = pparse_next(_pc, t))
+	for (PParseToken *t = (from); t->kind != PPARSE_TK_EOF; t = pparse_next(_pc, t))
 
 enum {
 	PPARSE_TDF_TYPEDEF = 1,
@@ -2947,20 +2950,25 @@ static uint8_t pparse_array_rank_for_tok(PParseToken *t);
 static inline void pparse_typedef_apply_tdf_flags(PParseTypeSpec *r, PParseToken *tok, int tflags) {
 	PPARSE_CTX();
 	r->is_typedef = true;
-	if (tflags & PPARSE_TDF_VLA) r->is_vla = true;
-	if (tflags & PPARSE_TDF_AGGREGATE) r->is_struct = true;
+	r->is_vla |= (tflags & PPARSE_TDF_VLA) != 0;
+	r->is_struct |= (tflags & PPARSE_TDF_AGGREGATE) != 0;
 	if ((tflags & PPARSE_TDF_AGGREGATE) && !r->object_type_idx)
 		r->object_type_idx = pparse_idx(_pc, tok) + 1;
-	if (tflags & PPARSE_TDF_UNION) r->is_union = true;
-	if (tflags & PPARSE_TDF_VOLATILE) r->has_volatile = r->has_hidden_volatile = true;
-	if (tflags & PPARSE_TDF_CONST) r->has_const = r->has_decl_const = r->has_hidden_const = true;
-	if (tflags & PPARSE_TDF_HAS_VOL_MEMBER)
-		r->has_volatile_member = r->has_hidden_volatile = true;
-	if (tflags & PPARSE_TDF_ATOMIC) r->has_atomic = true;
-	if (tflags & PPARSE_TDF_LONG_DOUBLE) r->has_long_double = true;
-	if (tflags & PPARSE_TDF_TYPEOF) r->has_typeof = true;
-	if (tflags & PPARSE_TDF_PTR) r->is_ptr = true;
-	if (tflags & PPARSE_TDF_FUNC) r->is_func = true;
+	r->is_union |= (tflags & PPARSE_TDF_UNION) != 0;
+	bool is_volatile = (tflags & PPARSE_TDF_VOLATILE) != 0;
+	bool is_const = (tflags & PPARSE_TDF_CONST) != 0;
+	bool has_volatile_member = (tflags & PPARSE_TDF_HAS_VOL_MEMBER) != 0;
+	r->has_volatile |= is_volatile;
+	r->has_hidden_volatile |= is_volatile | has_volatile_member;
+	r->has_const |= is_const;
+	r->has_decl_const |= is_const;
+	r->has_hidden_const |= is_const;
+	r->has_volatile_member |= has_volatile_member;
+	r->has_atomic |= (tflags & PPARSE_TDF_ATOMIC) != 0;
+	r->has_long_double |= (tflags & PPARSE_TDF_LONG_DOUBLE) != 0;
+	r->has_typeof |= (tflags & PPARSE_TDF_TYPEOF) != 0;
+	r->is_ptr |= (tflags & PPARSE_TDF_PTR) != 0;
+	r->is_func |= (tflags & PPARSE_TDF_FUNC) != 0;
 	if (tflags & PPARSE_TDF_ARRAY) {
 		r->is_array = true;
 		r->type_array_rank = pparse_array_rank_for_tok(tok);
@@ -3012,9 +3020,7 @@ static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_is_identifier_like(PPar
 
 static inline PParseToken *pparse_skip_balanced_group(PParseToken *tok) {
 	PPARSE_CTX();
-	PParseToken *end = pparse_pair(_pc, tok);
-	if (!end) return pparse_next(_pc, tok);
-	return pparse_next(_pc, end);
+	return pparse_next(_pc, pparse_pair_known(tok));
 }
 
 static inline PParseToken *pparse_skip_prep_dirs(PParseToken *tok) {
@@ -3097,12 +3103,10 @@ static PRISM_PURE PParseToken *pparse_skip_noise(PParseContext *_pc, PParseToken
 	while (tok && tok->kind != PPARSE_TK_EOF) {
 		if (tok->tag & PPARSE_TT_ATTR) {
 			tok = pparse_next(_pc, tok);
-			PParseToken *close = tok && pparse_match_ch(tok, '(') ? pparse_pair(_pc, tok) : NULL;
-			if (close) tok = pparse_next(_pc, close);
+			if (tok && pparse_match_ch(tok, '('))
+				tok = pparse_next(_pc, pparse_pair_known(tok));
 		} else if (pparse_is_c23_attr(tok)) {
-			PParseToken *close = pparse_pair(_pc, tok);
-			if (close) tok = pparse_next(_pc, close);
-			else break;
+			tok = pparse_next(_pc, pparse_pair_known(tok));
 		} else if (tok->kind == PPARSE_TK_PREP_DIR) {
 			tok = pparse_next(_pc, tok);
 		} else
@@ -3117,8 +3121,7 @@ static PParseToken *pparse_skip_asm_specifier_trail(PParseToken *t) {
 	t = pparse_skip_noise(_pc, t);
 	while (t && (t->tag & PPARSE_TT_ASM)) {
 		t = pparse_next(_pc, t);
-		PParseToken *close = t && pparse_match_ch(t, '(') ? pparse_pair(_pc, t) : NULL;
-		if (close) t = pparse_next(_pc, close);
+		if (t && pparse_match_ch(t, '(')) t = pparse_next(_pc, pparse_pair_known(t));
 		t = pparse_skip_noise(_pc, t);
 	}
 	return t;
@@ -3399,14 +3402,14 @@ enum {
 
 static inline void pparse_binding_apply_traits(PParseTypedefEntry *entry, unsigned traits) {
 	if (!entry) return;
-	if (traits & PPARSE_BIND_FUNC) entry->is_func = true;
-	if (traits & PPARSE_BIND_CONST) entry->is_const = true;
-	if (traits & PPARSE_BIND_VOLATILE) entry->is_volatile = true;
-	if (traits & PPARSE_BIND_VOLATILE_MEMBER) entry->has_volatile_member = true;
-	if (traits & PPARSE_BIND_ATOMIC) entry->is_atomic = true;
-	if (traits & PPARSE_BIND_LONG_DOUBLE) entry->is_long_double = true;
-	if (traits & PPARSE_BIND_AGGREGATE) entry->is_aggregate = true;
-	if (traits & PPARSE_BIND_CONSTEXPR) entry->is_constexpr = true;
+	entry->is_func |= (traits & PPARSE_BIND_FUNC) != 0;
+	entry->is_const |= (traits & PPARSE_BIND_CONST) != 0;
+	entry->is_volatile |= (traits & PPARSE_BIND_VOLATILE) != 0;
+	entry->has_volatile_member |= (traits & PPARSE_BIND_VOLATILE_MEMBER) != 0;
+	entry->is_atomic |= (traits & PPARSE_BIND_ATOMIC) != 0;
+	entry->is_long_double |= (traits & PPARSE_BIND_LONG_DOUBLE) != 0;
+	entry->is_aggregate |= (traits & PPARSE_BIND_AGGREGATE) != 0;
+	entry->is_constexpr |= (traits & PPARSE_BIND_CONSTEXPR) != 0;
 }
 
 /* Register or update an ordinary identifier without exposing table insertion
@@ -3472,8 +3475,8 @@ static PRISM_PURE PParseIdentifierBindingKind pparse_identifier_binding_kind(PPa
 	PPARSE_CTX();
 	PParseTypedefEntry *entry = pparse_typedef_lookup(_pc, tok);
 	if (!entry) return PPARSE_BINDING_NONE;
-	return entry->is_shadow || entry->is_enum_const || entry->is_vla_var ? PPARSE_BINDING_VALUE
-									   : PPARSE_BINDING_TYPE;
+	bool value = entry->is_shadow | entry->is_enum_const | entry->is_vla_var;
+	return (PParseIdentifierBindingKind)(PPARSE_BINDING_TYPE + value);
 }
 
 static inline PRISM_PURE bool pparse_token_has_binding(PParseToken *tok) {
@@ -3576,8 +3579,7 @@ static bool pparse_token_can_precede_function_name(PParseToken *tok) {
 static bool pparse_paren_is_function_params(PParseToken *open) {
 	PPARSE_CTX();
 	if (!open || !pparse_match_ch(open, '(')) return false;
-	PParseToken *close = pparse_pair(_pc, open);
-	if (!close) return false;
+	PParseToken *close = pparse_pair_known(open);
 	PParseToken *after = pparse_skip_asm_specifier_trail(pparse_next(_pc, close));
 	if (!after ||
 	    !(pparse_match_ch(after, '{') || pparse_match_ch(after, ';') || pparse_match_ch(after, ',') || pparse_match_ch(after, '=') ||
@@ -3593,7 +3595,7 @@ static bool pparse_paren_is_function_params(PParseToken *open) {
 		PParseToken *before = pparse_walk_back(pparse_idx(_pc, prev), PPARSE_WB_ATTR_NOISE);
 		return pparse_token_can_precede_function_name(before);
 	}
-	PParseToken *pointer_open = prev && pparse_match_ch(prev, ')') ? pparse_pair(_pc, prev) : NULL;
+	PParseToken *pointer_open = prev && pparse_match_ch(prev, ')') ? pparse_pair_known(prev) : NULL;
 	if (pointer_open) {
 		PParseToken *before = pparse_walk_back(pparse_idx(_pc, pointer_open), PPARSE_WB_ATTR_NOISE);
 		return pparse_token_can_precede_function_name(before);
@@ -3604,27 +3606,16 @@ static bool pparse_paren_is_function_params(PParseToken *open) {
 /* Innermost enclosing delimiter; pair jumps make cost proportional to nesting. */
 static PParseToken *pparse_enclosing_open(PParseContext *_pc, PParseToken *from, bool stop_at_stmt) {
 	if (!from) return NULL;
-	int depth = 0;
 	for (uint32_t i = pparse_idx(_pc, from); i > 0; i--) {
 		PParseToken *t = &pparse_token_pool[i - 1];
 		if (t->kind == PPARSE_TK_PREP_DIR) continue;
 		if (t->flags & PPARSE_TF_CLOSE) {
-			PParseToken *open = pparse_pair(_pc, t);
 			/* +1 compensates for the loop's decrement after the jump. */
-			if (open)
-				i = pparse_idx(_pc, open) + 1;
-			else
-				depth++;
+			i = pparse_idx(_pc, pparse_pair_known(t)) + 1;
 			continue;
 		}
-		if (t->flags & PPARSE_TF_OPEN) {
-			if (depth > 0) {
-				depth--;
-				continue;
-			}
-			return t;
-		}
-		if (stop_at_stmt && depth == 0 &&
+		if (t->flags & PPARSE_TF_OPEN) return t;
+		if (stop_at_stmt &&
 		    (pparse_match_ch(t, ';') || pparse_match_ch(t, '{') || pparse_match_ch(t, '}')))
 			return NULL;
 	}
@@ -3810,8 +3801,8 @@ static bool pparse_is_strict_bare_function_call(PParseToken *start, PParseToken 
 	PParseToken *function = tok;
 	tok = pparse_skip_prep_dirs_until(pparse_next(_pc, function), end);
 	if (!tok || tok == end || !pparse_match_ch(tok, '(') || !(tok->flags & PPARSE_TF_OPEN)) return false;
-	PParseToken *close = pparse_pair(_pc, tok);
-	return close && pparse_skip_prep_dirs_until(pparse_next(_pc, close), end) == end &&
+	PParseToken *close = pparse_pair_known(tok);
+	return pparse_skip_prep_dirs_until(pparse_next(_pc, close), end) == end &&
 	       pparse_function_symbol(function) != PPARSE_FS_NONE;
 }
 
@@ -3915,18 +3906,18 @@ static PParseToken *pparse_find_struct_body_brace(PParseToken *tok) {
 			while (t && t->kind != PPARSE_TK_EOF) {
 				pparse_SKIP_NOISE_CONTINUE(t);
 				if ((t->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS | PPARSE_TT_ATTR)) &&
-				    pparse_next(_pc, t) && pparse_match_ch(pparse_next(_pc, t), '(') && pparse_pair(_pc, pparse_next(_pc, t))) {
-					t = pparse_next(_pc, pparse_pair(_pc, pparse_next(_pc, t)));
+				    pparse_next(_pc, t) && pparse_match_ch(pparse_next(_pc, t), '(')) {
+					t = pparse_next(_pc, pparse_pair_known(pparse_next(_pc, t)));
 					continue;
 				}
 				/* `enum E : _Atomic(int) {` */
 				if ((t->tag & PPARSE_TT_TYPE) && pparse_equal(t, "_Atomic") && pparse_next(_pc, t) &&
-				    pparse_match_ch(pparse_next(_pc, t), '(') && pparse_pair(_pc, pparse_next(_pc, t))) {
-					t = pparse_next(_pc, pparse_pair(_pc, pparse_next(_pc, t)));
+				    pparse_match_ch(pparse_next(_pc, t), '(')) {
+					t = pparse_next(_pc, pparse_pair_known(pparse_next(_pc, t)));
 					continue;
 				}
-				if (pparse_is_c23_attr(t) && pparse_pair(_pc, t)) {
-					t = pparse_next(_pc, pparse_pair(_pc, t));
+				if (pparse_is_c23_attr(t)) {
+					t = pparse_next(_pc, pparse_pair_known(t));
 					continue;
 				}
 				if ((t->tag & PPARSE_TT_QUALIFIER) || pparse_is_type_keyword(t) || pparse_is_known_typedef(t)) {
@@ -3975,23 +3966,21 @@ static PParseToken *pparse_walk_back(uint32_t start_idx, unsigned flags) {
 
 		if (flags & PPARSE_WB_JUMP_GROUPS) {
 			if (pt->flags & PPARSE_TF_CLOSE) {
-				PParseToken *open = pparse_pair(_pc, pt);
-				if (!open) return NULL;
-				pi = pparse_idx(_pc, open); /* next iter looks at open-1 */
+				pi = pparse_idx(_pc, pparse_pair_known(pt)); /* next iter looks at open-1 */
 				continue;
 			}
 			return pt;
 		}
 
-		if ((flags & PPARSE_WB_JUMP_C23_ATTR) && pparse_match_ch(pt, ']') && pparse_pair(_pc, pt) &&
-		    (pparse_pair(_pc, pt)->flags & PPARSE_TF_C23_ATTR)) {
-			pi = pparse_idx(_pc, pparse_pair(_pc, pt));
+		if ((flags & PPARSE_WB_JUMP_C23_ATTR) && pparse_match_ch(pt, ']') &&
+		    (pparse_pair_known(pt)->flags & PPARSE_TF_C23_ATTR)) {
+			pi = pparse_idx(_pc, pparse_pair_known(pt));
 			continue;
 		}
 
-		if (pparse_match_ch(pt, ')') && pparse_pair(_pc, pt) &&
+		if (pparse_match_ch(pt, ')') &&
 		    (flags & (PPARSE_WB_JUMP_ALL_PARENS | PPARSE_WB_JUMP_ATTR_PARENS))) {
-			uint32_t open_idx = pparse_idx(_pc, pparse_pair(_pc, pt));
+			uint32_t open_idx = pparse_idx(_pc, pparse_pair_known(pt));
 			if (flags & PPARSE_WB_JUMP_ALL_PARENS) {
 				pi = open_idx;
 				continue;
@@ -4019,8 +4008,8 @@ static bool pparse_expr_is_aggregate_value(PParseToken *start, PParseToken *end)
 	if (!start || start == end) return false;
 	PParseToken *t = start, *limit = end;
 	while (pparse_match_ch(t, '(')) {
-		PParseToken *close = pparse_pair(_pc, t);
-		if (!close || pparse_next(_pc, close) != limit) break;
+		PParseToken *close = pparse_pair_known(t);
+		if (pparse_next(_pc, close) != limit) break;
 		limit = close;
 		t = pparse_next(_pc, t);
 		if (!t || t == limit) return false;
@@ -4031,7 +4020,7 @@ static bool pparse_expr_is_aggregate_value(PParseToken *start, PParseToken *end)
 	}
 	if (t->kind == PPARSE_TK_IDENT) {
 		PParseToken *open = pparse_next(_pc, t);
-		PParseToken *close = open && pparse_match_ch(open, '(') ? pparse_pair(_pc, open) : NULL;
+		PParseToken *close = open && pparse_match_ch(open, '(') ? pparse_pair_known(open) : NULL;
 		if (close && pparse_next(_pc, close) == limit)
 			return pparse_function_symbol(t) == PPARSE_FS_AGGREGATE_RETURN;
 	}
@@ -4082,8 +4071,8 @@ static PParseToken *pparse_return_type_end_before_attrs(PParseToken *start, PPar
 		if ((t->tag & PPARSE_TT_ATTR) || pparse_is_c23_attr(t) || (t->flags & PPARSE_TF_MS_CC)) {
 			return pparse_skip_function_attrs_and_cc(t) == parsed_end ? t : parsed_end;
 		}
-		PParseToken *close = t->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, t) : NULL;
-		t = pparse_next(_pc, close ? close : t);
+		if (t->flags & PPARSE_TF_OPEN) t = pparse_pair_known(t);
+		t = pparse_next(_pc, t);
 	}
 	return parsed_end;
 }
@@ -4155,7 +4144,7 @@ static PParseFunctionReturn pparse_function_return(PParseToken *tok) {
 			}
 			return result;
 		}
-	} else if (pparse_next(_pc, inner) == pparse_pair(_pc, outer_open)) {
+	} else if (pparse_next(_pc, inner) == pparse_pair_known(outer_open)) {
 		PParseToken *params = pparse_next(_pc, pparse_next(_pc, inner));
 		if (params && pparse_match_ch(params, '(')) {
 			result.kind = is_void ? PPARSE_FUNC_RETURN_VOID : PPARSE_FUNC_RETURN_VALUE;
@@ -4227,9 +4216,9 @@ static void pparse_tag_brackets_in_range(PParseToken *open, PParseToken *close) 
 static void pparse_tag_postfix_chain_unevaluated(PParseToken *t) {
 	PPARSE_CTX();
 	while (t && t->kind != PPARSE_TK_EOF) {
-		if ((pparse_match_ch(t, '[') || pparse_match_ch(t, '(')) && (t->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {
+		if ((pparse_match_ch(t, '[') || pparse_match_ch(t, '(')) && (t->flags & PPARSE_TF_OPEN)) {
 			if (pparse_match_ch(t, '[')) pparse_ann(t) |= P1_UNEVAL_BRACKET;
-			PParseToken *close = pparse_pair(_pc, t);
+			PParseToken *close = pparse_pair_known(t);
 			pparse_tag_brackets_in_range(t, close);
 			t = pparse_next(_pc, close);
 			continue;
@@ -4253,14 +4242,14 @@ static PParseToken *pparse_mark_unevaluated_at(PParseToken *t) {
 	PPARSE_CTX();
 	PParseToken *open = pparse_next(_pc, t);
 	if (t->flags & PPARSE_TF_STATIC_ASSERT) {
-		if (!open || open->ch0 != '(' || !(open->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, open)) return NULL;
-		PParseToken *close = pparse_pair(_pc, open);
+		if (!open || open->ch0 != '(' || !(open->flags & PPARSE_TF_OPEN)) return NULL;
+		PParseToken *close = pparse_pair_known(open);
 		pparse_tag_brackets_in_range(open, close);
 		return close;
 	}
 	if (t->tag & PPARSE_TT_GENERIC) {
-		if (!open || open->ch0 != '(' || !(open->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, open)) return NULL;
-		PParseToken *close = pparse_pair(_pc, open), *u = pparse_next(_pc, open);
+		if (!open || open->ch0 != '(' || !(open->flags & PPARSE_TF_OPEN)) return NULL;
+		PParseToken *close = pparse_pair_known(open), *u = pparse_next(_pc, open);
 		for (int depth = 0; u != close && u->kind != PPARSE_TK_EOF; u = pparse_next(_pc, u)) {
 			if (u->ch0 == '[' && (u->flags & PPARSE_TF_OPEN)) pparse_ann(u) |= P1_UNEVAL_BRACKET;
 			if (u->flags & PPARSE_TF_OPEN) depth++;
@@ -4271,8 +4260,7 @@ static PParseToken *pparse_mark_unevaluated_at(PParseToken *t) {
 	}
 	if (!open) return NULL;
 	if (open->ch0 == '(' && (open->flags & PPARSE_TF_OPEN)) {
-		PParseToken *close = pparse_pair(_pc, open);
-		if (!close) return NULL;
+		PParseToken *close = pparse_pair_known(open);
 		pparse_tag_brackets_in_range(open, close);
 		pparse_tag_postfix_chain_unevaluated(pparse_next(_pc, close));
 		return close;
@@ -4295,8 +4283,8 @@ static PParseToken *pparse_bounds_peel_primary(PParseToken *last, bool nested) {
 	PPARSE_CTX();
 	PParseToken *t = last;
 	for (;;) {
-		if (!t || !pparse_match_ch(t, ')') || !pparse_pair(_pc, t)) return t;
-		PParseToken *open = pparse_pair(_pc, t);
+		if (!t || !pparse_match_ch(t, ')')) return t;
+		PParseToken *open = pparse_pair_known(t);
 		if (!nested && pparse_idx(_pc, open) >= 1) {
 			PParseToken *before = &pparse_token_pool[pparse_idx(_pc, open) - 1];
 			if (pparse_is_value_name_token(before) || before->kind == PPARSE_TK_NUM ||
@@ -4311,9 +4299,9 @@ static PParseToken *pparse_bounds_peel_primary(PParseToken *last, bool nested) {
 			return t;
 		}
 		/* Nested `((i))`: whole body is one paren group. */
-		if (nested && pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, inner) &&
-		    pparse_next(_pc, pparse_pair(_pc, inner)) == t) {
-			t = pparse_pair(_pc, inner);
+		if (nested && pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN) &&
+		    pparse_next(_pc, pparse_pair_known(inner)) == t) {
+			t = pparse_pair_known(inner);
 			continue;
 		}
 		return t;
@@ -4325,8 +4313,8 @@ static PParseToken *pparse_bounds_find_tracked_array(PParseToken *start, PParseT
 	PPARSE_FOR_RANGE(t, start, end) {
 		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '(') && pparse_idx(_pc, t) >= 1) {
 			PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, t) - 1];
-			if (pparse_is_unevaluated_operand_intro(prev) && pparse_pair(_pc, t)) {
-				t = pparse_pair(_pc, t);
+			if (pparse_is_unevaluated_operand_intro(prev)) {
+				t = pparse_pair_known(t);
 				continue;
 			}
 		}
@@ -4343,16 +4331,16 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 	PPARSE_FOR_RANGE(t, first, close) {
 		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '(') && pparse_idx(_pc, t) >= 1) {
 			PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, t) - 1];
-			if (pparse_is_unevaluated_operand_intro(prev) && pparse_pair(_pc, t)) {
-				t = pparse_pair(_pc, t);
+			if (pparse_is_unevaluated_operand_intro(prev)) {
+				t = pparse_pair_known(t);
 				continue;
 			}
 		}
 		if ((pparse_match_ch(t, '&') || pparse_match_ch(t, '*')) && !(t->flags & PPARSE_TF_OPEN)) {
 			PParseToken *next = pparse_next(_pc, t);
 			while (next && next != close && pparse_match_ch(next, '(') &&
-			       (next->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, next)) {
-				PParseToken *inner = pparse_next(_pc, next), *ic = pparse_pair(_pc, next);
+			       (next->flags & PPARSE_TF_OPEN)) {
+				PParseToken *inner = pparse_next(_pc, next), *ic = pparse_pair_known(next);
 				if (!inner || inner == close) break;
 				/* `(name)` -- bare, or `(name[...][...]...)` -- name with a
 				 * trailing subscript chain that fills the rest of this
@@ -4366,8 +4354,8 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 				if (pparse_is_value_name_token(inner)) {
 					PParseToken *after = pparse_next(_pc, inner);
 					while (after && after != ic && pparse_match_ch(after, '[') &&
-					       (after->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, after))
-						after = pparse_next(_pc, pparse_pair(_pc, after));
+					       (after->flags & PPARSE_TF_OPEN))
+						after = pparse_next(_pc, pparse_pair_known(after));
 					if (after == ic) {
 						next = inner;
 						break;
@@ -4386,9 +4374,9 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 
 static bool pparse_bounds_peel_redundant_parens(PParseToken **lhs, PParseToken **scan_end) {
 	PPARSE_CTX();
-	while (*lhs && pparse_match_ch(*lhs, '(') && ((*lhs)->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, *lhs)) {
-		PParseToken *inner_close = pparse_pair(_pc, *lhs);
-		if (!inner_close || pparse_next(_pc, inner_close) != *scan_end) break;
+	while (*lhs && pparse_match_ch(*lhs, '(') && ((*lhs)->flags & PPARSE_TF_OPEN)) {
+		PParseToken *inner_close = pparse_pair_known(*lhs);
+		if (pparse_next(_pc, inner_close) != *scan_end) break;
 		*lhs = pparse_next(_pc, *lhs);
 		*scan_end = inner_close;
 		if (!*lhs || *lhs == *scan_end) return false;
@@ -4416,8 +4404,8 @@ static bool pparse_bounds_span_has_array_arithmetic(PParseToken *lhs, PParseToke
 
 static bool pparse_bounds_paren_has_array_arithmetic(PParseToken *open) {
 	PPARSE_CTX();
-	if (!open || !pparse_match_ch(open, '(') || !(open->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, open)) return false;
-	PParseToken *scan_end = pparse_pair(_pc, open);
+	if (!open || !pparse_match_ch(open, '(') || !(open->flags & PPARSE_TF_OPEN)) return false;
+	PParseToken *scan_end = pparse_pair_known(open);
 	PParseToken *lhs = pparse_next(_pc, open);
 	if (!pparse_bounds_peel_redundant_parens(&lhs, &scan_end)) return false;
 	return pparse_bounds_span_has_array_arithmetic(lhs, scan_end);
@@ -4444,7 +4432,7 @@ static bool pparse_bounds_deref_add_is_unverifiable(PParseToken *tok) {
 			return false;
 		if (pparse_match_ch(prev, ']')) return false;
 		if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE)) {
-			PParseToken *popen = pparse_pair(_pc, prev);
+			PParseToken *popen = pparse_pair_known(prev);
 			/* A control statement's condition close (`if (c) *(a+i) = 0;`)
 			 * is not a value: the `)` ends `if (c)`, not an operand of `*`.
 			 * Treating it like one let this exact pattern silently skip the
@@ -4455,23 +4443,23 @@ static bool pparse_bounds_deref_add_is_unverifiable(PParseToken *tok) {
 	}
 
 	PParseToken *op = pparse_next(_pc, tok);
-	if (!op || !pparse_match_ch(op, '(') || !(op->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, op)) return false;
+	if (!op || !pparse_match_ch(op, '(') || !(op->flags & PPARSE_TF_OPEN)) return false;
 	while (pparse_bounds_group_is_cast(op)) {
-		PParseToken *after = pparse_next(_pc, pparse_pair(_pc, op));
-		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, after))
+		PParseToken *after = pparse_next(_pc, pparse_pair_known(op));
+		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN))
 			return false;
 		op = after;
 	}
-	PParseToken *scan_end = pparse_pair(_pc, op);
+	PParseToken *scan_end = pparse_pair_known(op);
 	PParseToken *lhs = pparse_next(_pc, op);
 	if (!pparse_bounds_peel_redundant_parens(&lhs, &scan_end)) return false;
-	while (lhs && pparse_match_ch(lhs, '(') && (lhs->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, lhs) &&
+	while (lhs && pparse_match_ch(lhs, '(') && (lhs->flags & PPARSE_TF_OPEN) &&
 	       pparse_bounds_group_is_cast(lhs)) {
-		PParseToken *after = pparse_next(_pc, pparse_pair(_pc, lhs));
-		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, after))
+		PParseToken *after = pparse_next(_pc, pparse_pair_known(lhs));
+		if (!after || !pparse_match_ch(after, '(') || !(after->flags & PPARSE_TF_OPEN))
 			return false;
-		PParseToken *add_close = pparse_pair(_pc, after);
-		if (!add_close || pparse_next(_pc, add_close) != scan_end) break;
+		PParseToken *add_close = pparse_pair_known(after);
+		if (pparse_next(_pc, add_close) != scan_end) break;
 		lhs = pparse_next(_pc, after);
 		scan_end = add_close;
 		if (!lhs || lhs == scan_end) return false;
@@ -4490,8 +4478,7 @@ static PParseToken *pparse_ctrl_condition_kw_before_paren(PParseToken *open) {
 static bool pparse_close_brace_ends_sue_body(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!tok || !pparse_match_ch(tok, '}')) return false;
-	PParseToken *open = pparse_pair(_pc, tok);
-	if (!open) return false;
+	PParseToken *open = pparse_pair_known(tok);
 	for (uint32_t ti = pparse_idx(_pc, open); ti > 1;) {
 		PParseToken *t = &pparse_token_pool[ti - 1];
 		if (t->kind == PPARSE_TK_PREP_DIR) {
@@ -4499,7 +4486,7 @@ static bool pparse_close_brace_ends_sue_body(PParseToken *tok) {
 			continue;
 		}
 		PParseToken *group_open = (pparse_match_ch(t, ']') || pparse_match_ch(t, ')'))
-						 ? pparse_pair(_pc, t)
+						 ? pparse_pair_known(t)
 						 : NULL;
 		if (group_open && pparse_match_ch(t, ']') && (group_open->flags & PPARSE_TF_C23_ATTR)) {
 			ti = pparse_idx(_pc, group_open);
@@ -4546,8 +4533,7 @@ static inline bool pparse_raw_token_is_sue_tag_name(PParseToken *tok) {
 static bool pparse_close_paren_ends_cast_type_name(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!tok || !pparse_match_ch(tok, ')')) return false;
-	PParseToken *open = pparse_pair(_pc, tok);
-	if (!open) return false;
+	PParseToken *open = pparse_pair_known(tok);
 	PParseToken *before_open = pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE);
 	if (before_open &&
 	    (pparse_is_sizeof_like(before_open) || (before_open->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_ALIGNAS | PPARSE_TT_BITINT))))
@@ -4563,7 +4549,7 @@ static bool pparse_close_paren_ends_cast_type_name(PParseToken *tok) {
 			t = pparse_next(_pc, t);
 			continue;
 		}
-		PParseToken *close = pparse_match_ch(t, '(') || pparse_match_ch(t, '[') ? pparse_pair(_pc, t) : NULL;
+		PParseToken *close = pparse_match_ch(t, '(') || pparse_match_ch(t, '[') ? pparse_pair_known(t) : NULL;
 		if (close) {
 			t = pparse_next(_pc, close);
 			continue;
@@ -4652,7 +4638,7 @@ static bool pparse_bounds_tok_ends_value(PParseToken *pp) {
 	if (pparse_match_ch(pp, ']') || pparse_match_ch(pp, '}')) return true;
 	if (pparse_equal(pp, "++") || pparse_equal(pp, "--")) return true;
 	if (pparse_match_ch(pp, ')') && !pparse_close_paren_ends_cast_type_name(pp) &&
-	    !pparse_ctrl_condition_kw_before_paren(pparse_pair(_pc, pp)))
+	    !pparse_ctrl_condition_kw_before_paren(pparse_pair_known(pp)))
 		return true;
 	return false;
 }
@@ -4662,38 +4648,31 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					 PParseBoundsPlan *out) {
 	PPARSE_CTX();
 	if (!pparse_feat(PPARSE_F_BOUNDS_CHECK)) return false;
-	if (!pparse_match_ch(tok, '[') || !(tok->flags & PPARSE_TF_OPEN) || !pparse_pair(_pc, tok)) return false;
+	if (!pparse_match_ch(tok, '[') || !(tok->flags & PPARSE_TF_OPEN)) return false;
+	PParseToken *rb = pparse_pair_known(tok);
 	if (tok->flags & PPARSE_TF_C23_ATTR) return false;
 	if (pparse_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return false;
 	{
 		PParseToken *idx0 = pparse_next(_pc, tok);
-		if (idx0 && idx0->kind == PPARSE_TK_IDENT && idx0->len == 12 &&
+		if (idx0->kind == PPARSE_TK_IDENT && idx0->len == 12 &&
 		    prism_memeq_static(pparse_loc(_pc, idx0), "__prism_bchk", 12))
 			return false;
 	}
 	if (!last_emitted) return false;
 	uint32_t ti = pparse_idx(_pc, tok);
 	PParseToken *rp_prev = (ti >= 1) ? &pparse_token_pool[ti - 1] : NULL;
-	if (rp_prev) {
+	if (rp_prev && pparse_match_ch(rp_prev, ')')) {
 		PParseToken *rp = rp_prev;
-		if (pparse_match_ch(rp, ')') && (rp->flags & PPARSE_TF_CLOSE) && pparse_pair(_pc, rp)) {
-			PParseToken *op = pparse_pair(_pc, rp);
+		PParseToken *op = pparse_pair_known(rp);
+		{
 			if (pparse_bounds_span_derives_array(pparse_next(_pc, op), rp))
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_DERIVED_SUB);
 			if (pparse_bounds_paren_has_array_arithmetic(op))
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
-		}
-	}
-
-	if (rp_prev) {
-		PParseToken *rp = rp_prev;
-		if (pparse_match_ch(rp, ')') && pparse_pair(_pc, rp)) {
-			PParseToken *op = pparse_pair(_pc, rp);
 			PParseToken *idx = pparse_next(_pc, op);
 			if (pparse_is_value_name_token(idx) && pparse_next(_pc, idx) == rp) {
-				PParseToken *rb_close = pparse_pair(_pc, tok);
 				PParseToken *inner = pparse_next(_pc, tok);
-				if (rb_close && inner && pparse_next(_pc, inner) == rb_close &&
+				if (pparse_next(_pc, inner) == rb &&
 				    pparse_bounds_is_tracked_array(inner) && !pparse_bounds_is_tracked_array(idx))
 					PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_IDX_ARR);
 			}
@@ -4701,22 +4680,20 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	}
 
 	{
-		PParseToken *rb_close = pparse_pair(_pc, tok);
 		PParseToken *inner_first = pparse_next(_pc, tok);
-		if (inner_first && rb_close && pparse_bounds_span_derives_array(inner_first, rb_close))
+		if (pparse_bounds_span_derives_array(inner_first, rb))
 			PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_DERIVED);
 	}
 
 	bool comma_resolved = false;
 	{
-		PParseToken *close_scan = pparse_pair(_pc, tok);
 		PParseToken *inner = pparse_next(_pc, tok);
-		PParseToken *iclose = close_scan;
+		PParseToken *iclose = rb;
 		if (pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN)) {
-			PParseToken *pclose = pparse_pair(_pc, inner);
-			if (pclose) {
+			PParseToken *pclose = pparse_pair_known(inner);
+			{
 				PParseToken *lastop = pparse_last_comma_operand(inner, pclose);
-				if (lastop && lastop != pparse_next(_pc, inner) && pparse_next(_pc, lastop) == pclose) {
+				if (lastop != pparse_next(_pc, inner) && pparse_next(_pc, lastop) == pclose) {
 					inner = lastop;
 					iclose = pclose;
 					if (pparse_bounds_is_tracked_array(lastop)) comma_resolved = true;
@@ -4729,8 +4706,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			    (pparse_token_pool[pparse_idx(_pc, last_emitted) - 1].tag & PPARSE_TT_MEMBER);
 			if (!le_is_member) {
 				while (inner != iclose && pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN) &&
-				       pparse_pair(_pc, inner) && pparse_next(_pc, pparse_pair(_pc, inner)) == iclose) {
-					iclose = pparse_pair(_pc, inner);
+				       pparse_next(_pc, pparse_pair_known(inner)) == iclose) {
+					iclose = pparse_pair_known(inner);
 					inner = pparse_next(_pc, inner);
 				}
 				if (inner != iclose && pparse_next(_pc, inner) == iclose &&
@@ -4748,10 +4725,9 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	}
 	if (comma_resolved) PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_COMMA_OP);
 	{
-		PParseToken *rb = pparse_pair(_pc, tok);
 		PParseToken *le = pparse_bounds_peel_primary(last_emitted, true);
-		if (rb && (pparse_is_value_name_token(le) || le->kind == PPARSE_TK_NUM ||
-			   last_emitted->kind == PPARSE_TK_NUM)) {
+		if (pparse_is_value_name_token(le) || le->kind == PPARSE_TK_NUM ||
+		    last_emitted->kind == PPARSE_TK_NUM) {
 			bool memb = pparse_idx(_pc, le) >= 1 &&
 				    (pparse_token_pool[pparse_idx(_pc, le) - 1].tag & PPARSE_TT_MEMBER);
 			bool left_ok_scan = !memb && le->kind != PPARSE_TK_NUM && !pparse_is_known_typedef(le) &&
@@ -4759,20 +4735,20 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			PParseToken *hit = left_ok_scan ? NULL : pparse_bounds_find_tracked_array(pparse_next(_pc, tok), rb);
 			while (hit) {
 				PParseToken *nx = pparse_next(_pc, hit);
-				if (!(nx && pparse_match_ch(nx, '[') && (nx->flags & PPARSE_TF_OPEN))) break;
+				if (!(pparse_match_ch(nx, '[') && (nx->flags & PPARSE_TF_OPEN))) break;
 				hit = pparse_bounds_find_tracked_array(pparse_next(_pc, nx), rb);
 			}
 			if (hit) PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_COMM_SCAN);
 			PParseToken *inner0 = pparse_next(_pc, tok);
-			if (!left_ok_scan && inner0 && pparse_match_ch(inner0, '(') && (inner0->flags & PPARSE_TF_OPEN) &&
-			    pparse_pair(_pc, inner0) && pparse_next(_pc, pparse_pair(_pc, inner0)) == rb &&
+			if (!left_ok_scan && pparse_match_ch(inner0, '(') && (inner0->flags & PPARSE_TF_OPEN) &&
+			    pparse_next(_pc, pparse_pair_known(inner0)) == rb &&
 			    pparse_bounds_paren_has_array_arithmetic(inner0))
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
 		}
 	}
 	PParseToken *name_tok = last_emitted;
-	if (pparse_idx(_pc, tok) >= 1) {
-		PParseToken *pool_prev = &pparse_token_pool[pparse_idx(_pc, tok) - 1];
+	if (ti >= 1) {
+		PParseToken *pool_prev = &pparse_token_pool[ti - 1];
 		if (pool_prev != last_emitted &&
 		    (pparse_match_ch(pool_prev, ']') || pparse_match_ch(pool_prev, ')') ||
 		     pparse_is_value_name_token(pool_prev)))
@@ -4780,8 +4756,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	}
 	int dim_depth = 0;
 	while (1) {
-		if (pparse_match_ch(name_tok, ')') && pparse_pair(_pc, name_tok)) {
-			PParseToken *open = pparse_pair(_pc, name_tok);
+		if (pparse_match_ch(name_tok, ')')) {
+			PParseToken *open = pparse_pair_known(name_tok);
 			if (pparse_idx(_pc, open) >= 1) {
 				PParseToken *bp = &pparse_token_pool[pparse_idx(_pc, open) - 1];
 				if (pparse_is_value_name_token(bp) || bp->kind == PPARSE_TK_NUM ||
@@ -4789,14 +4765,13 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					break;
 			}
 			PParseToken *inner = pparse_next(_pc, open);
-			if (!inner) break;
 			if (pparse_is_value_name_token(inner) && pparse_next(_pc, inner) == name_tok) {
 				name_tok = inner;
 				break;
 			}
-			if (pparse_match_ch(inner, '(') && pparse_pair(_pc, inner) &&
-			    pparse_next(_pc, pparse_pair(_pc, inner)) == name_tok) {
-				name_tok = pparse_pair(_pc, inner);
+			if (pparse_match_ch(inner, '(') &&
+			    pparse_next(_pc, pparse_pair_known(inner)) == name_tok) {
+				name_tok = pparse_pair_known(inner);
 				continue;
 			}
 			if (pparse_idx(_pc, name_tok) >= 1) {
@@ -4808,8 +4783,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			}
 			break;
 		}
-		if (pparse_match_ch(name_tok, ']') && pparse_pair(_pc, name_tok)) {
-			PParseToken *open_br = pparse_pair(_pc, name_tok);
+		if (pparse_match_ch(name_tok, ']')) {
+			PParseToken *open_br = pparse_pair_known(name_tok);
 			if (pparse_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) break;
 			if (open_br->flags & PPARSE_TF_C23_ATTR) break;
 			if (pparse_idx(_pc, open_br) < 1) break;
@@ -4823,10 +4798,10 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		}
 		break;
 	}
-	if (!pparse_is_value_name_token(name_tok) && last_emitted) {
+	if (!pparse_is_value_name_token(name_tok)) {
 		PParseToken *probe = last_emitted;
-		while (probe && pparse_match_ch(probe, ')') && pparse_pair(_pc, probe)) {
-			PParseToken *op = pparse_pair(_pc, probe);
+		while (probe && pparse_match_ch(probe, ')')) {
+			PParseToken *op = pparse_pair_known(probe);
 			if (pparse_bounds_paren_has_array_arithmetic(op))
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
 			PParseToken *hit = pparse_bounds_find_tracked_array(pparse_next(_pc, op), probe);
@@ -4840,11 +4815,10 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	}
 	if (!pparse_is_value_name_token(name_tok)) return false;
 	if (pparse_is_known_typedef(name_tok)) return false;
-	if (pparse_idx(_pc, name_tok) >= 1 &&
-	    (pparse_token_pool[pparse_idx(_pc, name_tok) - 1].tag & PPARSE_TT_MEMBER))
-		return false;
-	if (pparse_idx(_pc, name_tok) >= 1) {
-		PParseToken *pv = &pparse_token_pool[pparse_idx(_pc, name_tok) - 1];
+	uint32_t name_idx = pparse_idx(_pc, name_tok);
+	if (name_idx >= 1) {
+		PParseToken *pv = &pparse_token_pool[name_idx - 1];
+		if (pv->tag & PPARSE_TT_MEMBER) return false;
 		if (pv->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) return false;
 		if (pparse_match_ch(pv, '*') && !(pv->flags & PPARSE_TF_OPEN) && pparse_idx(_pc, pv) >= 1) {
 			PParseToken *pp = &pparse_token_pool[pparse_idx(_pc, pv) - 1];
@@ -4854,23 +4828,20 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			    (pparse_match_ch(pp, '(') && (pp->flags & PPARSE_TF_OPEN));
 			if (is_decl_star) return false;
 		}
-	}
-	PParseArrayBindingInfo array = pparse_array_binding_info(name_tok);
-	if (!array.tracked) return false;
-	if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return false;
-	if (pparse_idx(_pc, name_tok) >= 1) {
+		PParseArrayBindingInfo array = pparse_array_binding_info(name_tok);
+		if (!array.tracked) return false;
+		if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return false;
 		PParseToken *operand_start = name_tok;
 		/* Include this subscript in the operand span.  Otherwise `&(a[i])`
 		 * cannot peel the parentheses: the close follows `]`, not the bare
 		 * name token, and the address-of suppression is lost even though it
 		 * is semantically identical to `&a[i]` (including a valid one-past
 		 * address at i == length). */
-		PParseToken *operand_end = pparse_pair(_pc, tok);
-		if (!operand_end) operand_end = name_tok;
-		PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, operand_start) - 1];
-		while (pparse_match_ch(prev, '(') && (prev->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, prev)) {
-			PParseToken *rp = pparse_pair(_pc, prev);
-			if (!rp || pparse_next(_pc, prev) != operand_start || pparse_next(_pc, operand_end) != rp) break;
+		PParseToken *operand_end = rb;
+		PParseToken *prev = &pparse_token_pool[name_idx - 1];
+		while (pparse_match_ch(prev, '(') && (prev->flags & PPARSE_TF_OPEN)) {
+			PParseToken *rp = pparse_pair_known(prev);
+			if (pparse_next(_pc, prev) != operand_start || pparse_next(_pc, operand_end) != rp) break;
 			operand_start = prev;
 			operand_end = rp;
 			if (pparse_idx(_pc, prev) < 1) {
@@ -4916,11 +4887,11 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 				 * of pointer arithmetic and the `*` dereferences the sum, so
 				 * treating it as a cancelled `&` would wrap a subscript that
 				 * must stay bare under -fno-safety. */
-				PParseToken *expect = pparse_next(_pc, pparse_pair(_pc, tok));
+				PParseToken *expect = pparse_next(_pc, rb);
 				for (int peel = 0; peel < 8 && pparse_match_ch(deref, '(') &&
-						   (deref->flags & PPARSE_TF_OPEN) && pparse_idx(_pc, deref) >= 1;
+					   (deref->flags & PPARSE_TF_OPEN) && pparse_idx(_pc, deref) >= 1;
 				     peel++) {
-					PParseToken *rp = pparse_pair(_pc, deref);
+					PParseToken *rp = pparse_pair_known(deref);
 					if (rp != expect) break;
 					expect = pparse_next(_pc, rp);
 					deref = &pparse_token_pool[pparse_idx(_pc, deref) - 1];
@@ -4935,6 +4906,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			}
 			if (unary) return false;
 		}
+	} else {
+		return false;
 	}
 
 	PParseToken *cast_close = NULL; /* ')' of outermost (T *) / (T(*)[N]) */
@@ -4942,8 +4915,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		PParseToken *probe = name_tok;
 		for (int peel = 0; peel < 8 && pparse_idx(_pc, probe) >= 1; peel++) {
 			PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, probe) - 1];
-			if (pparse_match_ch(prev, ')') && pparse_pair(_pc, prev)) {
-				PParseToken *open = pparse_pair(_pc, prev);
+			if (pparse_match_ch(prev, ')')) {
+				PParseToken *open = pparse_pair_known(prev);
 				PParseToken *last =
 				    pparse_idx(_pc, prev) >= 1 ? &pparse_token_pool[pparse_idx(_pc, prev) - 1] : NULL;
 				if (last && (pparse_match_ch(last, '*') || pparse_match_ch(last, ']'))) {
@@ -4968,7 +4941,7 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		}
 	}
 	out->arr = name_tok;
-	out->close = pparse_pair(_pc, tok);
+	out->close = rb;
 	out->cast_close = cast_close;
 	out->dim_depth = dim_depth;
 	return true;
@@ -4987,8 +4960,7 @@ static inline bool pparse_cached_bounds_plan(PParseToken *tok, PParseBoundsPlan 
 static bool pparse_close_paren_ends_type_specifier_ctor(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!tok || !pparse_match_ch(tok, ')')) return false;
-	PParseToken *open = pparse_pair(_pc, tok);
-	if (!open) return false;
+	PParseToken *open = pparse_pair_known(tok);
 	PParseToken *before_open = pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE);
 	if (!before_open) return false;
 	if (before_open->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS)) return true;
@@ -5019,8 +4991,7 @@ static inline bool pparse_is_array_bracket_predecessor(PParseToken *t) {
 		return b && (b->tag & PPARSE_TT_SUE);
 	}
 	if (pparse_match_ch(t, ']')) {
-		PParseToken *open = pparse_pair(_pc, t);
-		if (!open) return true;
+		PParseToken *open = pparse_pair_known(t);
 		PParseToken *before_open = pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE);
 		if (!before_open) return true;
 		if (pparse_decl_paren_predecessor_is_type(before_open)) return true;
@@ -5028,8 +4999,7 @@ static inline bool pparse_is_array_bracket_predecessor(PParseToken *t) {
 		return false;
 	}
 	if (pparse_match_ch(t, ')')) {
-		PParseToken *open = pparse_pair(_pc, t);
-		if (!open) return true; // no match info — conservatively assume type
+		PParseToken *open = pparse_pair_known(t);
 		PParseToken *before_open = pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE);
 		if (!before_open) return true;
 		return pparse_decl_paren_predecessor_is_type(before_open);
@@ -5040,8 +5010,7 @@ static inline bool pparse_is_array_bracket_predecessor(PParseToken *t) {
 static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) {
 	PPARSE_CTX();
 	if (depth > 256) pparse_error_tok(open_bracket, "array dimension nesting depth exceeds 256");
-	PParseToken *close = pparse_pair(_pc, open_bracket);
-	if (!close) return false;
+	PParseToken *close = pparse_pair_known(open_bracket);
 	PParseToken *tok = pparse_next(_pc, open_bracket);
 	while (tok != close) {
 		if (pparse_match_ch(tok, '[')) {
@@ -5049,7 +5018,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 			tok = pparse_skip_balanced_group(tok);
 			continue;
 		}
-		if (pparse_match_ch(tok, '(') && pparse_next(_pc, tok) && pparse_match_ch(pparse_next(_pc, tok), '{')) return true;
+		if (pparse_match_ch(tok, '(') && pparse_match_ch(pparse_next(_pc, tok), '{')) return true;
 		if (tok->tag & PPARSE_TT_GENERIC) return true;
 		pparse_SKIP_NOISE_CONTINUE(tok);
 		if (pparse_is_sizeof_like(tok)) {
@@ -5059,7 +5028,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 				PParseToken *end = pparse_skip_balanced_group(tok);
 				if (is_sizeof) {
 					PParseToken *prev_inner = tok;
-					for (PParseToken *inner = pparse_next(_pc, tok); inner && inner != end;
+					for (PParseToken *inner = pparse_next(_pc, tok); inner != end;
 					     prev_inner = inner, inner = pparse_next(_pc, inner)) {
 						if (pparse_is_enum_kw(inner)) {
 							PParseToken *brace = pparse_find_struct_body_brace(inner);
@@ -5078,7 +5047,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 						if (vla_fl & PPARSE_TDF_VLA) {
 							if (!(vla_fl & PPARSE_TDF_PARAM)) {
 								PParseToken *la = pparse_skip_noise(_pc, pparse_next(_pc, inner));
-								if (la && la != end && pparse_match_ch(la, ')'))
+								if (la != end && pparse_match_ch(la, ')'))
 									return true;
 							}
 							PParseToken *ni = pparse_next(_pc, inner);
@@ -5088,7 +5057,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 							while (eff_prev->ch0 == '(' && pi > pparse_idx(_pc, tok) + 1)
 								eff_prev = &pparse_token_pool[--pi];
 							PParseToken *eff_next = ni;
-							while (has_next && eff_next && eff_next->ch0 == ')' &&
+							while (has_next && eff_next->ch0 == ')' &&
 							       eff_next != end) {
 								eff_next = pparse_next(_pc, eff_next);
 								has_next = eff_next && eff_next != end;
@@ -5110,23 +5079,22 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 						    pparse_is_array_bracket_predecessor(prev_inner)) {
 							if (pparse_array_size_is_vla_impl(inner, depth + 1))
 								return true;
-							inner = pparse_pair(_pc, inner);
-							if (!inner || inner == end) break;
+							inner = pparse_pair_known(inner);
+							if (inner == end) break;
 							continue;
 						}
 						if (pparse_is_valid_varname(inner) && !pparse_is_type_keyword(inner) &&
 						    !pparse_is_known_typedef(inner) && !pparse_is_known_enum_const(inner) &&
-						    pparse_next(_pc, inner) && inner != end &&
-						    pparse_match_ch(pparse_next(_pc, inner), '(')) {
-							PParseToken *call_end =
-							    pparse_skip_balanced_group(pparse_next(_pc, inner));
+						    inner != end && pparse_match_ch(pparse_next(_pc, inner), '(')) {
+							PParseToken *call_open = pparse_next(_pc, inner);
+							PParseToken *call_end = pparse_skip_balanced_group(call_open);
 							bool is_deref = (pparse_match_ch(prev_inner, '*')) ||
-									(call_end && call_end != end &&
+									(call_end != end &&
 									 ((pparse_match_ch(call_end, '[')) ||
 									  (call_end->tag & PPARSE_TT_MEMBER)));
 							if (is_deref)
-								for (PParseToken *a = pparse_next(_pc, pparse_next(_pc, inner));
-								     a && a != call_end;
+								for (PParseToken *a = pparse_next(_pc, call_open);
+								     a != call_end;
 								     a = pparse_next(_pc, a))
 									if (pparse_is_valid_varname(a) &&
 									    !pparse_is_known_enum_const(a) &&
@@ -5134,7 +5102,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 										return true;
 							prev_inner = inner;
 							inner = call_end;
-							if (!inner || inner == end) break;
+							if (inner == end) break;
 						}
 					}
 				}
@@ -5155,11 +5123,9 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 				}
 				if (tok != close) {
 					if (tok->flags & PPARSE_TF_OPEN) {
-						PParseToken *m = pparse_pair(_pc, tok);
-						if (m) tok = pparse_next(_pc, m);
+						tok = pparse_next(_pc, pparse_pair_known(tok));
 						if (tok != close && pparse_match_ch(tok, '{')) {
-							m = pparse_pair(_pc, tok);
-							if (m) tok = pparse_next(_pc, m);
+							tok = pparse_next(_pc, pparse_pair_known(tok));
 						}
 					} else {
 						if (pparse_is_identifier_like(tok) && pparse_is_vla_typedef(tok))
@@ -5172,9 +5138,7 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 						tok = pparse_next(_pc, tok);
 						if (tok != close) tok = pparse_next(_pc, tok);
 					} else if (tok->flags & PPARSE_TF_OPEN) {
-						PParseToken *m = pparse_pair(_pc, tok);
-						if (!m) break;
-						tok = pparse_next(_pc, m);
+						tok = pparse_next(_pc, pparse_pair_known(tok));
 					} else
 						break;
 				}
@@ -5217,7 +5181,7 @@ static PParseToken *pparse_declarator_array_dims(PParseToken *tok, PParseDecl *d
 				tok = pparse_skip_balanced_group(tok);
 				continue;
 			}
-			PParseToken *close = pparse_pair(_pc, tok), *first = pparse_next(_pc, tok);
+			PParseToken *close = pparse_pair_known(tok), *first = pparse_next(_pc, tok);
 			PParseToken *inner = pparse_skip_noise(_pc, first);
 			if (close && (!inner || inner == close ||
 				      (inner->kind == PPARSE_TK_NUM && inner->len == 1 && inner->ch0 == '0' &&
@@ -5406,8 +5370,7 @@ static unsigned pparse_struct_body_field_traits(PParseToken *id, PParseToken *pr
 static unsigned pparse_struct_body_traits(PParseToken *brace) {
 	PPARSE_CTX();
 	if (!brace || !pparse_match_ch(brace, '{')) return 0;
-	PParseToken *end = pparse_pair(_pc, brace);
-	if (!end) return 0;
+	PParseToken *end = pparse_pair_known(brace);
 	unsigned traits = 0;
 	PParseToken *prev = brace;
 	for (PParseToken *t = pparse_next(_pc, brace); t && t != end; prev = t, t = pparse_next(_pc, t)) {
@@ -5415,13 +5378,13 @@ static unsigned pparse_struct_body_traits(PParseToken *brace) {
 			traits |= pparse_struct_body_traits(t);
 			if (traits == (PPARSE_SBT_VLA | PPARSE_SBT_VOL)) return traits;
 			prev = t;
-			t = pparse_pair(_pc, t);
+			t = pparse_pair_known(t);
 			continue;
 		}
 		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '[')) {
 			if (pparse_array_size_is_vla(t)) traits |= PPARSE_SBT_VLA;
 			prev = t;
-			t = pparse_pair(_pc, t);
+			t = pparse_pair_known(t);
 			continue;
 		}
 		// Don't skip typeof()/_Atomic() parens — VLA dims / volatile hide inside.
@@ -5429,7 +5392,7 @@ static unsigned pparse_struct_body_traits(PParseToken *brace) {
 		    !(prev && ((prev->tag & PPARSE_TT_TYPEOF) ||
 			       ((prev->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) == (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE))))) {
 			prev = t;
-			t = pparse_pair(_pc, t);
+			t = pparse_pair_known(t);
 			continue;
 		}
 		if (t->tag & PPARSE_TT_VOLATILE) traits |= PPARSE_SBT_VOL;
@@ -5464,8 +5427,8 @@ static bool pparse_comma_starts_declarator(PParseToken *tok) {
 // not an array-of-VLA object — must not set PParseTypeSpec.is_vla / is_array.
 static bool pparse_abstract_declarator_paren_is_pointer_only(PParseToken *open_paren) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open_paren);
-	if (!close || !(pparse_match_ch(open_paren, '('))) return false;
+	if (!pparse_match_ch(open_paren, '(')) return false;
+	PParseToken *close = pparse_pair_known(open_paren);
 	for (PParseToken *x = pparse_next(_pc, open_paren); x && x != close;) {
 		x = pparse_skip_noise(_pc, x);
 		if (!x || x == close) break;
@@ -5478,17 +5441,15 @@ static bool pparse_abstract_declarator_paren_is_pointer_only(PParseToken *open_p
 			continue;
 		}
 		if (pparse_match_ch(x, '(') && (x->flags & PPARSE_TF_OPEN)) {
-			PParseToken *inner_close = pparse_pair(_pc, x);
-			if (!inner_close) return false;
+			PParseToken *inner_close = pparse_pair_known(x);
 			if (!pparse_abstract_declarator_paren_is_pointer_only(x)) return false;
 			x = pparse_next(_pc, inner_close);
 			continue;
 		}
 		if (pparse_is_identifier_like(x) && x->kind == PPARSE_TK_IDENT) {
 			x = pparse_next(_pc, x);
-			while (x != close && pparse_match_ch(x, '[') && (x->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, x)) {
-				PParseToken *rb = pparse_pair(_pc, x);
-				if (!rb) return false;
+			while (x != close && pparse_match_ch(x, '[') && (x->flags & PPARSE_TF_OPEN)) {
+				PParseToken *rb = pparse_pair_known(x);
 				x = pparse_next(_pc, rb);
 			}
 			continue;
@@ -5499,10 +5460,8 @@ static bool pparse_abstract_declarator_paren_is_pointer_only(PParseToken *open_p
 }
 
 static bool pparse_array_bracket_closes_ptr_to_array(PParseToken *open_bracket, PParseToken *prev) {
-	PPARSE_CTX();
 	if (!open_bracket || !prev || prev->len != 1 || prev->ch0 != ')') return false;
-	PParseToken *open = pparse_pair(_pc, prev);
-	return open && pparse_abstract_declarator_paren_is_pointer_only(open);
+	return pparse_abstract_declarator_paren_is_pointer_only(pparse_pair_known(prev));
 }
 
 static void pparse_scan_type_constructor(PParseToken *start,
@@ -5523,29 +5482,30 @@ static void pparse_scan_type_constructor(PParseToken *start,
 		 * memset path and reject otherwise valid code. */
 		if (copy_quals && pparse_is_sizeof_like(t)) {
 			PParseToken *op = pparse_skip_noise(_pc, pparse_next(_pc, t));
-			if (op && pparse_match_ch(op, '(') && pparse_pair(_pc, op)) {
-				t = pparse_pair(_pc, op);
+			if (pparse_match_ch(op, '(')) {
+				t = pparse_pair_known(op);
 				continue;
 			}
 		}
 		PParseToken *attr_open = (t->tag & PPARSE_TT_ATTR) ? pparse_next(_pc, t) : NULL;
 		PParseToken *attr_close = attr_open && pparse_match_ch(attr_open, '(')
-					   ? pparse_pair(_pc, attr_open)
+					   ? pparse_pair_known(attr_open)
 					   : NULL;
 		if (attr_close) {
 			t = attr_close;
 			continue;
 		}
-		if (pparse_is_c23_attr(t) && pparse_pair(_pc, t)) {
+		if (pparse_is_c23_attr(t)) {
 			prev = t;
-			t = pparse_pair(_pc, t);
+			t = pparse_pair_known(t);
 			continue;
 		}
 		if (t->tag & (PPARSE_TT_GOTO | PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE)) {
 			SAFETY_DIAG2(t, PPARSE_ERR_CTRL_IN_TYPE_SPEC, PPARSE_ERR_CTRL_IN_TYPE_SPEC_HARD);
-		} else if ((t->tag & PPARSE_TT_DEFER) && !pparse_typedef_lookup(_pc, t) && pparse_next(_pc, t) &&
-			   (pparse_match_ch(pparse_next(_pc, t), '{') || pparse_is_identifier_like(pparse_next(_pc, t)))) {
-			SAFETY_DIAG2(t, PPARSE_ERR_CTRL_IN_TYPE_SPEC, PPARSE_ERR_CTRL_IN_TYPE_SPEC_HARD);
+		} else if ((t->tag & PPARSE_TT_DEFER) && !pparse_typedef_lookup(_pc, t)) {
+			PParseToken *next = pparse_next(_pc, t);
+			if (pparse_match_ch(next, '{') || pparse_is_identifier_like(next))
+				SAFETY_DIAG2(t, PPARSE_ERR_CTRL_IN_TYPE_SPEC, PPARSE_ERR_CTRL_IN_TYPE_SPEC_HARD);
 		}
 		if (check_typeof && (t->tag & PPARSE_TT_TYPEOF)) r->has_typeof = true;
 
@@ -5553,20 +5513,24 @@ static void pparse_scan_type_constructor(PParseToken *start,
 			PParseToken *brace = pparse_find_struct_body_brace(t);
 			if (brace) {
 				unsigned traits = pparse_struct_body_traits(brace);
-				if (traits & PPARSE_SBT_VLA) r->is_vla = r->type_vm = true;
-				if (traits & PPARSE_SBT_VOL) r->has_volatile_member = true;
+				bool has_vla = (traits & PPARSE_SBT_VLA) != 0;
+				r->is_vla |= has_vla;
+				r->type_vm |= has_vla;
+				r->has_volatile_member |= (traits & PPARSE_SBT_VOL) != 0;
 				pparse_enum_constants(brace, 0);
 				prev = brace;
-				t = pparse_pair(_pc, brace);
+				t = pparse_pair_known(brace);
 				saw_sue = false;
 				continue;
 			}
 		}
 		if (pparse_match_ch(t, '{') && saw_sue) {
 			unsigned traits = pparse_struct_body_traits(t);
-			if (traits & PPARSE_SBT_VLA) r->is_vla = r->type_vm = true;
-			if (traits & PPARSE_SBT_VOL) r->has_volatile_member = true;
-			t = pparse_pair(_pc, t);
+			bool has_vla = (traits & PPARSE_SBT_VLA) != 0;
+			r->is_vla |= has_vla;
+			r->type_vm |= has_vla;
+			r->has_volatile_member |= (traits & PPARSE_SBT_VOL) != 0;
+			t = pparse_pair_known(t);
 			saw_sue = false;
 			continue;
 		}
@@ -5585,29 +5549,29 @@ static void pparse_scan_type_constructor(PParseToken *start,
 
 		if (!check_typeof && pparse_is_sizeof_like(t) && !vla_done) {
 			PParseToken *nx = pparse_next(_pc, t);
-			PParseToken *close = nx && pparse_match_ch(nx, '(') ? pparse_pair(_pc, nx) : NULL;
+			PParseToken *close = pparse_match_ch(nx, '(') ? pparse_pair_known(nx) : NULL;
 			if (close) sizeof_end = pparse_idx(_pc, close);
 		}
-		bool scan_vla = !vla_done && fn_skip == 0 &&
-				(sizeof_end == 0 || pparse_idx(_pc, t) > sizeof_end);
+		bool scan_vla = !vla_done & (fn_skip == 0) &
+				((sizeof_end == 0) | (pparse_idx(_pc, t) > sizeof_end));
 		if (sizeof_end && pparse_idx(_pc, t) > sizeof_end) sizeof_end = 0;
 		if (scan_vla && pparse_match_ch(t, '[') && !(t->flags & PPARSE_TF_C23_ATTR) &&
 		    prev && pparse_is_array_bracket_predecessor(prev)) {
 			bool dim_vla = pparse_array_size_is_vla(t);
-			if (dim_vla) r->type_vm = true;
+			r->type_vm |= dim_vla;
 			if (!pparse_array_bracket_closes_ptr_to_array(t, prev)) {
 				r->is_array = true;
 				if (!r->type_array_rank) {
 					PParseToken *inner = pparse_next(_pc, t);
-					r->array_dim_complete = inner && !pparse_match_ch(inner, ']');
+					r->array_dim_complete = !pparse_match_ch(inner, ']');
 				}
 				if (r->type_array_rank < 15) r->type_array_rank++;
-				if (dim_vla) r->is_vla = true;
+				r->is_vla |= dim_vla;
 			}
 		}
 		if (scan_vla && pparse_is_identifier_like(t)) {
 			int tf = pparse_typedef_flags(t);
-			if (tf & PPARSE_TDF_VLA) r->is_vla = true;
+			r->is_vla |= (tf & PPARSE_TDF_VLA) != 0;
 			if (tf & PPARSE_TDF_ARRAY) {
 				r->is_array = true;
 				uint8_t rk = pparse_array_rank_for_tok(t);
@@ -5616,18 +5580,19 @@ static void pparse_scan_type_constructor(PParseToken *start,
 				else if (r->type_array_rank == 0)
 					r->type_array_rank = 1;
 				PParseArrayBindingInfo info = pparse_array_binding_info(t);
-				if (info.tracked && info.dim_complete) r->array_dim_complete = true;
+				r->array_dim_complete |= info.tracked & info.dim_complete;
 			}
-			if (tf & (PPARSE_TDF_VLA | PPARSE_TDF_ARRAY)) vla_done = true;
+			vla_done |= (tf & (PPARSE_TDF_VLA | PPARSE_TDF_ARRAY)) != 0;
 		}
 
-		if (depth == 0 && pparse_match_ch(t, '*')) outer_ptr = true;
+		outer_ptr |= (depth == 0) & pparse_match_ch(t, '*');
 		if (copy_quals) {
-			if (t->tag & PPARSE_TT_VOLATILE) r->has_volatile = true;
-			if (t->tag & PPARSE_TT_CONST) r->has_const = r->has_decl_const = true;
-			if ((t->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
-			    (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE))
-				r->has_atomic = true;
+			r->has_volatile |= (t->tag & PPARSE_TT_VOLATILE) != 0;
+			bool has_const = (t->tag & PPARSE_TT_CONST) != 0;
+			r->has_const |= has_const;
+			r->has_decl_const |= has_const;
+			r->has_atomic |= (t->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
+					 (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE);
 		}
 		int tf = pparse_typedef_flags(t);
 		if (((t->tag & PPARSE_TT_SUE) || (tf & PPARSE_TDF_AGGREGATE)) && !r->object_type_idx)
@@ -5636,12 +5601,11 @@ static void pparse_scan_type_constructor(PParseToken *start,
 			r->has_decl_const = r->has_hidden_const = true;
 			if (copy_quals) r->has_const = true;
 		}
-		if (tf & (PPARSE_TDF_VOLATILE | PPARSE_TDF_HAS_VOL_MEMBER))
-			r->has_hidden_volatile = true;
-		if ((t->tag & PPARSE_TT_SUE) || (tf & PPARSE_TDF_AGGREGATE)) r->is_struct = true;
-		if ((t->tag & PPARSE_TT_SUE) && t->ch0 == 'u') r->is_union = true;
-		if ((t->tag & PPARSE_TT_SUE) && t->ch0 == 'e') r->is_enum = true;
-		if (tf & PPARSE_TDF_UNION) r->is_union = true;
+		r->has_hidden_volatile |= (tf & (PPARSE_TDF_VOLATILE | PPARSE_TDF_HAS_VOL_MEMBER)) != 0;
+		r->is_struct |= ((t->tag & PPARSE_TT_SUE) != 0) | ((tf & PPARSE_TDF_AGGREGATE) != 0);
+		r->is_union |= ((t->tag & PPARSE_TT_SUE) != 0) & (t->ch0 == 'u');
+		r->is_enum |= ((t->tag & PPARSE_TT_SUE) != 0) & (t->ch0 == 'e');
+		r->is_union |= (tf & PPARSE_TDF_UNION) != 0;
 		if (t->tag & PPARSE_TT_SUE) {
 			saw_sue = true;
 			continue;
@@ -5656,17 +5620,19 @@ static void pparse_scan_type_constructor(PParseToken *start,
 			saw_sue = false;
 		}
 		if (copy_quals) {
-			if (tf & PPARSE_TDF_VOLATILE) r->has_volatile = true;
-			if (tf & PPARSE_TDF_HAS_VOL_MEMBER) r->has_volatile_member = true;
+			r->has_volatile |= (tf & PPARSE_TDF_VOLATILE) != 0;
+			r->has_volatile_member |= (tf & PPARSE_TDF_HAS_VOL_MEMBER) != 0;
 		}
 	}
-	if (outer_ptr) PPARSE_CLEAR_SUE_KIND((*r));
+	r->is_struct &= !outer_ptr;
+	r->is_union &= !outer_ptr;
+	r->is_enum &= !outer_ptr;
 }
 
 static bool pparse_typeof_operand_is_function(PParseToken *inner, PParseToken *close) {
 	PPARSE_CTX();
-	while (inner && inner != close && pparse_match_ch(inner, '(') && pparse_pair(_pc, inner)) {
-		PParseToken *inner_close = pparse_pair(_pc, inner);
+	while (inner && inner != close && pparse_match_ch(inner, '(')) {
+		PParseToken *inner_close = pparse_pair_known(inner);
 		if (pparse_next(_pc, inner_close) != close) break;
 		inner = pparse_next(_pc, inner);
 		close = inner_close;
@@ -5680,8 +5646,8 @@ static bool pparse_typeof_operand_is_function(PParseToken *inner, PParseToken *c
 	}
 	PParseToken *prev = NULL;
 	PPARSE_FOR_RANGE(s, inner, close) {
-		if ((pparse_is_c23_attr(s) || pparse_match_ch(s, '[')) && pparse_pair(_pc, s)) {
-			s = pparse_pair(_pc, s);
+		if (pparse_is_c23_attr(s) || pparse_match_ch(s, '[')) {
+			s = pparse_pair_known(s);
 			prev = NULL;
 			continue;
 		}
@@ -5689,11 +5655,11 @@ static bool pparse_typeof_operand_is_function(PParseToken *inner, PParseToken *c
 			prev = s;
 			continue;
 		}
-		PParseToken *pair = pparse_pair(_pc, s);
+		PParseToken *pair = pparse_pair_known(s);
 		bool ctor = prev && ((prev->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT |
 						       PPARSE_TT_ALIGNAS | PPARSE_TT_ATTR)) ||
 				     ((prev->tag & PPARSE_TT_TYPE) && pparse_equal(prev, "_Atomic")));
-		if (ctor && pair) {
+		if (ctor) {
 			s = pair;
 			prev = NULL;
 			continue;
@@ -5769,9 +5735,11 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 		}
 
 		uint32_t tag = tok->tag;
-		if (pparse_equal(tok, "long")) saw_long = true;
-		if (pparse_equal(tok, "double")) saw_double = true;
-		if (saw_long && saw_double) r.has_long_double = true;
+		if (tag & PPARSE_TT_TYPE) {
+			saw_long |= tok->ch0 == 'l' && tok->len == 4;
+			saw_double |= tok->ch0 == 'd' && tok->len == 6;
+			r.has_long_double |= saw_long & saw_double;
+		}
 		bool is_type = (tag & PPARSE_TT_TYPE) || (tflags & PPARSE_TDF_TYPEDEF);
 		if (r.saw_type && pparse_is_soft_keyword_identifier(tok) && pparse_soft_keyword_decl_name_boundary(tok))
 			break;
@@ -5784,7 +5752,7 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 			continue;
 		}
 
-		if (pparse_equal(tok, "void") || (tflags & PPARSE_TDF_VOID)) r.has_void = true;
+		r.has_void |= pparse_equal(tok, "void") | ((tflags & PPARSE_TDF_VOID) != 0);
 		bool had_type = r.saw_type;
 		if ((tflags & PPARSE_TDF_TYPEDEF) && pparse_is_soft_keyword_identifier(tok)) {
 			if (had_type) break;
@@ -5801,47 +5769,55 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 			continue;
 		}
 
-		if ((tag & PPARSE_TT_STORAGE) && tok->ch0 == 'e') r.has_extern = true;
-		if ((tag & PPARSE_TT_STORAGE) && tok->ch0 == 's') r.has_static = true;
-		if ((tag & PPARSE_TT_STORAGE) && tok->ch0 != 'e' && tok->ch0 != 's') r.has_thread_local = true;
+		if (tag & PPARSE_TT_STORAGE) {
+			switch (tok->ch0) {
+			case 'e': r.has_extern = true; break;
+			case 's': r.has_static = true; break;
+			default: r.has_thread_local = true; break;
+			}
+		}
 		if (tag & PPARSE_TT_QUALIFIER) {
-			if (tag & PPARSE_TT_VOLATILE) r.has_volatile = true;
-			if (tag & PPARSE_TT_REGISTER) r.has_register = true;
-			if (tag & PPARSE_TT_CONST) r.has_const = r.has_decl_const = true;
-			if (tok->ch0 == 'c' && tok->len == 9) r.has_constexpr = true;
+			r.has_volatile |= (tag & PPARSE_TT_VOLATILE) != 0;
+			r.has_register |= (tag & PPARSE_TT_REGISTER) != 0;
+			bool has_const = (tag & PPARSE_TT_CONST) != 0;
+			r.has_const |= has_const;
+			r.has_decl_const |= has_const;
+			r.has_constexpr |= (tok->ch0 == 'c') & (tok->len == 9);
 			if (tag & PPARSE_TT_TYPE) {
-				if (tok->ch0 == 'a') r.saw_type = r.has_auto = true;
-				else r.has_atomic = true;
+				bool auto_type = tok->ch0 == 'a';
+				r.saw_type |= auto_type;
+				r.has_auto |= auto_type;
+				r.has_atomic |= !auto_type;
 			}
 		}
 
-		if (is_type && (tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) == (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE) &&
-		    !(pparse_next(_pc, tok) && pparse_match_ch(pparse_next(_pc, tok), '(')))
+		bool atomic_kw = (tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
+				 (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE);
+		PParseToken *atomic_open = pparse_next(_pc, tok);
+		bool atomic_ctor = atomic_kw & pparse_match_ch(atomic_open, '(');
+		if (is_type && atomic_kw && !atomic_ctor)
 			is_type = false;
 		if (is_type) r.saw_type = true;
-		is_type = false;
 		// _Atomic(type) specifier form
-		if ((tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) == (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE) && pparse_next(_pc, tok) &&
-		    pparse_match_ch(pparse_next(_pc, tok), '(')) {
+		if (atomic_ctor) {
 			r.saw_type = true;
 			r.has_atomic = true;
-			tok = pparse_next(_pc, tok);
+			tok = atomic_open;
 			PParseToken *inner_start = pparse_skip_noise(_pc, pparse_next(_pc, tok));
 			PParseToken *end = pparse_skip_balanced_group(tok);
-			int inner_flags = inner_start ? pparse_typedef_flags(inner_start) : 0;
-			if (inner_flags & PPARSE_TDF_TYPEDEF) {
-				r.is_typedef = true;
-			}
+			int inner_flags = pparse_typedef_flags(inner_start);
+			r.is_typedef |= (inner_flags & PPARSE_TDF_TYPEDEF) != 0;
 			PParseToken *shape_start = inner_start, *shape_end = end;
 			/* Look through the nested constructor once; shape is about its
 			 * operand, not the `typeof` keyword itself. */
-			if (inner_start && (inner_start->tag & PPARSE_TT_TYPEOF) && pparse_next(_pc, inner_start) &&
-			    pparse_match_ch(pparse_next(_pc, inner_start), '(')) {
-				PParseToken *topen = pparse_next(_pc, inner_start);
+			bool nested_typeof = (inner_start->tag & PPARSE_TT_TYPEOF) != 0;
+			PParseToken *nested_open = pparse_next(_pc, inner_start);
+			if (nested_typeof && pparse_match_ch(nested_open, '(')) {
+				PParseToken *topen = nested_open;
 				shape_start = pparse_next(_pc, topen);
 				shape_end = pparse_skip_balanced_group(topen);
 			}
-			if (inner_start && (inner_start->tag & PPARSE_TT_TYPEOF)) r.has_typeof = true;
+			r.has_typeof |= nested_typeof;
 			pparse_scan_type_constructor(shape_start, shape_end, &r, true, false);
 			tok = end;
 			r.end = tok;
@@ -5852,11 +5828,11 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 			if (!r.sue_kw) r.sue_kw = tok;
 			if (!r.object_type_idx) r.object_type_idx = pparse_idx(_pc, tok) + 1;
 			r.is_struct = true;
-			if (tok->ch0 == 'u') r.is_union = true;
-			if (tok->ch0 == 'e') r.is_enum = true;
+			r.is_union |= tok->ch0 == 'u';
+			r.is_enum |= tok->ch0 == 'e';
 			r.saw_type = true;
 			tok = pparse_next(_pc, tok);
-			while (tok && tok->kind != PPARSE_TK_EOF) {
+			while (tok->kind != PPARSE_TK_EOF) {
 				pparse_SKIP_NOISE_CONTINUE(tok);
 				if ((tok->tag & PPARSE_TT_QUALIFIER) && !pparse_is_soft_keyword_identifier(tok))
 					tok = pparse_next(_pc, tok);
@@ -5864,21 +5840,21 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 					break;
 			}
 			PParseToken *sue_tag = NULL;
-			if (tok && pparse_is_valid_varname(tok)) {
+			if (pparse_is_valid_varname(tok)) {
 				sue_tag = tok;
 				tok = pparse_next(_pc, tok);
 			}
 			// C23 enum fixed underlying type: enum E : int { ... }
-			if (tok && pparse_match_ch(tok, ':')) {
+			if (pparse_match_ch(tok, ':')) {
 				tok = pparse_next(_pc, tok);
-				while (tok && tok->kind != PPARSE_TK_EOF) {
+				while (tok->kind != PPARSE_TK_EOF) {
 					pparse_SKIP_NOISE_CONTINUE(tok);
 					if (pparse_match_ch(tok, '(')) {
 						tok = pparse_skip_balanced_group(tok);
 						continue;
 					}
-					if (pparse_is_c23_attr(tok) && pparse_pair(_pc, tok)) {
-						tok = pparse_pair(_pc, tok);
+					if (pparse_is_c23_attr(tok)) {
+						tok = pparse_pair_known(tok);
 						continue;
 					}
 					if (pparse_is_type_keyword(tok) || (tok->tag & PPARSE_TT_QUALIFIER)) {
@@ -5888,19 +5864,19 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 					break;
 				}
 			}
-			if (tok && pparse_match_ch(tok, '{')) {
+			if (pparse_match_ch(tok, '{')) {
 				pparse_ann(r.sue_kw) |= P1_SUE_BODY_RECIPE;
 				r.sue_kw->pair_idx = pparse_idx(_pc, tok);
 				if (r.is_enum || sue_tag) pparse_ann(tok) |= P1_SUE_SPLIT_STRIP;
 				unsigned body_traits = pparse_struct_body_traits(tok);
-				if (body_traits & PPARSE_SBT_VLA) r.is_vla = true;
-				if (body_traits & PPARSE_SBT_VOL) r.has_volatile_member = true;
+				r.is_vla |= (body_traits & PPARSE_SBT_VLA) != 0;
+				r.has_volatile_member |= (body_traits & PPARSE_SBT_VOL) != 0;
 				tok = pparse_skip_balanced_group(tok);
 			} else if (sue_tag) {
 				PParseTypedefEntry *tag_e = pparse_tag_lookup(sue_tag);
 				if (tag_e) {
-					if (tag_e->is_vla) r.is_vla = true;
-					if (tag_e->has_volatile_member) r.has_volatile_member = true;
+					r.is_vla |= tag_e->is_vla;
+					r.has_volatile_member |= tag_e->has_volatile_member;
 				}
 			}
 			r.end = tok;
@@ -5912,34 +5888,32 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 			    tok->len >= 13; // typeof_unqual(13), __typeof_unqual(15), __typeof_unqual__(17)
 			r.saw_type = true;
 			r.has_typeof = true;
-			if (tok->len != 11) r.has_hidden_const = true;
-			if (pparse_equal(tok, "__auto_type")) r.has_auto = true;
+			r.has_hidden_const |= tok->len != 11;
+			r.has_auto |= pparse_equal(tok, "__auto_type");
 			tok = pparse_next(_pc, tok);
-			if (tok && pparse_match_ch(tok, '(')) {
-				PParseToken *close = pparse_pair(_pc, tok);
-				PParseToken *end = close ? pparse_next(_pc, close) : pparse_next(_pc, tok);
+			if (pparse_match_ch(tok, '(')) {
+				PParseToken *close = pparse_pair_known(tok);
+				PParseToken *end = pparse_next(_pc, close);
 				PParseToken *inner = pparse_next(_pc, tok);
-				if (inner && pparse_equal(inner, "void") && pparse_next(_pc, inner) == close)
-					r.has_void = true;
+				r.has_void |= pparse_equal(inner, "void") & (pparse_next(_pc, inner) == close);
 				/* Resolve the traits of a direct identifier operand. Scanning
 				 * every identifier inside an arbitrary expression is unsound:
 				 * `typeof(sizeof(atomic_var))` is size_t, not atomic. */
 				PParseToken *operand = inner, *operand_close = close;
-				while (operand && operand_close && pparse_match_ch(operand, '(') &&
-				       pparse_pair(_pc, operand) &&
-				       pparse_next(_pc, pparse_pair(_pc, operand)) == operand_close) {
-					operand_close = pparse_pair(_pc, operand);
+				while (pparse_match_ch(operand, '(') &&
+				       pparse_next(_pc, pparse_pair_known(operand)) == operand_close) {
+					operand_close = pparse_pair_known(operand);
 					operand = pparse_next(_pc, operand);
 				}
-				if (operand && operand_close && pparse_next(_pc, operand) == operand_close &&
+				if (pparse_next(_pc, operand) == operand_close &&
 				    pparse_is_identifier_like(operand)) {
 					int operand_flags = pparse_typedef_flags(operand);
 					PParseTypedefEntry *operand_binding = pparse_typedef_lookup(_pc, operand);
 					if (!is_unqual && operand_binding && operand_binding->is_const) {
 						r.has_const = r.has_decl_const = r.has_hidden_const = true;
 					}
-					if (!is_unqual && (operand_flags & PPARSE_TDF_ATOMIC)) r.has_atomic = true;
-					if (operand_flags & PPARSE_TDF_LONG_DOUBLE) r.has_long_double = true;
+					r.has_atomic |= !is_unqual & ((operand_flags & PPARSE_TDF_ATOMIC) != 0);
+					r.has_long_double |= (operand_flags & PPARSE_TDF_LONG_DOUBLE) != 0;
 				}
 				pparse_scan_type_constructor(inner, end, &r, false, !is_unqual);
 				r.is_func |= pparse_typeof_operand_is_function(inner, close);
@@ -5950,13 +5924,13 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 		}
 
 		if (tag & (PPARSE_TT_BITINT | PPARSE_TT_ATTR | PPARSE_TT_ALIGNAS)) {
-			if (tag & PPARSE_TT_BITINT) r.saw_type = true;
-			if (tag & PPARSE_TT_ALIGNAS) r.has_alignas = true;
+			r.saw_type |= (tag & PPARSE_TT_BITINT) != 0;
+			r.has_alignas |= (tag & PPARSE_TT_ALIGNAS) != 0;
 			PParseToken *kw = tok;
 			tok = pparse_next(_pc, tok);
-			if (tok && pparse_match_ch(tok, '(')) {
+			if (pparse_match_ch(tok, '(')) {
 				if (pparse_feat(PPARSE_F_ORELSE) && (kw->tag & (PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS))) {
-					PParseToken *close = pparse_pair(_pc, tok);
+					PParseToken *close = pparse_pair_known(tok);
 					PPARSE_FOR_RANGE(s, pparse_next(_pc, tok), close)
 						if (pparse_is_orelse_kw_shadow(s))
 							pparse_error_tok(
@@ -6137,8 +6111,8 @@ static PParseToken *pparse_typedef_type_start(PParseTypedefEntry *entry) {
 	uint32_t i = entry->token_index;
 	while (i > 0) {
 		PParseToken *prev = &pparse_token_pool[i - 1];
-		if ((prev->flags & PPARSE_TF_CLOSE) && pparse_pair(_pc, prev)) {
-			i = pparse_idx(_pc, pparse_pair(_pc, prev));
+		if (prev->flags & PPARSE_TF_CLOSE) {
+			i = pparse_idx(_pc, pparse_pair_known(prev));
 			continue;
 		}
 		if (pparse_match_ch(prev, ';')) return NULL;
@@ -6212,7 +6186,7 @@ static unsigned pparse_record_aggregate_traits(PParseToken *brace, unsigned trai
 
 static unsigned pparse_aggregate_object_traits(PParseToken *brace, int depth) {
 	PPARSE_CTX();
-	if (!brace || !pparse_pair(_pc, brace) || depth > 32) return 0;
+	if (!brace || depth > 32) return 0;
 	uint32_t known = P1_ZUNSAFE_KNOWN | P1_AGG_CONST_KNOWN;
 	if ((pparse_ann(brace) & known) == known)
 		return ((pparse_ann(brace) & P1_ZUNSAFE) ? PPARSE_OBJ_ZERO_UNSAFE : 0) |
@@ -6220,16 +6194,16 @@ static unsigned pparse_aggregate_object_traits(PParseToken *brace, int depth) {
 	if (pparse_ann(brace) & P1_AGG_BUSY) return 0;
 	pparse_ann(brace) |= P1_AGG_BUSY;
 
-	PParseToken *end = pparse_pair(_pc, brace);
+	PParseToken *end = pparse_pair_known(brace);
 	bool saw_any = false, needs_full = false, maybe_const = false;
 	for (PParseToken *t = pparse_next(_pc, brace); t && t != end;) {
 		if (t->kind == PPARSE_TK_PREP_DIR) {
 			t = pparse_next(_pc, t);
 			continue;
 		}
-		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '{') && pparse_pair(_pc, t)) {
+		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '{')) {
 			needs_full = saw_any = true;
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
 		if ((pparse_match_ch(t, '[') && !(t->flags & PPARSE_TF_C23_ATTR)) || (t->tag & PPARSE_TT_SUE))
@@ -6252,8 +6226,8 @@ static unsigned pparse_aggregate_object_traits(PParseToken *brace, int depth) {
 		}
 		if ((stmt->flags & PPARSE_TF_STATIC_ASSERT) || (stmt->tag & PPARSE_TT_SKIP_DECL)) {
 			PParseToken *n = pparse_skip_noise(_pc, pparse_next(_pc, stmt));
-			stmt = n && pparse_match_ch(n, '(') && pparse_pair(_pc, n)
-				   ? pparse_skip_noise(_pc, pparse_next(_pc, pparse_pair(_pc, n)))
+			stmt = n && pparse_match_ch(n, '(')
+				   ? pparse_skip_noise(_pc, pparse_next(_pc, pparse_pair_known(n)))
 				   : pparse_skip_noise(_pc, pparse_next(_pc, stmt));
 			continue;
 		}
@@ -6315,8 +6289,7 @@ static bool pparse_range_has_attribute(PParseToken *start, PParseToken *end, uin
 	PPARSE_CTX();
 	PPARSE_FOR_RANGE(t, start, end) {
 		if ((t->tag & (PPARSE_TT_ATTR | extra_tag)) || pparse_is_c23_attr(t)) return true;
-		PParseToken *close = t->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, t) : NULL;
-		if (close) t = close;
+		if (t->flags & PPARSE_TF_OPEN) t = pparse_pair_known(t);
 	}
 	return false;
 }
@@ -6330,8 +6303,8 @@ static bool pparse_is_const_literal_initializer(PParseToken *eq) {
 		while (next && next->kind == PPARSE_TK_STR) next = pparse_next(_pc, next);
 		return next && pparse_match_ch(next, ';');
 	}
-	if (!pparse_match_ch(t, '{') || !pparse_pair(_pc, t)) return false;
-	PParseToken *close = pparse_pair(_pc, t);
+	if (!pparse_match_ch(t, '{')) return false;
+	PParseToken *close = pparse_pair_known(t);
 	bool prev_was_dot = false;
 	for (t = pparse_next(_pc, t); t && t != close; t = pparse_next(_pc, t)) {
 		if (t->kind == PPARSE_TK_NUM || t->kind == PPARSE_TK_STR) {
@@ -6408,7 +6381,7 @@ restart:
 	}
 
 	if (pparse_match_ch(tok, '{')) {
-		tok = pparse_pair(_pc, tok);
+		tok = pparse_pair_known(tok);
 		goto unwind_if;
 	}
 
@@ -6418,20 +6391,20 @@ restart:
 			goto restart;
 		}
 		PParseToken *p = pparse_skip_prep_dirs(pparse_next(_pc, tok));
-		if (!p || !(pparse_match_ch(p, '(')) || !pparse_pair(_pc, p)) return NULL;
+		if (!p || !pparse_match_ch(p, '(')) return NULL;
 		if (!pparse_sos_ensure_intbuf(&pparse_sos_if_trail_snap, &pparse_sos_if_cap, if_depth + 1))
 			return NULL;
 		if_trail_snap = pparse_sos_if_trail_snap;
 		if_trail_snap[if_depth] = tn;
 		if_depth++;
-		tok = pparse_next(_pc, pparse_pair(_pc, p));
+		tok = pparse_next(_pc, pparse_pair_known(p));
 		goto restart;
 	}
 
 	if ((tok->tag & (PPARSE_TT_LOOP | PPARSE_TT_SWITCH)) && tok->ch0 != 'd') {
 		PParseToken *p = pparse_skip_prep_dirs(pparse_next(_pc, tok));
-		if (!p || !(pparse_match_ch(p, '(')) || !pparse_pair(_pc, p)) return NULL;
-		tok = pparse_next(_pc, pparse_pair(_pc, p));
+		if (!p || !pparse_match_ch(p, '(')) return NULL;
+		tok = pparse_next(_pc, pparse_pair_known(p));
 		goto restart;
 	}
 
@@ -6529,11 +6502,11 @@ unwind_if:
 			goto unwind_if;
 		}
 		PParseToken *p2 = pparse_skip_prep_dirs(pparse_next(_pc, w));
-		if (!p2 || !(pparse_match_ch(p2, '(')) || !pparse_pair(_pc, p2)) {
+		if (!p2 || !pparse_match_ch(p2, '(')) {
 			tok = NULL;
 			goto unwind_if;
 		}
-		PParseToken *a = pparse_skip_prep_dirs(pparse_next(_pc, pparse_pair(_pc, p2)));
+		PParseToken *a = pparse_skip_prep_dirs(pparse_next(_pc, pparse_pair_known(p2)));
 		tok = (a && pparse_match_ch(a, ';')) ? a : NULL;
 		goto unwind_if;
 	}
@@ -6563,7 +6536,7 @@ static bool pparse_is_c23_fixed_underlying_enum(PParseToken *type_kw_before_brac
 	PPARSE_CTX();
 	if (!type_kw_before_brace) return false;
 	PParseToken *anchor = type_kw_before_brace;
-	PParseToken *open = pparse_match_ch(anchor, ')') ? pparse_pair(_pc, anchor) : NULL;
+	PParseToken *open = pparse_match_ch(anchor, ')') ? pparse_pair_known(anchor) : NULL;
 	if (open) {
 		PParseToken *kw = pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_ATTR_NOISE);
 		if (kw && ((kw->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS)) ||
@@ -6583,7 +6556,7 @@ static bool pparse_is_c23_fixed_underlying_enum(PParseToken *type_kw_before_brac
 		if (pparse_match_ch(st, ':')) continue;
 		if (pparse_match_ch(st, '*')) continue;
 		PParseToken *group_open = (pparse_match_ch(st, ']') || pparse_match_ch(st, ')'))
-						 ? pparse_pair(_pc, st)
+						 ? pparse_pair_known(st)
 						 : NULL;
 		if (group_open && (pparse_match_ch(st, ')') || (group_open->flags & PPARSE_TF_C23_ATTR))) {
 			si2 = pparse_idx(_pc, group_open);
@@ -6604,7 +6577,7 @@ static bool pparse_is_objc_ivar_brace(uint32_t brace_idx) {
 		    (t->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_ATTR)))
 			continue;
 		PParseToken *group_open = (pparse_match_ch(t, ')') || pparse_match_ch(t, ']'))
-						 ? pparse_pair(_pc, t)
+						 ? pparse_pair_known(t)
 						 : NULL;
 		if (group_open && (pparse_match_ch(t, ')') || (group_open->flags & PPARSE_TF_C23_ATTR))) {
 			i = pparse_idx(_pc, group_open);
@@ -6650,7 +6623,7 @@ static void pparse_build_scopes(PParseToken *start) {
 		uint32_t bits;
 		bool is_generic, seen_comma, sticky_uneval;
 	} context[PPARSE_CTX_STACK_MAX] = {0};
-	for (PParseToken *t = start; t && t->kind != PPARSE_TK_EOF; t++) {
+	for (PParseToken *t = start; t->kind != PPARSE_TK_EOF; t++) {
 		uint32_t here = context[context_depth].bits;
 		if (t->flags & PPARSE_TF_OPEN) {
 			pparse_ann(t) |= here;
@@ -6663,19 +6636,17 @@ static void pparse_build_scopes(PParseToken *start) {
 				unsigned intro_ci = pparse_context_intro(intro);
 				int d = ++context_depth;
 				context[d].bits = 0;
-				context[d].is_generic = context[d].seen_comma = false;
+				context[d].seen_comma = false;
 				context[d].sticky_uneval = false;
 				/* A delimiter nested anywhere inside an unevaluated operand
 				 * remains unevaluated across its own commas and child groups.
 				 * Previously only a group immediately preceded by sizeof/typeof
 				 * inherited the bit, so one redundant pair of parentheses made
 				 * bounds checking reject dead pointer arithmetic. */
-				if (here & P1_CTX_UNEVAL) {
-					context[d].bits |= P1_CTX_UNEVAL;
-					context[d].sticky_uneval = true;
-				}
-				if (prev_ci & PPARSE_CI_UNEVAL) context[d].bits |= P1_CTX_UNEVAL;
-				if (prev_ci & PPARSE_CI_UNEVAL) context[d].sticky_uneval = true;
+				bool inherited_uneval = ((here & P1_CTX_UNEVAL) != 0) |
+							((prev_ci & PPARSE_CI_UNEVAL) != 0);
+				context[d].bits |= inherited_uneval * P1_CTX_UNEVAL;
+				context[d].sticky_uneval = inherited_uneval;
 				context[d].is_generic = intro && (intro->tag & PPARSE_TT_GENERIC);
 				if (!paren) {
 					context[d].bits |= here &
@@ -6708,16 +6679,15 @@ static void pparse_build_scopes(PParseToken *start) {
 			}
 			if (pparse_context_intro(t) & PPARSE_CI_UNEVAL) {
 				PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, t));
-				if (!(after && pparse_match_ch(after, '('))) context[context_depth].bits |= P1_CTX_UNEVAL;
-			} else if (!context[context_depth].sticky_uneval &&
-				   (pparse_match_ch(t, ';') || pparse_match_ch(t, ',') ||
-				    pparse_match_ch(t, '{') || pparse_match_ch(t, '}'))) {
+				if (!pparse_match_ch(after, '(')) context[context_depth].bits |= P1_CTX_UNEVAL;
+			} else if (!context[context_depth].sticky_uneval && t->len == 1 &&
+				   ((t->ch0 == ';') | (t->ch0 == ',') | (t->ch0 == '{') | (t->ch0 == '}'))) {
 				context[context_depth].bits &= ~P1_CTX_UNEVAL;
 			}
 		}
 		if (t->ch0 != '{' && t->ch0 != '}') continue;
 		if (t->ch0 == '}') {
-			if (depth > 0) depth--;
+			depth--;
 			continue;
 		}
 
@@ -6732,8 +6702,8 @@ static void pparse_build_scopes(PParseToken *start) {
 		if (prev) {
 			if (pparse_is_do_kw(prev)) {
 				si->is_loop = true;
-			} else if (pparse_match_ch(prev, ')') && pparse_pair(_pc, prev)) {
-				PParseToken *open = pparse_pair(_pc, prev);
+			} else if (pparse_match_ch(prev, ')')) {
+				PParseToken *open = pparse_pair_known(prev);
 				PParseToken *kw = pparse_walk_back(pparse_idx(_pc, open) - 1, PPARSE_WB_SKIP_NOISE);
 				if (kw && (kw->tag & PPARSE_TT_ATTR)) kw = pparse_walk_back(pparse_idx(_pc, kw) - 1, PPARSE_WB_SKIP_ATTRS);
 				if (kw) {
@@ -6742,11 +6712,10 @@ static void pparse_build_scopes(PParseToken *start) {
 					else if (kw->tag & PPARSE_TT_IF) si->is_conditional = true;
 					else if (kw->tag & PPARSE_TT_SUE) si->is_struct = true;
 				}
-				if (depth == 0 && !si->is_loop && !si->is_switch && !si->is_conditional &&
-				    !si->is_struct)
+				bool classified = si->is_loop | si->is_switch | si->is_conditional | si->is_struct;
+				if (depth == 0 && !classified)
 					si->is_func_body = true;
-				if (depth > 0 && !si->is_loop && !si->is_switch && !si->is_conditional &&
-				    !si->is_struct && !si->is_func_body) {
+				if (depth > 0 && !classified && !si->is_func_body) {
 					if (pparse_paren_is_function_params(open)) si->is_func_body = true;
 					else si->is_init = true;
 				}
@@ -6769,29 +6738,30 @@ static void pparse_build_scopes(PParseToken *start) {
 			}
 		}
 
-		if (!si->is_struct && !si->is_loop && !si->is_switch && !si->is_conditional &&
+		if (!(si->is_struct | si->is_loop | si->is_switch | si->is_conditional) &&
 		    pparse_is_objc_ivar_brace(pparse_idx(_pc, t))) {
 			si->is_struct = true;
 			si->is_func_body = si->is_init = false;
 		}
 		if (prev && pparse_match_ch(prev, '(')) si->is_stmt_expr = true;
-		if (!si->is_func_body && !si->is_loop && !si->is_switch && !si->is_conditional &&
-		    !si->is_struct && !si->is_stmt_expr) {
+		if (!(si->is_func_body | si->is_loop | si->is_switch | si->is_conditional |
+		      si->is_struct | si->is_stmt_expr)) {
 			if (prev && pparse_match_ch(prev, '=')) si->is_init = true;
 			else if (depth > 0 && stack[depth] < pparse_scope_tree_count && pparse_scope_tree[stack[depth]].is_init)
 				si->is_init = true;
 		}
 
-		pparse_ann(t) = (si->is_loop ? P1_SCOPE_LOOP : 0) |
-			     (si->is_switch ? P1_SCOPE_SWITCH : 0) |
-			     (si->is_init ? P1_SCOPE_INIT : 0);
+		pparse_ann(t) = (uint16_t)si->is_loop * P1_SCOPE_LOOP |
+			     (uint16_t)si->is_switch * P1_SCOPE_SWITCH |
+			     (uint16_t)si->is_init * P1_SCOPE_INIT;
 		bool reuse_parent =
 		    si->is_init && depth > 0 && stack[depth] < pparse_scope_tree_count && pparse_scope_tree[stack[depth]].is_init;
-		t->parse_data = reuse_parent ? stack[depth] : sid;
+		uint16_t actual_sid = reuse_parent ? stack[depth] : sid;
+		t->parse_data = actual_sid;
 		if (!reuse_parent) pparse_scope_tree_count++;
 		PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena, stack, depth + 2, stack_cap, 256, uint16_t);
 		depth++;
-		stack[depth] = reuse_parent ? stack[depth - 1] : sid;
+		stack[depth] = actual_sid;
 	}
 }
 static bool pparse_scope_is_ancestor_or_self(uint16_t ancestor, uint16_t descendant) {
@@ -6845,9 +6815,9 @@ static void pparse_defer_scan_hidden_stmt_exprs(PParseToken *open, bool in_loop,
 static inline PParseToken *pparse_skip_defer_control_head(PParseToken *tok, bool in_loop, bool in_switch, int depth) {
 	PPARSE_CTX();
 	tok = pparse_skip_noise(_pc, tok);
-	if (tok && pparse_match_ch(tok, '(') && pparse_pair(_pc, tok)) {
+	if (tok && pparse_match_ch(tok, '(')) {
 		pparse_defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
-		return pparse_next(_pc, pparse_pair(_pc, tok));
+		return pparse_next(_pc, pparse_pair_known(tok));
 	}
 	return tok;
 }
@@ -6876,8 +6846,7 @@ static PParseToken *pparse_defer_walk_advance_past_orelse(PParseToken *s, bool i
 	pparse_validate_defer_control_flow(act, in_loop, in_switch);
 	if (act && pparse_match_ch(act, '{')) {
 		pparse_validate_defer_statement(act, in_loop, in_switch, depth + 1);
-		PParseToken *close = pparse_pair(_pc, act);
-		if (close) return close;
+		return pparse_pair_known(act);
 	}
 	return act ? act : s;
 }
@@ -6893,14 +6862,13 @@ static void pparse_defer_scan_orelse_in_group(PParseToken *open, bool in_loop, b
 	PPARSE_CTX();
 	if (depth >= PPARSE_DEFER_MAX_DEPTH)
 		pparse_error_tok(open, "expression nesting depth inside 'defer' exceeds 4096");
-	PParseToken *end = pparse_pair(_pc, open);
-	if (!end) return;
+	PParseToken *end = pparse_pair_known(open);
 	PParseToken *prev = open;
 	PPARSE_FOR_RANGE(s, pparse_next(_pc, open), end) {
 		if (s->flags & PPARSE_TF_OPEN) {
 			if (pparse_match_ch(s, '(') || pparse_match_ch(s, '['))
 				pparse_defer_scan_orelse_in_group(s, in_loop, in_switch, depth + 1);
-			prev = pparse_pair(_pc, s);
+			prev = pparse_pair_known(s);
 			s = prev;
 			continue;
 		}
@@ -6915,13 +6883,11 @@ static void pparse_defer_scan_orelse_in_group(PParseToken *open, bool in_loop, b
 
 static void pparse_defer_scan_hidden_stmt_exprs(PParseToken *open, bool in_loop, bool in_switch, int depth) {
 	PPARSE_CTX();
-	PParseToken *end = pparse_pair(_pc, open);
-	if (!end) return;
-	for (PParseToken *t = pparse_next(_pc, open); t && t != end && t->kind != PPARSE_TK_EOF;) {
+	PParseToken *end = pparse_pair_known(open);
+	for (PParseToken *t = pparse_next(_pc, open); t != end;) {
 		if (pparse_is_stmt_expr_open(t)) {
 			pparse_validate_defer_statement(pparse_next(_pc, t), in_loop, in_switch, depth + 1);
-			PParseToken *close = pparse_pair(_pc, t);
-			t = pparse_next(_pc, close ? close : t);
+			t = pparse_next(_pc, pparse_pair_known(t));
 		} else
 			t = pparse_next(_pc, t);
 	}
@@ -6934,8 +6900,8 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 	tok = pparse_skip_noise(_pc, tok);
 	if (!tok || tok->kind == PPARSE_TK_EOF) return tok;
 	if (pparse_match_ch(tok, '{')) {
-		PParseToken *end = pparse_pair(_pc, tok);
-		uint32_t end_idx = end ? pparse_idx(_pc, end) : UINT32_MAX;
+		PParseToken *end = pparse_pair_known(tok);
+		uint32_t end_idx = pparse_idx(_pc, end);
 		for (tok = pparse_skip_noise(_pc, pparse_next(_pc, tok));
 		     tok && tok != end && tok->kind != PPARSE_TK_EOF && pparse_idx(_pc, tok) < end_idx;
 		     tok = pparse_skip_noise(_pc, tok)) {
@@ -6943,7 +6909,7 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 			if (next == tok) break;
 			tok = next;
 		}
-		return end ? pparse_next(_pc, end) : tok;
+		return pparse_next(_pc, end);
 	}
 
 	if ((tok->tag & PPARSE_TT_IF) && tok->ch0 == 'i') {
@@ -6965,7 +6931,7 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 			if (tok->flags & PPARSE_TF_OPEN) {
 				if (pparse_match_ch(tok, '(') || pparse_match_ch(tok, '['))
 					pparse_defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
-				tok = pparse_pair(_pc, tok);
+				tok = pparse_pair_known(tok);
 				continue;
 			}
 			if (pparse_match_ch(tok, '?')) {
@@ -7010,8 +6976,7 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 		if (pparse_is_stmt_expr_open(tok)) {
 			PParseToken *inner_brace = pparse_next(_pc, tok);
 			pparse_validate_defer_statement(inner_brace, in_loop, in_switch, depth + 1);
-			PParseToken *close = pparse_pair(_pc, tok);
-			return pparse_next(_pc, close ? close : tok);
+			return pparse_next(_pc, pparse_pair_known(tok));
 		}
 	}
 
@@ -7031,8 +6996,7 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 		}
 		if (s->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_INLINE)) {
 			if (s->flags & PPARSE_TF_OPEN) {
-				PParseToken *m = pparse_pair(_pc, s);
-				if (m) s = m;
+				s = pparse_pair_known(s);
 			}
 			continue;
 		}
@@ -7041,8 +7005,9 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 
 	if (tok->kind == PPARSE_TK_KEYWORD) {
 		pparse_validate_defer_control_flow(tok, in_loop, in_switch);
-		if ((tok->tag & PPARSE_TT_DEFER) && !pparse_is_known_typedef(tok) && !pparse_match_ch(pparse_next(_pc, tok), ':') &&
-		    !(pparse_next(_pc, tok) && (pparse_next(_pc, tok)->tag & PPARSE_TT_ASSIGN)))
+		PParseToken *next = pparse_next(_pc, tok);
+		if ((tok->tag & PPARSE_TT_DEFER) && !pparse_is_known_typedef(tok) && !pparse_match_ch(next, ':') &&
+		    !(next->tag & PPARSE_TT_ASSIGN))
 			pparse_error_tok(tok, "nested defer is not supported");
 	}
 
@@ -7054,7 +7019,7 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 			if (s->flags & PPARSE_TF_OPEN) {
 				if (pparse_match_ch(s, '(') || pparse_match_ch(s, '['))
 					pparse_defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
-				prev_oe = pparse_pair(_pc, s);
+				prev_oe = pparse_pair_known(s);
 				s = prev_oe;
 				continue;
 			}
@@ -7075,12 +7040,12 @@ static PParseToken *pparse_validate_defer_statement(PParseToken *tok, bool in_lo
 				pparse_validate_defer_statement(pparse_next(_pc, s), in_loop, in_switch, depth + 1);
 			else if (pparse_match_set(s, pparse_CH('(') | pparse_CH('[')) || pparse_match_ch(s, '{'))
 				pparse_defer_scan_hidden_stmt_exprs(s, in_loop, in_switch, depth);
-			s = pparse_pair(_pc, s);
+			s = pparse_pair_known(s);
 			continue;
 		}
 	}
 	PParseToken *semi = pparse_skip_to_semicolon(tok, NULL);
-	return (semi && semi->kind != PPARSE_TK_EOF) ? pparse_next(_pc, semi) : semi;
+	return semi->kind != PPARSE_TK_EOF ? pparse_next(_pc, semi) : semi;
 }
 
 static bool pparse_is_knr_params(PParseToken *start, PParseToken *brace) {
@@ -7089,7 +7054,7 @@ static bool pparse_is_knr_params(PParseToken *start, PParseToken *brace) {
 	bool saw_semi = false;
 	PPARSE_FOR_RANGE(t, start, brace) {
 		if (pparse_match_ch(t, ';')) saw_semi = true;
-		if (t->flags & PPARSE_TF_OPEN) t = pparse_pair(_pc, t);
+		if (t->flags & PPARSE_TF_OPEN) t = pparse_pair_known(t);
 	}
 	return saw_semi;
 }
@@ -7098,8 +7063,7 @@ static bool pparse_is_knr_params(PParseToken *start, PParseToken *brace) {
 
 static bool pparse_params_look_like_decls(PParseToken *open) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open);
-	if (!close) return false;
+	PParseToken *close = pparse_pair_known(open);
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, open), close) {
 		PPARSE_SKIP_GROUP_LENIENT(t)
 		if (t->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ATTR | PPARSE_TT_STORAGE))
@@ -7111,8 +7075,7 @@ static bool pparse_params_look_like_decls(PParseToken *open) {
 
 static PParseToken *pparse_generic_find_assoc_start(PParseToken *open) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open);
-	if (!close) return NULL;
+	PParseToken *close = pparse_pair_known(open);
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, open), close) {
 		PPARSE_SKIP_GROUP_LENIENT(t)
 		if (pparse_match_ch(t, ',')) return pparse_next(_pc, t);
@@ -7169,19 +7132,19 @@ static bool pparse_generic_has_distinct_targets(PParseToken *assoc_start, PParse
 				first_name = pparse_loc(_pc, b);
 				first_len = b->len;
 				PParseToken *ao = pparse_next(_pc, b);
-				if (ao && pparse_match_ch(ao, '(') && pparse_pair(_pc, ao)) {
+				if (ao && pparse_match_ch(ao, '(')) {
 					first_args_open = ao;
-					first_args_close = pparse_pair(_pc, ao);
+					first_args_close = pparse_pair_known(ao);
 				}
 			} else if (b->len != first_len ||
 				   !prism_memeq_runtime_sized(pparse_loc(_pc, b), first_name, first_len)) {
 				return true;
 			} else {
 				PParseToken *ao = pparse_next(_pc, b);
-				if (!ao || !pparse_match_ch(ao, '(') || !pparse_pair(_pc, ao)) {
+				if (!ao || !pparse_match_ch(ao, '(')) {
 					if (first_args_open) return true;
 				} else {
-					PParseToken *ac = pparse_pair(_pc, ao);
+					PParseToken *ac = pparse_pair_known(ao);
 					if (!first_args_open) return true;
 					PParseToken *a1 = pparse_next(_pc, first_args_open);
 					PParseToken *a2 = pparse_next(_pc, ao);
@@ -7224,10 +7187,9 @@ static bool pparse_generic_rewrite_preamble(PParseToken *generic_tok,
 				     PParseToken **assoc_start_out) {
 	PPARSE_CTX();
 	PParseToken *open = pparse_next(_pc, generic_tok);
-	if (!open || !pparse_match_ch(open, '(') || !pparse_pair(_pc, open)) return false;
-	PParseToken *close = pparse_pair(_pc, open);
+	if (!open || !pparse_match_ch(open, '(')) return false;
+	PParseToken *close = pparse_pair_known(open);
 	PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, close));
-	if (!after) return false;
 	PParseToken *assoc_start = pparse_generic_find_assoc_start(open);
 	if (!assoc_start || pparse_generic_has_distinct_targets(assoc_start, close)) return false;
 	*open_out = open;
@@ -7250,32 +7212,31 @@ static bool pparse_generic_decl_rewrite_target(PParseToken *generic_tok,
 			PParseToken *call_open = pparse_skip_noise(_pc, pparse_next(_pc, t));
 			/* Plain `name(params)` association. */
 			if (pparse_is_valid_varname(t) && call_open && pparse_match_ch(call_open, '(') &&
-			    pparse_pair(_pc, call_open) && pparse_params_look_like_decls(call_open)) {
+			    pparse_params_look_like_decls(call_open)) {
 				*name_out = name;
 				*params_open_out = call_open;
-				*params_close_out = pparse_pair(_pc, call_open);
+				*params_close_out = pparse_pair_known(call_open);
 				*next_out = after;
 				return true;
 			}
 			/* Glibc-style parenthesized / cast-wrapped name:
 			 * `(name)(params)` or `(const char *)(name)(params)`. */
-			if (!pparse_match_ch(t, '(') || !pparse_pair(_pc, t)) continue;
+			if (!pparse_match_ch(t, '(')) continue;
 			PParseToken *inner = pparse_skip_noise(_pc, pparse_next(_pc, t));
-			PParseToken *paren_close = pparse_pair(_pc, t);
+			PParseToken *paren_close = pparse_pair_known(t);
 			PParseToken *after_paren = pparse_skip_noise(_pc, pparse_next(_pc, paren_close));
 			/* Peel one layer of cast-like `(type)(name)` before `(params)`. */
-			if (inner && !pparse_is_valid_varname(inner) && after_paren && pparse_match_ch(after_paren, '(') &&
-			    pparse_pair(_pc, after_paren)) {
+			if (inner && !pparse_is_valid_varname(inner) && after_paren && pparse_match_ch(after_paren, '(')) {
 				PParseToken *maybe_name = pparse_skip_noise(_pc, pparse_next(_pc, after_paren));
-				PParseToken *name_close = pparse_pair(_pc, after_paren);
-				PParseToken *params = name_close ? pparse_skip_noise(_pc, pparse_next(_pc, name_close)) : NULL;
+				PParseToken *name_close = pparse_pair_known(after_paren);
+				PParseToken *params = pparse_skip_noise(_pc, pparse_next(_pc, name_close));
 				if (maybe_name && pparse_is_valid_varname(maybe_name) &&
-				    pparse_skip_noise(_pc, pparse_next(_pc, maybe_name)) == name_close && params &&
-				    pparse_match_ch(params, '(') && pparse_pair(_pc, params) &&
+				    pparse_skip_noise(_pc, pparse_next(_pc, maybe_name)) == name_close &&
+				    pparse_match_ch(params, '(') &&
 				    pparse_params_look_like_decls(params)) {
 					*name_out = maybe_name;
 					*params_open_out = params;
-					*params_close_out = pparse_pair(_pc, params);
+					*params_close_out = pparse_pair_known(params);
 					*next_out = after;
 					return true;
 				}
@@ -7283,18 +7244,18 @@ static bool pparse_generic_decl_rewrite_target(PParseToken *generic_tok,
 			/* `(name)(params)` */
 			if (inner && pparse_is_valid_varname(inner) &&
 			    pparse_skip_noise(_pc, pparse_next(_pc, inner)) == paren_close && after_paren &&
-			    pparse_match_ch(after_paren, '(') && pparse_pair(_pc, after_paren) &&
+			    pparse_match_ch(after_paren, '(') &&
 			    pparse_params_look_like_decls(after_paren)) {
 				*name_out = inner;
 				*params_open_out = after_paren;
-				*params_close_out = pparse_pair(_pc, after_paren);
+				*params_close_out = pparse_pair_known(after_paren);
 				*next_out = after;
 				return true;
 			}
 		}
 	}
-	if (pparse_match_ch(after, '(') && pparse_pair(_pc, after) && pparse_params_look_like_decls(after)) {
-		PParseToken *ext_close = pparse_pair(_pc, after);
+	if (pparse_match_ch(after, '(') && pparse_params_look_like_decls(after)) {
+		PParseToken *ext_close = pparse_pair_known(after);
 		PParseToken *after_ext = pparse_skip_noise(_pc, pparse_next(_pc, ext_close));
 		if (after_ext &&
 		    (pparse_match_ch(after_ext, ';') || pparse_match_ch(after_ext, ',') || (after_ext->tag & PPARSE_TT_ATTR) ||
@@ -7339,12 +7300,10 @@ static inline bool pparse_generic_decl_recipe(PParseToken *tok, PParseGenericDec
 	    !r->name->pair_idx)
 		return false;
 	r->params_open = &pparse_token_pool[r->name->pair_idx];
-	r->params_close = pparse_pair(_pc, r->params_open);
+	r->params_close = pparse_pair_known(r->params_open);
 	PParseToken *generic_open = pparse_next(_pc, tok);
-	PParseToken *generic_close = generic_open ? pparse_pair(_pc, generic_open) : NULL;
-	PParseToken *after_generic = generic_close
-					 ? pparse_skip_noise(_pc, pparse_next(_pc, generic_close))
-					 : NULL;
+	PParseToken *generic_close = pparse_pair_known(generic_open);
+	PParseToken *after_generic = pparse_skip_noise(_pc, pparse_next(_pc, generic_close));
 	r->after = after_generic == r->params_open && r->params_close
 			 ? pparse_skip_noise(_pc, pparse_next(_pc, r->params_close))
 			 : after_generic;
@@ -7357,8 +7316,8 @@ static bool pparse_noreturn_is_unevaluated(PParseToken *tok) {
 	PParseToken *t = pparse_walk_back(pparse_idx(_pc, tok), PPARSE_WB_ATTR_NOISE);
 	for (;;) {
 		if (t && pparse_match_ch(t, ')') && pparse_close_paren_ends_cast_type_name(t))
-			t = pparse_pair(_pc, t);
-		else if (t && pparse_match_ch(t, '(') && (t->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {
+			t = pparse_pair_known(t);
+		else if (t && pparse_match_ch(t, '(') && (t->flags & PPARSE_TF_OPEN)) {
 		} else if (t && t->kind == PPARSE_TK_IDENT && pparse_equal(t, "__extension__")) {
 		} else if (t && t->kind == PPARSE_TK_PUNCT && t->len == 1 && strchr("+-!~", t->ch0)) {
 			PParseToken *before = pparse_walk_back(pparse_idx(_pc, t), PPARSE_WB_ATTR_NOISE);
@@ -7394,8 +7353,8 @@ static inline PParseToken *pparse_try_detect_noreturn_call(PParseToken *tok) {
 			return NULL;
 	}
 	PParseToken *call = pparse_next(_pc, tok);
-	if (!call || !pparse_match_ch(call, '(') || !pparse_pair(_pc, call)) return NULL;
-	PParseToken *after = pparse_next(_pc, pparse_pair(_pc, call));
+	if (!call || !pparse_match_ch(call, '(')) return NULL;
+	PParseToken *after = pparse_next(_pc, pparse_pair_known(call));
 	/* Accept statement-final calls through grouping, casts and comma tails. */
 	while (after && pparse_match_ch(after, ')')) after = pparse_next(_pc, after);
 	if (after && pparse_match_ch(after, ';')) return after;
@@ -7454,8 +7413,8 @@ static PParseToken *pparse_p1_knr_find_close_paren(PParseToken *semi_tok) {
 		PParseToken *pt = &pparse_token_pool[pi - 1];
 		if (pt->kind == PPARSE_TK_PREP_DIR) continue;
 		if (pparse_match_ch(pt, '{') || pparse_match_ch(pt, '}')) return NULL;
-		if (pparse_match_ch(pt, ')') && pparse_pair(_pc, pt)) {
-			PParseToken *open = pparse_pair(_pc, pt);
+		if (pparse_match_ch(pt, ')')) {
+			PParseToken *open = pparse_pair_known(pt);
 			bool is_ident_list = true;
 			PPARSE_FOR_RANGE(t, pparse_next(_pc, open), pt) {
 				if (!pparse_is_valid_varname(t) && !pparse_match_ch(t, ',') && t->kind != PPARSE_TK_PREP_DIR) {
@@ -7467,8 +7426,8 @@ static PParseToken *pparse_p1_knr_find_close_paren(PParseToken *semi_tok) {
 			pi = pparse_idx(_pc, open) + 1; // +1 because loop does pi--
 			continue;
 		}
-		if ((pt->flags & PPARSE_TF_CLOSE) && pparse_pair(_pc, pt)) {
-			pi = pparse_idx(_pc, pparse_pair(_pc, pt)) + 1;
+		if (pt->flags & PPARSE_TF_CLOSE) {
+			pi = pparse_idx(_pc, pparse_pair_known(pt)) + 1;
 			continue;
 		}
 	}
@@ -7626,15 +7585,16 @@ static PRISM_PURE bool pparse_needs_space(PParseToken *prev, PParseToken *tok) {
 	PPARSE_CTX();
 	if (!prev || pparse_at_bol(tok)) return false;
 	if (tok->flags & PPARSE_TF_HAS_SPACE) return true;
-	if ((pparse_is_identifier_like(prev) || prev->kind == PPARSE_TK_NUM) &&
-	    (pparse_is_identifier_like(tok) || tok->kind == PPARSE_TK_NUM))
-		return true;
-	if (prev->kind != PPARSE_TK_PUNCT || tok->kind != PPARSE_TK_PUNCT) return false;
+	bool prev_word = pparse_is_identifier_like(prev) | (prev->kind == PPARSE_TK_NUM);
+	bool tok_word = pparse_is_identifier_like(tok) | (tok->kind == PPARSE_TK_NUM);
+	if (prev_word & tok_word) return true;
+	if ((prev->kind != PPARSE_TK_PUNCT) | (tok->kind != PPARSE_TK_PUNCT)) return false;
 	char a = (prev->len == 1) ? prev->ch0 : pparse_loc(_pc, prev)[prev->len - 1];
 	char b = tok->ch0;
 	if (b == '=') return strchr("=!<>+-*/%&|^", a) != NULL;
-	return (a == b && strchr("+-<>&|#", a)) || (a == '-' && b == '>') || (a == '/' && b == '*') ||
-	       (a == '*' && b == '/');
+	return ((a == b) & (strchr("+-<>&|#", a) != NULL)) |
+	       ((a == '-') & (b == '>')) | ((a == '/') & (b == '*')) |
+	       ((a == '*') & (b == '/'));
 }
 
 static inline uint16_t pparse_scope_id(PParseToken *body_start) {
@@ -7650,22 +7610,25 @@ static bool pparse_finalize(const char *find_ident, uint32_t find_len) {
 	bool found = false;
 	bool mark_uneval = pparse_feat(PPARSE_F_BOUNDS_CHECK);
 	bool plan_noreturn = pparse_feat(PPARSE_F_AUTO_UNREACHABLE);
+	bool has_defer = pparse_feat(PPARSE_F_DEFER);
+	bool warn_safety = pparse_feat(PPARSE_F_WARN_SAFETY);
 	int file_scope_braces = 0;
 	bool file_scope_initializer = false;
 	bool static_storage_pending = false;
 	bool static_storage_initializer = false;
 	int raw_block_depth = 0;
 	uint32_t uneval_covered_until = 0;
-	PParseToken *pool_end = pparse_token_pool + pparse_token_count;
-	for (PParseToken *t = pparse_token_pool + 1; t < pool_end && t->kind != PPARSE_TK_EOF; t++) {
-		if (raw_block_depth && pparse_match_ch(t, '}') && (pparse_ann(t) & P1_RAW_BLOCK))
+	for (PParseToken *t = pparse_token_pool + 1; t->kind != PPARSE_TK_EOF; t++) {
+		uint32_t ti = (uint32_t)(t - pparse_token_pool);
+		unsigned char ch = t->ch0;
+		if (raw_block_depth && ch == '}' && (pparse_ann(t) & P1_RAW_BLOCK))
 			raw_block_depth--;
-		if (pparse_feat(PPARSE_F_DEFER) && (t->tag & PPARSE_TT_DEFER) &&
+		if (has_defer && (t->tag & PPARSE_TT_DEFER) &&
 		    !(pparse_ann(t) & P1_IS_DEFER_KW) && !pparse_is_known_function_call(t)) {
 			PParseToken *prev = pparse_walk_back(pparse_idx(_pc, t), PPARSE_WB_ATTR_NOISE);
 			PParseToken *next = pparse_skip_noise(_pc, pparse_next(_pc, t));
 			if (!(prev && (prev->tag & (PPARSE_TT_MEMBER | PPARSE_TT_SUE))) &&
-			    (!pparse_token_has_binding(t) || (next && pparse_match_ch(next, '{'))) && next &&
+			    (!pparse_token_has_binding(t) || pparse_match_ch(next, '{')) &&
 			    (pparse_is_identifier_like(next) || pparse_match_ch(next, '{')))
 				pparse_error_tok(t,
 					  "'defer' cannot be used in expression context "
@@ -7675,21 +7638,21 @@ static bool pparse_finalize(const char *find_ident, uint32_t find_len) {
 		    t->ch0 == (uint8_t)find_ident[0] &&
 		    prism_memeq_runtime_sized(pparse_loc(_pc, t), find_ident, find_len))
 			found = true;
-		if (mark_uneval && pparse_idx(_pc, t) > uneval_covered_until) {
+		if (mark_uneval && ti > uneval_covered_until) {
 			if ((t->flags & PPARSE_TF_OPEN) && t->ch0 == '{') {
 				if (!file_scope_initializer && !static_storage_initializer)
 					static_storage_pending = false;
 				file_scope_braces++;
 			} else if ((t->flags & PPARSE_TF_CLOSE) && t->ch0 == '}') {
-				if (file_scope_braces) file_scope_braces--;
-			} else if (pparse_match_ch(t, ';')) {
+				file_scope_braces--;
+			} else if (ch == ';') {
 				file_scope_initializer = false;
 				static_storage_pending = false;
 				static_storage_initializer = false;
 			} else if ((t->tag & PPARSE_TT_STORAGE) ||
 				   ((t->tag & PPARSE_TT_QUALIFIER) && t->ch0 == 'c' && t->len == 9)) {
 				if (!(t->tag & PPARSE_TT_REGISTER)) static_storage_pending = true;
-			} else if (pparse_match_ch(t, '=')) {
+			} else if (ch == '=') {
 				if (file_scope_braces == 0) file_scope_initializer = true;
 				if (static_storage_pending) static_storage_initializer = true;
 			}
@@ -7699,7 +7662,7 @@ static bool pparse_finalize(const char *find_ident, uint32_t find_len) {
 			if ((t->flags & PPARSE_TF_STATIC_ASSERT) || (t->tag & PPARSE_TT_GENERIC) ||
 			    pparse_is_unevaluated_operand_intro(t)) {
 				PParseToken *covered = pparse_mark_unevaluated_at(t);
-				if (covered) uneval_covered_until = pparse_idx(_pc, covered);
+				if (covered) uneval_covered_until = (uint32_t)(covered - pparse_token_pool);
 			}
 		}
 		if ((t->tag & PPARSE_TT_GENERIC) && pparse_generic_decl_context(t)) {
@@ -7707,9 +7670,9 @@ static bool pparse_finalize(const char *find_ident, uint32_t find_len) {
 			if (pparse_generic_decl_rewrite_target(
 				t, &name, &params_open, &params_close, &after)) {
 				pparse_ann(t) |= P1_GENERIC_DECL_RECIPE;
-				t->pair_idx = pparse_idx(_pc, name);
+				t->pair_idx = (uint32_t)(name - pparse_token_pool);
 				pparse_ann(name) |= P1_GENERIC_DECL_TARGET;
-				name->pair_idx = pparse_idx(_pc, params_open);
+				name->pair_idx = (uint32_t)(params_open - pparse_token_pool);
 			}
 		}
 		if (t->flags & PPARSE_TF_RAW) pparse_plan_raw_strip(t);
@@ -7717,24 +7680,24 @@ static bool pparse_finalize(const char *find_ident, uint32_t find_len) {
 			PParseToken *end = pparse_try_detect_noreturn_call(t);
 			if (end) {
 				pparse_ann(t) |= P1_NORETURN_CALL_RECIPE;
-				t->pair_idx = pparse_idx(_pc, end);
+				t->pair_idx = (uint32_t)(end - pparse_token_pool);
 			}
 		}
 		if (mark_uneval) {
-			if (pparse_match_ch(t, '[')) {
+			if (ch == '[') {
 				PParseBoundsPlan plan;
 				PParseToken *prev = t > pparse_token_pool + 1 ? t - 1 : NULL;
 				if (pparse_bounds_plan_subscript(t, prev, &plan))
 					pparse_analysis_add(t, PPARSE_AR_BOUNDS)->as.bounds = plan;
-			} else if (pparse_match_ch(t, '*') &&
+			} else if (ch == '*' &&
 				   pparse_bounds_deref_add_is_unverifiable(t)) {
-				if (pparse_feat(PPARSE_F_WARN_SAFETY))
+				if (warn_safety)
 					pparse_warn_tok(t, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
 				else
 					pparse_error_tok(t, PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF);
 			}
 		}
-		if ((pparse_ann(t) & P1_RAW_BLOCK) && pparse_match_ch(t, '{')) raw_block_depth++;
+		if ((pparse_ann(t) & P1_RAW_BLOCK) && ch == '{') raw_block_depth++;
 	}
 	return found;
 }
@@ -7952,10 +7915,11 @@ static inline bool is_defer_kw(PParseToken *tok, PParseToken *prev) {
 	PPARSE_CTX();
 	if (!(tok->tag & PPARSE_TT_DEFER)) return false;
 	PParseToken *nx = pparse_next(_pc, tok);
+	unsigned char nx_ch = nx->ch0;
 	/* A declared function named `defer` wins for every call spelling. The
 	 * previous empty-argument-only exception let `defer(1);` be silently
 	 * lowered as the keyword plus a parenthesized deferred expression. */
-	if (nx && pparse_match_ch(nx, '(') && pparse_function_symbol(tok)) return false;
+	if (nx_ch == '(' && pparse_function_symbol(tok)) return false;
 	/* Typedef *type* named `defer` stays an identifier except `defer {…}`
 	 * (unambiguous keyword). Variable/param/enum-constant shadows
 	 * (`is_shadow`) must still allow braceless `defer stmt;` — otherwise the
@@ -7964,101 +7928,71 @@ static inline bool is_defer_kw(PParseToken *tok, PParseToken *prev) {
 	/* A value binding followed by `(` is a function-pointer call. Ordinary
 	 * variables named defer must still permit the keyword in `defer cleanup()`;
 	 * only the syntactically callable spelling is unambiguous. */
-	if (binding == PPARSE_BINDING_VALUE && nx && pparse_match_ch(nx, '(')) return false;
-	if (binding == PPARSE_BINDING_TYPE && !(nx && pparse_match_ch(nx, '{'))) return false;
+	if (binding == PPARSE_BINDING_VALUE && nx_ch == '(') return false;
+	if (binding == PPARSE_BINDING_TYPE && nx_ch != '{') return false;
 	/* `defer {…}` cannot be a parameter name — skip the param-list walk. */
-	if (!(nx && pparse_match_ch(nx, '{')) && pparse_function_param_open(tok)) return false;
-	/* Type / declarator predecessor → identifier (mirror: `int defer`, `T *defer`). */
-	if (prev && ((prev->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE | PPARSE_TT_TYPEDEF | PPARSE_TT_SUE | PPARSE_TT_TYPEOF |
-				   PPARSE_TT_BITINT)) ||
-		     pparse_is_known_typedef(prev) || pparse_match_ch(prev, '*')))
-		return false;
-	/* Label / member / &&label → identifier. */
-	if (prev && ((prev->tag & (PPARSE_TT_GOTO | PPARSE_TT_MEMBER)) || pparse_is_gnu_label_decl_head(prev) ||
-		     pparse_equal_2(_pc, prev, "&&")))
-		return false;
-	/* Expression-position predecessor: `return defer`, `f(defer`, `x=defer`,
-	 * `a[defer`, `sizeof defer`, `!defer`, cast `) defer`, ternary `: defer`.
-	 * Real statements follow `;` `{` `}` / stmt-start (unary `+x` after boundary OK). */
-	if (prev && (prev->tag & (PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_GOTO | PPARSE_TT_ASSIGN)))
-		return false;
-	if (prev && pparse_is_sizeof_like(prev)) return false;
-	if (prev && pparse_match_ch(prev, '(')) return false;
-	if (prev && pparse_match_ch(prev, '[')) return false;
-	if (prev && pparse_match_ch(prev, ',')) return false;
-	/* Cast / call-close `) defer` is expression; `if (…)` / `while` / `for` /
-	 * `switch` close is statement position (`if (1) defer …`). */
-	if (prev && pparse_match_ch(prev, ')')) {
-		PParseToken *open = pparse_pair(_pc, prev);
-		PParseToken *before = open ? pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE) : NULL;
-		if (!(before && (before->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH)))) return false;
-	}
-	/* Unary expr predecessors: `!defer` `~defer` `&defer` (address-of). */
-	if (prev && prev->kind == PPARSE_TK_PUNCT && prev->len == 1) {
-		unsigned char pc = (unsigned char)prev->ch0;
-		if (pc == '!' || pc == '~' || pc == '&') return false;
-	}
-	/* Ternary `: defer` is expression; label/case `:` stays statement position. */
-	if (prev && pparse_match_ch(prev, ':')) {
-		int qd = 0;
-		bool ternary = false;
-		for (uint32_t pi = pparse_idx(_pc, prev); pi > 0;) {
-			pi--;
-			PParseToken *pt = &pparse_token_pool[pi];
-			if (pt->kind == PPARSE_TK_PREP_DIR) continue;
-			if ((pt->flags & PPARSE_TF_CLOSE) && pparse_pair(_pc, pt)) {
-				pi = pparse_idx(_pc, pparse_pair(_pc, pt));
-				continue;
-			}
-			if (pparse_match_ch(pt, ';') || pparse_match_ch(pt, '{') || pparse_match_ch(pt, '}')) break;
-			if (pt->tag & (PPARSE_TT_CASE | PPARSE_TT_DEFAULT)) break;
-			if (pparse_match_ch(pt, '?') && qd == 0) {
-				ternary = true;
-				break;
-			}
+	if (nx_ch != '{' && pparse_function_param_open(tok)) return false;
+	if (prev) {
+		/* Type/declarator, label/member, or expression predecessor: identifier. */
+		if ((prev->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE |
+				  PPARSE_TT_TYPEDEF | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT |
+				  PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_GOTO |
+				  PPARSE_TT_MEMBER | PPARSE_TT_ASSIGN)) ||
+		    pparse_is_known_typedef(prev) || pparse_is_sizeof_like(prev) ||
+		    pparse_is_gnu_label_decl_head(prev) || pparse_equal_2(_pc, prev, "&&"))
+			return false;
+
+		unsigned char prev_ch = prev->ch0;
+		switch (prev_ch) {
+		case '!': case '~': case '&': case '*': case '(':
+		case '[': case ',': case '+': case '-': case '/':
+		case '%': case '|': case '^': case '<': case '>':
+		case '?': case '=':
+			return false;
+		case ')': {
+			/* A control condition closes into statement position; casts and calls do not. */
+			PParseToken *open = pparse_pair_known(prev);
+			PParseToken *before =
+			    pparse_walk_back(pparse_idx(_pc, open), PPARSE_WB_PAST_NOISE);
+			if (!(before && (before->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH))))
+				return false;
+			break;
 		}
-		if (ternary) return false;
-	}
-	/* Infix binary op → identifier (`x + defer + y`). Unary `+`/`-` after a
-	 * statement boundary still allows braceless `defer +x;`. */
-	if (prev && prev->kind == PPARSE_TK_PUNCT) {
-		unsigned char pc0 = (unsigned char)prev->ch0;
-		if (prev->len == 1) {
-			if (pc0 == '+' || pc0 == '-' || pc0 == '/' || pc0 == '%' || pc0 == '|' ||
-			    pc0 == '^' || pc0 == '<' || pc0 == '>' || pc0 == '?' || pc0 == '=')
-				return false;
-		} else if (prev->len == 2) {
-			char pc1 = pparse_loc(_pc, prev)[1];
-			if ((pc0 == '<' && (pc1 == '=' || pc1 == '<')) ||
-			    (pc0 == '>' && (pc1 == '=' || pc1 == '>')) || (pc0 == '=' && pc1 == '=') ||
-			    (pc0 == '!' && pc1 == '=') || (pc0 == '&' && pc1 == '&') ||
-			    (pc0 == '|' && pc1 == '|') || (pc0 == '+' && pc1 == '=') ||
-			    (pc0 == '-' && pc1 == '=') || (pc0 == '*' && pc1 == '=') ||
-			    (pc0 == '/' && pc1 == '=') || (pc0 == '%' && pc1 == '=') ||
-			    (pc0 == '&' && pc1 == '=') || (pc0 == '|' && pc1 == '=') ||
-			    (pc0 == '^' && pc1 == '='))
-				return false;
-		} else if (prev->len == 3) {
-			char *pl = pparse_loc(_pc, prev);
-			if ((pc0 == '<' && pl[1] == '<' && pl[2] == '=') ||
-			    (pc0 == '>' && pl[1] == '>' && pl[2] == '='))
-				return false;
+		case ':':
+			/* Ternary `: defer` is expression; label/case `:` stays statement position. */
+			for (uint32_t pi = pparse_idx(_pc, prev); pi > 0;) {
+				PParseToken *pt = &pparse_token_pool[--pi];
+				if (pt->kind == PPARSE_TK_PREP_DIR) continue;
+				if (pt->flags & PPARSE_TF_CLOSE) {
+					pi = pparse_idx(_pc, pparse_pair_known(pt));
+					continue;
+				}
+				if (pparse_match_ch(pt, ';') || pparse_match_ch(pt, '{') ||
+				    pparse_match_ch(pt, '}') ||
+				    (pt->tag & (PPARSE_TT_CASE | PPARSE_TT_DEFAULT)))
+					break;
+				if (pparse_match_ch(pt, '?')) return false;
+			}
+			break;
+		default: break;
 		}
 	}
-	if (!nx || pparse_match_ch(nx, ':') || (nx->tag & PPARSE_TT_ASSIGN)) return false;
+	if (nx_ch == ':' || (nx->tag & PPARSE_TT_ASSIGN)) return false;
 	/* `defer;` is an empty defer statement unless a variable/enum shadow owns
 	 * the name — then it is an expression-statement of that identifier. */
-	if (pparse_match_ch(nx, ';')) return binding != PPARSE_BINDING_VALUE;
+	if (nx_ch == ';') return binding != PPARSE_BINDING_VALUE;
 	/* Call-arg / asm-goto / brace-init: `f(defer)`, `{ defer }`, `{ defer, }`. */
-	if (pparse_match_ch(nx, ')') || pparse_match_ch(nx, ']') || pparse_match_ch(nx, ',') || pparse_match_ch(nx, '}'))
+	if (pparse_match_set(nx, pparse_CH(')') | pparse_CH(']') | pparse_CH(',')) || nx_ch == '}')
 		return false;
 	/* Subscript / member on the name: `defer[i]`, `defer.x`, `defer->x`. */
-	if (pparse_match_ch(nx, '[') || (nx->tag & PPARSE_TT_MEMBER)) return false;
+	if (nx_ch == '[' || (nx->tag & PPARSE_TT_MEMBER)) return false;
 	/* Postfix `defer++` / `defer--` vs braceless body `defer ++x;`. */
 	if (nx->len == 2 && (nx->ch0 == '+' || nx->ch0 == '-') && pparse_loc(_pc, nx)[1] == nx->ch0) {
 		PParseToken *after = pparse_next(_pc, nx);
-		if (!after || pparse_match_ch(after, ';') || pparse_match_ch(after, ')') || pparse_match_ch(after, ']') ||
-		    pparse_match_ch(after, ',') || pparse_match_ch(after, ':') || (after->tag & PPARSE_TT_ASSIGN))
+		if (pparse_match_set(after,
+				     pparse_CH(';') | pparse_CH(')') | pparse_CH(']') |
+					 pparse_CH(',') | pparse_CH(':')) ||
+		    (after->tag & PPARSE_TT_ASSIGN))
 			return false;
 	}
 	/* Infix punctuators cannot start a statement: `for (; defer < 3; )`.
@@ -8066,8 +8000,10 @@ static inline bool is_defer_kw(PParseToken *tok, PParseToken *prev) {
 	if (nx->kind == PPARSE_TK_PUNCT) {
 		unsigned char c0 = (unsigned char)nx->ch0;
 		if (nx->len == 1) {
-			if (c0 == '<' || c0 == '>' || c0 == '?' || c0 == '%' || c0 == '^' || c0 == '|' ||
-			    c0 == '/')
+			if (pparse_match_set(nx,
+					     pparse_CH('<') | pparse_CH('>') | pparse_CH('?') |
+						 pparse_CH('%') | pparse_CH('^') | pparse_CH('/')) ||
+			    c0 == '|')
 				return false;
 		} else if (nx->len == 2) {
 			char c1 = pparse_loc(_pc, nx)[1];
@@ -8168,10 +8104,12 @@ static void reject_orelse_side_effects(PParseToken *start, PParseToken *end,
 					  check_indirect_call ? "a function" : "side effect",
 					  advice);
 		}
-		if (check_indirect_call && pparse_match_ch(s, '(') && (s->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, s) &&
-		    pparse_pair(_pc, s) != end && pparse_next(_pc, pparse_pair(_pc, s)) && pparse_next(_pc, pparse_pair(_pc, s)) != end &&
-		    pparse_match_ch(pparse_next(_pc, pparse_pair(_pc, s)), '('))
-			pparse_error_tok(s, "%s with an indirect call %s", ctx_msg, advice);
+		if (check_indirect_call && pparse_match_ch(s, '(') && (s->flags & PPARSE_TF_OPEN)) {
+			PParseToken *group_close = pparse_pair_known(s);
+			PParseToken *after_group = pparse_next(_pc, group_close);
+			if (group_close != end && after_group != end && pparse_match_ch(after_group, '('))
+				pparse_error_tok(s, "%s with an indirect call %s", ctx_msg, advice);
+		}
 		if (check_volatile_deref && pparse_match_ch(s, '*') && pparse_next(_pc, s) && pparse_next(_pc, s) != end) {
 			bool is_mul = false;
 			if (prev_tok) {
@@ -8181,8 +8119,8 @@ static void reject_orelse_side_effects(PParseToken *start, PParseToken *end,
 				else if (pparse_match_ch(prev_tok, ']'))
 					is_mul = true;
 				else if (pparse_match_ch(prev_tok, ')') && (prev_tok->flags & PPARSE_TF_CLOSE)) {
-					PParseToken *om = pparse_pair(_pc, prev_tok);
-					if (om) {
+					PParseToken *om = pparse_pair_known(prev_tok);
+					{
 						PParseToken *fi = pparse_next(_pc, om);
 						bool looks_cast =
 						    fi && (pparse_is_type_keyword(fi) ||
@@ -8235,12 +8173,12 @@ static void validate_bracket_orelse(PParseToken *oe) {
 
 static PParseToken *paren_scan_skip_nested(PParseToken *t) {
 	PPARSE_CTX();
-	if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '[')) return pparse_pair(_pc, t);
+	if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '[')) return pparse_pair_known(t);
 	if (t->tag & PPARSE_TT_TYPEOF) {
 		PParseToken *open = pparse_next(_pc, t);
-		if (open && pparse_match_ch(open, '(')) return pparse_pair(_pc, open);
+		if (open && pparse_match_ch(open, '(')) return pparse_pair_known(open);
 	}
-	if (pparse_is_stmt_expr_open(t)) return pparse_pair(_pc, t);
+	if (pparse_is_stmt_expr_open(t)) return pparse_pair_known(t);
 	return NULL;
 }
 
@@ -8265,8 +8203,8 @@ static bool orelse_after_type_in_parens(PParseToken *t, PParseToken *prev) {
 static void check_paren_orelse_defer(PParseToken *open, bool ctrl_cond) {
 	PPARSE_CTX();
 	if (!ctrl_cond && pparse_paren_is_function_params(open)) return;
-	PParseToken *close = pparse_pair(_pc, open);
-	if (pparse_is_stmt_expr_open(open) && close) return;
+	PParseToken *close = pparse_pair_known(open);
+	if (pparse_is_stmt_expr_open(open)) return;
 	for (PParseToken *pi = open, *t = pparse_next(_pc, open); t != close; pi = t, t = pparse_next(_pc, t)) {
 		PParseToken *skipped = paren_scan_skip_nested(t);
 		if (skipped) {
@@ -8362,8 +8300,8 @@ static bool p1_bracket_requires_ice(PParseToken *lb) {
 	if (!lb) return false;
 
 	/* Designated initializer index: `[ … ] =` */
-	PParseToken *close = pparse_pair(_pc, lb);
-	if (close) {
+	PParseToken *close = pparse_pair_known(lb);
+	{
 		PParseToken *nx = pparse_next(_pc, close);
 		while (nx && nx->kind == PPARSE_TK_PREP_DIR) nx = pparse_next(_pc, nx);
 		if (nx && pparse_match_ch(nx, '=')) return true;
@@ -8375,9 +8313,9 @@ static bool p1_bracket_requires_ice(PParseToken *lb) {
 	/* A struct/union member's dimension cannot be a VLA. */
 	if (pparse_match_ch(outer, '{') && p1_brace_is_sue_body(outer)) return true;
 	/* `(int[ … ]){…}` — a compound literal cannot have VLA type. */
-	if (pparse_match_ch(outer, '(') && close) {
-		PParseToken *outer_close = pparse_pair(_pc, outer);
-		PParseToken *after = pparse_next(_pc, outer_close ? outer_close : outer);
+	if (pparse_match_ch(outer, '(')) {
+		PParseToken *outer_close = pparse_pair_known(outer);
+		PParseToken *after = pparse_next(_pc, outer_close);
 		while (after && after->kind == PPARSE_TK_PREP_DIR) after = pparse_next(_pc, after);
 		if (after && pparse_match_ch(after, '{')) return true;
 	}
@@ -8582,8 +8520,7 @@ static PParseToken *find_bare_orelse(PParseToken *tok) {
 	int ternary = 0;
 	for (PParseToken *s = tok; s->kind != PPARSE_TK_EOF; s = pparse_next(_pc, s)) {
 		if (s->flags & PPARSE_TF_OPEN) {
-			prev = pparse_pair(_pc, s);
-			s = pparse_pair(_pc, s);
+			s = prev = pparse_pair_known(s);
 			continue;
 		}
 		if ((s->flags & PPARSE_TF_CLOSE) || pparse_match_ch(s, ';')) return NULL;
@@ -8640,6 +8577,14 @@ static void pparse_register_parameter_binding(PParseToken *tok,
 	entry->is_array = false;
 	pparse_binding_apply_traits(entry, traits);
 }
+static inline bool pparse_param_name_candidate(PParseToken *tok) {
+	const uint32_t non_name = PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE | PPARSE_TT_SUE |
+				  PPARSE_TT_TYPEOF | PPARSE_TT_ATTR;
+	return pparse_is_valid_varname(tok) &
+	       (!(tok->tag & non_name) |
+		((tok->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE)) != 0) |
+		((tok->flags & PPARSE_TF_RAW) != 0));
+}
 static void
 p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_id, int brace_depth, bool check_vla) {
 	PPARSE_CTX();
@@ -8650,25 +8595,20 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 		bool ident_from_inner = false;
 		while (t && t != close && !pparse_match_ch(t, ',') && t->kind != PPARSE_TK_EOF) {
 			if (t->flags & PPARSE_TF_OPEN) {
-				if (!last_ident && !scanned_inner_paren && pparse_match_ch(t, '(') && pparse_pair(_pc, t))
-					for (PParseToken *s = pparse_next(_pc, t); s != pparse_pair(_pc, t); s = pparse_next(_pc, s)) {
+				PParseToken *group_close = pparse_pair_known(t);
+				if (!last_ident && !scanned_inner_paren && pparse_match_ch(t, '('))
+					for (PParseToken *s = pparse_next(_pc, t); s != group_close; s = pparse_next(_pc, s)) {
 						PPARSE_SKIP_GROUP_ON_CLOSE(s)
-						if (pparse_is_valid_varname(s) &&
-						    (!(s->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE | PPARSE_TT_SUE | PPARSE_TT_TYPEOF |
-								 PPARSE_TT_ATTR)) ||
-						     (s->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE)) ||
-						     (s->flags & PPARSE_TF_RAW))) {
+						if (pparse_param_name_candidate(s)) {
 							last_ident = s;
 							ident_from_inner = true;
 						}
 					}
 				if (pparse_match_ch(t, '(')) scanned_inner_paren = true;
-				t = pparse_pair(_pc, t) ? pparse_next(_pc, pparse_pair(_pc, t)) : pparse_next(_pc, t);
+				t = pparse_next(_pc, group_close);
 				continue;
 			}
-			if (pparse_is_valid_varname(t) &&
-			    (!(t->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_ATTR)) ||
-			     (t->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE)) || (t->flags & PPARSE_TF_RAW))) {
+			if (pparse_param_name_candidate(t)) {
 				last_ident = t;
 				ident_from_inner = false;
 			}
@@ -8683,13 +8623,13 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			pparse_register_shadow(last_ident, brace_depth);
 		if (check_vla && last_ident) {
 			bool skip_first = !ident_from_inner;
-			PParseToken *param_end = (t && pparse_match_ch(t, ',')) ? t : close;
+			PParseToken *param_end = pparse_match_ch(t, ',') ? t : close;
 			for (PParseToken *s = param_start; s && s != param_end && s->kind != PPARSE_TK_EOF;
 			     s = pparse_next(_pc, s))
 				if (pparse_match_ch(s, '[')) {
 					if (skip_first) {
 						skip_first = false;
-						if (pparse_pair(_pc, s)) s = pparse_pair(_pc, s);
+						s = pparse_pair_known(s);
 						continue;
 					}
 					if (pparse_array_size_is_vla(s)) {
@@ -8699,7 +8639,7 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 				}
 		}
 		if (last_ident && scope_id < pparse_scope_tree_count) {
-			PParseToken *param_end = (t && pparse_match_ch(t, ',')) ? t : close;
+			PParseToken *param_end = pparse_match_ch(t, ',') ? t : close;
 			/* Skip definite built-in scalar params; all ambiguous/array types need entries. */
 			bool param_has_bracket = false;
 			PPARSE_FOR_RANGE(s, param_start, param_end)
@@ -8712,25 +8652,26 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			bool has_atomic_qual = false;
 			bool saw_star = false;
 			bool saw_builtin_type = false, saw_typedef_or_sue = false;
-			for (PParseToken *s = param_start; s && s != param_end && s->kind != PPARSE_TK_EOF;
+			for (PParseToken *s = param_start; s != param_end;
 			     s = pparse_next(_pc, s)) {
 				if (s == last_ident) break;
-				if (pparse_match_ch(s, '*')) saw_star = true;
-				if (s->tag & (PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT)) saw_typedef_or_sue = true;
-				else if ((s->tag & PPARSE_TT_TYPE) && !pparse_is_known_typedef(s))
-					saw_builtin_type = true;
-				else if (pparse_is_known_typedef(s))
-					saw_typedef_or_sue = true;
-				if ((s->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_VOLATILE)) == (PPARSE_TT_QUALIFIER | PPARSE_TT_VOLATILE))
-					has_vol_qual = true;
-				if (s->len == 7 && s->ch0 == '_' && prism_memeq_static(pparse_loc(_pc, s), "_Atomic", 7))
-					has_atomic_qual = true;
+				saw_star |= pparse_match_ch(s, '*');
+				bool tagged_indirect_type =
+				    (s->tag & (PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT)) != 0;
+				bool known_typedef = pparse_is_known_typedef(s);
+				saw_typedef_or_sue |= tagged_indirect_type | known_typedef;
+				saw_builtin_type |= !tagged_indirect_type & !known_typedef &
+						    ((s->tag & PPARSE_TT_TYPE) != 0);
+				has_vol_qual |= (s->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_VOLATILE)) ==
+						(PPARSE_TT_QUALIFIER | PPARSE_TT_VOLATILE);
+				has_atomic_qual |= s->len == 7 && s->ch0 == '_' &&
+						   prism_memeq_static(pparse_loc(_pc, s), "_Atomic", 7);
 				if (pparse_is_valid_varname(s) &&
 				    !(s->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_ATTR))) {
 					unsigned tf = pparse_typedef_flags(s);
-					if (tf & PPARSE_TDF_VOLATILE) has_vol_qual = true;
-					if (tf & PPARSE_TDF_HAS_VOL_MEMBER) has_vol_member = true;
-					if (tf & PPARSE_TDF_ATOMIC) has_atomic_qual = true;
+					has_vol_qual |= (tf & PPARSE_TDF_VOLATILE) != 0;
+					has_vol_member |= (tf & PPARSE_TDF_HAS_VOL_MEMBER) != 0;
+					has_atomic_qual |= (tf & PPARSE_TDF_ATOMIC) != 0;
 				}
 			}
 			bool is_const_param = false;
@@ -8750,18 +8691,16 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 				} else if (param_decl.is_array) {
 					is_const_param = is_vol_param = is_atomic_param = false;
 					for (PParseToken *s = pparse_next(_pc, last_ident);
-					     s && s != param_end && s->kind != PPARSE_TK_EOF;
+					     s != param_end;
 					     s = pparse_next(_pc, s)) {
-						if (!pparse_match_ch(s, '[') || !(s->flags & PPARSE_TF_OPEN) ||
-						    !pparse_pair(_pc, s))
+						if (!pparse_match_ch(s, '[') || !(s->flags & PPARSE_TF_OPEN))
 							continue;
-						PParseToken *bc = pparse_pair(_pc, s);
+						PParseToken *bc = pparse_pair_known(s);
 						PPARSE_FOR_RANGE(q, pparse_next(_pc, s), bc) {
-							if (q->tag & PPARSE_TT_CONST) is_const_param = true;
-							if (q->tag & PPARSE_TT_VOLATILE) is_vol_param = true;
-							if ((q->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
-							    (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE))
-								is_atomic_param = true;
+							is_const_param |= (q->tag & PPARSE_TT_CONST) != 0;
+							is_vol_param |= (q->tag & PPARSE_TT_VOLATILE) != 0;
+							is_atomic_param |= (q->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
+									   (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE);
 						}
 						break;
 					}
@@ -8776,14 +8715,14 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			bool param_needs_shadow =
 			    param_has_bracket || is_const_param || is_vol_param || is_atomic_param || hides_outer_array ||
 			    (!saw_star && (saw_typedef_or_sue || !saw_builtin_type));
-			unsigned traits = (is_const_param ? PPARSE_BIND_CONST : 0) |
-					  (is_vol_param ? PPARSE_BIND_VOLATILE : 0) |
-					  (has_vol_member && is_vol_param ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
-					  (is_atomic_param ? PPARSE_BIND_ATOMIC : 0);
+			unsigned traits = is_const_param * PPARSE_BIND_CONST |
+					  is_vol_param * PPARSE_BIND_VOLATILE |
+					  (has_vol_member && is_vol_param) * PPARSE_BIND_VOLATILE_MEMBER |
+					  is_atomic_param * PPARSE_BIND_ATOMIC;
 			pparse_register_parameter_binding(
 			    last_ident, brace_depth, scope_id, param_needs_shadow, traits);
 		}
-		if (t && pparse_match_ch(t, ',')) t = pparse_next(_pc, t);
+		if (pparse_match_ch(t, ',')) t = pparse_next(_pc, t);
 	}
 }
 
@@ -8797,17 +8736,17 @@ static bool p1d_classify_decl_dims(PParseToken *start,
 	if (!pparse_feat(PPARSE_F_ORELSE)) return false;
 	bool found = false;
 	for (PParseToken *t = start; t && t != end;) {
-		if (pparse_match_ch(t, '[') && pparse_pair(_pc, t) && !(t->flags & PPARSE_TF_C23_ATTR)) {
+		if (pparse_match_ch(t, '[') && !(t->flags & PPARSE_TF_C23_ATTR)) {
 			if (!(pparse_ann(t) & P1_OE_BRACKET))
 				p1d_classify_bracket_orelse_ex(t, cur_sid, cur_func, hard_ctx, allow_se_hoist);
 			found |= (pparse_ann(t) & P1_OE_BRACKET) != 0;
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
 		/* Skip struct/enum bodies and stmt-exprs, but walk into `(...)`
 		 * so dims inside typeof/_Atomic type-specifier parens are seen. */
-		if (pparse_match_ch(t, '{') && pparse_pair(_pc, t)) {
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+		if (pparse_match_ch(t, '{')) {
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
 		t = pparse_next(_pc, t);
@@ -8819,8 +8758,8 @@ static bool pparse_canonical_zero_follows(PParseToken *var) {
 	PPARSE_CTX();
 	PParseToken *t = var;
 	for (int n = 0; t && t->kind != PPARSE_TK_EOF && n < 4096; n++) {
-		if ((t->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, t)) {
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+		if (t->flags & PPARSE_TF_OPEN) {
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
 		if (pparse_match_ch(t, ';')) break;
@@ -8833,10 +8772,11 @@ static bool pparse_canonical_zero_follows(PParseToken *var) {
 		if (t->kind == PPARSE_TK_IDENT && t->len == 16 &&
 		    prism_memeq_static(pparse_loc(_pc, t), "__builtin_memset", 16)) {
 			PParseToken *p = pparse_next(_pc, t), *close;
-			if (!p || !pparse_match_ch(p, '(') || !(close = pparse_pair(_pc, p))) return false;
+			if (!p || !pparse_match_ch(p, '(')) return false;
+			close = pparse_pair_known(p);
 			PParseToken *a = pparse_next(_pc, p);
-			if (a && pparse_match_ch(a, '(') && pparse_pair(_pc, a))
-				a = pparse_next(_pc, pparse_pair(_pc, a));
+			if (a && pparse_match_ch(a, '('))
+				a = pparse_next(_pc, pparse_pair_known(a));
 			if (a && pparse_match_ch(a, '&')) a = pparse_next(_pc, a);
 			if (a && a->kind == PPARSE_TK_IDENT && a->len == var->len &&
 			    prism_memeq_runtime_sized(pparse_loc(_pc, a), pparse_loc(_pc, var), var->len))
@@ -8845,8 +8785,8 @@ static bool pparse_canonical_zero_follows(PParseToken *var) {
 			if (t && pparse_match_ch(t, ';')) t = pparse_next(_pc, t);
 			continue;
 		}
-		if (pparse_match_ch(t, '{') && pparse_pair(_pc, t)) {
-			PParseToken *close = pparse_pair(_pc, t);
+		if (pparse_match_ch(t, '{')) {
+			PParseToken *close = pparse_pair_known(t);
 			bool has_p = false, has_var = false;
 			int k = 0;
 			for (PParseToken *s = pparse_next(_pc, t); s && s != close && k++ < 16;
@@ -8880,45 +8820,46 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 				    unsigned plan_flags,
 				    uint8_t *out_zero) {
 	PPARSE_CTX();
-	bool plain = !decl->is_pointer && !decl->is_func_ptr;
-	bool is_vol = plain ? (type->has_volatile || type->has_volatile_member) : decl->is_volatile;
-	bool is_atomic = plain ? type->has_atomic : decl->is_atomic;
-	bool is_long_double = plain && !type->is_ptr && type->has_long_double;
-	bool is_const = track_const &&
-			(pparse_decl_const_flags(type, decl) & PPARSE_DECL_CONST_EFFECTIVE);
-	bool is_aggregate = brace_depth > 0 && type->is_struct && !type->is_enum && plain &&
-			    !decl->is_array && !decl->is_func_decl;
+	bool plain = !(decl->is_pointer | decl->is_func_ptr);
+	bool type_vol = type->has_volatile | type->has_volatile_member;
+	bool is_vol = (plain & type_vol) | (!plain & decl->is_volatile);
+	bool is_atomic = (plain & type->has_atomic) | (!plain & decl->is_atomic);
+	bool is_long_double = plain & !type->is_ptr & type->has_long_double;
+	bool is_const = track_const &
+			((pparse_decl_const_flags(type, decl) & PPARSE_DECL_CONST_EFFECTIVE) != 0);
+	bool is_aggregate = (brace_depth > 0) & type->is_struct & !type->is_enum & plain &
+			    !decl->is_array & !decl->is_func_decl;
 	bool create = pparse_is_known_typedef(decl->var_name) ||
 		      pparse_is_known_enum_const(decl->var_name) ||
 		      (decl->var_name->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE |
 					     PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN)) ||
 		      (decl->var_name->flags & PPARSE_TF_RAW) ||
 		      pparse_function_symbol(decl->var_name) || is_vol || is_atomic || is_long_double || is_const ||
-		      decl->is_func_decl || is_aggregate;
+			      decl->is_func_decl || is_aggregate;
 	if (create) {
-		unsigned bind = (decl->is_func_decl ? PPARSE_BIND_FUNC : 0) |
-				(is_const ? PPARSE_BIND_CONST : 0) |
-				(is_vol ? PPARSE_BIND_VOLATILE : 0) |
-				(type->has_volatile_member && is_vol ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
-				(is_atomic ? PPARSE_BIND_ATOMIC : 0) |
-				(is_long_double ? PPARSE_BIND_LONG_DOUBLE : 0) |
-				(is_aggregate ? PPARSE_BIND_AGGREGATE : 0) |
-				(type->has_constexpr && plain ? PPARSE_BIND_CONSTEXPR : 0);
+		unsigned bind = decl->is_func_decl * PPARSE_BIND_FUNC |
+				is_const * PPARSE_BIND_CONST |
+				is_vol * PPARSE_BIND_VOLATILE |
+				(type->has_volatile_member & is_vol) * PPARSE_BIND_VOLATILE_MEMBER |
+				is_atomic * PPARSE_BIND_ATOMIC |
+				is_long_double * PPARSE_BIND_LONG_DOUBLE |
+				is_aggregate * PPARSE_BIND_AGGREGATE |
+				(type->has_constexpr & plain) * PPARSE_BIND_CONSTEXPR;
 		pparse_register_shadow_traits(decl->var_name, brace_depth, bind);
 	}
-	if (pparse_feat(PPARSE_F_BOUNDS_CHECK) && decl->var_name) {
-		bool base_array = !is_raw && plain && type->is_array;
-		bool own_array = decl->is_array && (!decl->paren_pointer || decl->paren_array);
-		bool complete = own_array ? decl->array_dim_complete || pparse_match_ch(decl->end, '=')
-					  : !base_array || type->array_dim_complete;
-		bool register_array = !is_raw &&
-			(brace_depth > 0 || (brace_depth == 0 && (own_array || base_array))) &&
-			complete && (own_array || base_array) && !decl->is_func_ptr;
+	if (pparse_feat(PPARSE_F_BOUNDS_CHECK)) {
+		bool base_array = !is_raw & plain & type->is_array;
+		bool own_array = decl->is_array & (!decl->paren_pointer | decl->paren_array);
+		bool complete = (own_array & (decl->array_dim_complete | pparse_match_ch(decl->end, '='))) |
+				(!own_array & (!base_array | type->array_dim_complete));
+		bool register_array = !is_raw &
+			((brace_depth > 0) | ((brace_depth == 0) & (own_array | base_array))) &
+			complete & (own_array | base_array) & !decl->is_func_ptr;
 		if (!register_array && pparse_bounds_is_tracked_array(decl->var_name))
 			pparse_register_array_binding(decl->var_name, 0, false, false, true);
 		if (register_array) {
 			int rank = decl->array_rank + type->type_array_rank;
-			if (!rank && base_array) rank = 1;
+			rank += (!rank & base_array);
 			if (rank > 15) rank = PPARSE_ARRAY_RANK_WRAP_ALL;
 			if (create) {
 				PParseTypedefEntry *entry = pparse_binding_entry(decl->var_name, true);
@@ -8932,17 +8873,16 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 			    decl->var_name, (uint8_t)rank, complete, false, false);
 		}
 	}
-	if (!is_raw && (type->is_vla || decl->is_vla) && decl->var_name && brace_depth > 0)
+	if (!is_raw && (type->is_vla || decl->is_vla) && brace_depth > 0)
 		pparse_register_vla_preserving_array(decl->var_name, brace_depth);
-	uint8_t shape = (((decl->is_vla && (!decl->paren_pointer || decl->paren_array)) ||
-			  (type->is_vla && !decl->is_pointer)) ? P1DS_EFF_VLA : 0) |
-			(((decl->is_array && (!decl->paren_pointer || decl->paren_array)) ||
-			  ((type->is_struct || type->is_typedef || type->is_array) && !decl->is_pointer))
-			     ? P1DS_AGG : 0) |
-			((type->is_union && !decl->is_pointer) ? P1DS_UNION : 0) |
-			((decl->is_func_decl ||
-			  (type->is_func && !decl->is_pointer && !decl->is_array && !decl->is_func_ptr))
-			     ? P1DS_FUNC : 0);
+	uint8_t shape =
+	    ((decl->is_vla & (!decl->paren_pointer | decl->paren_array)) |
+	     (type->is_vla & !decl->is_pointer)) * P1DS_EFF_VLA |
+	    ((decl->is_array & (!decl->paren_pointer | decl->paren_array)) |
+	     ((type->is_struct | type->is_typedef | type->is_array) & !decl->is_pointer)) * P1DS_AGG |
+	    (type->is_union & !decl->is_pointer) * P1DS_UNION |
+	    (decl->is_func_decl |
+	     (type->is_func & !decl->is_pointer & !decl->is_array & !decl->is_func_ptr)) * P1DS_FUNC;
 	uint8_t zero = p1_decl_zero_plan(decl->var_name,
 					    shape,
 					    type_start,
@@ -8957,11 +8897,11 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 	if (!record) return NULL;
 	uint32_t recipe = P1_DECL_RECIPE | ((uint32_t)zero << P1_DECL_ZERO_SHIFT);
 	unsigned cf = pparse_decl_const_flags(type, decl);
-	if (cf & PPARSE_DECL_CONST_EXPLICIT) recipe |= P1_DECL_EXPLICIT_CONST;
-	if (cf & PPARSE_DECL_CONST_EFFECTIVE) recipe |= P1_DECL_EFFECTIVE_CONST;
-	if (decl->has_bracket_orelse) recipe |= P1_DECL_BRACKET_OE;
-	if (plain && (type->has_volatile || type->has_volatile_member || type->has_hidden_volatile))
-		recipe |= P1_DECL_VOLATILE_VALUE;
+	recipe |= ((cf & PPARSE_DECL_CONST_EXPLICIT) != 0) * P1_DECL_EXPLICIT_CONST |
+		  ((cf & PPARSE_DECL_CONST_EFFECTIVE) != 0) * P1_DECL_EFFECTIVE_CONST |
+		  decl->has_bracket_orelse * P1_DECL_BRACKET_OE |
+		  (plain & (type->has_volatile | type->has_volatile_member | type->has_hidden_volatile)) *
+		      P1_DECL_VOLATILE_VALUE;
 	if (zero == P1Z_MEMSET && pparse_canonical_zero_follows(decl->var_name))
 		recipe |= P1_DECL_ALREADY_ZERO;
 	pparse_ann(decl->var_name) |= recipe;
@@ -9043,8 +8983,8 @@ static void p1_scan_init_shadows(PParseToken *open,
 				PParseToken *brace = pparse_find_struct_body_brace(tw);
 				if (brace) pparse_enum_constants(brace, brace_depth);
 			}
-			if (tw->flags & PPARSE_TF_OPEN && pparse_pair(_pc, tw)) {
-				tw = pparse_next(_pc, pparse_pair(_pc, tw));
+			if (tw->flags & PPARSE_TF_OPEN) {
+				tw = pparse_next(_pc, pparse_pair_known(tw));
 				continue;
 			}
 			tw = pparse_next(_pc, tw);
@@ -9052,7 +8992,7 @@ static void p1_scan_init_shadows(PParseToken *open,
 		PPARSE_TD_SCOPE_RESTORE();
 		return;
 	}
-	if (!init_tok || !(init_tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT |
+	if (!(init_tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT |
 					    PPARSE_TT_INLINE | PPARSE_TT_STORAGE) ||
 			   pparse_is_known_typedef(init_tok)))
 		return;
@@ -9100,7 +9040,7 @@ static void p1_scan_init_shadows(PParseToken *open,
 				t = pparse_next(_pc, t);
 				while (t && t != init_end && t->kind != PPARSE_TK_EOF) {
 					if (t->flags & PPARSE_TF_OPEN) {
-						t = pparse_pair(_pc, t) ? pparse_next(_pc, pparse_pair(_pc, t)) : pparse_next(_pc, t);
+						t = pparse_next(_pc, pparse_pair_known(t));
 						continue;
 					}
 					if (pparse_match_ch(t, ',')) break;
@@ -9125,19 +9065,19 @@ static void
 p1d_scan_ctrl_init(PParseToken *tok, uint32_t **skip_cache, int brace_depth, uint16_t cur_sid, bool is_for) {
 	PPARSE_CTX();
 	PParseToken *open = pparse_p1d_find_open_paren(tok);
-	if (!open || !pparse_pair(_pc, open)) return;
-	PParseToken *close = pparse_pair(_pc, open);
+	if (!open) return;
+	PParseToken *close = pparse_pair_known(open);
 	PParseToken *init_end = pparse_find_init_semicolon(open, close);
 	/* C23 if/switch: `if (int x = 1)` has no semicolon inside the parens —
 	 * the declaration runs to the closing `)`. */
-	if (!init_end && !is_for && close) init_end = close;
+	if (!init_end && !is_for) init_end = close;
 	if (!init_end) return;
 	PParseToken *body_start = pparse_skip_prep_dirs(pparse_next(_pc, close));
 	uint16_t body_sid = pparse_scope_id(body_start);
 	uint32_t body_end_idx = pparse_idx(_pc, close);
-	if (is_for && body_start && pparse_match_ch(body_start, '{') && pparse_pair(_pc, body_start)) {
+	if (is_for && body_start && pparse_match_ch(body_start, '{')) {
 		/* C99 §6.8.5p3: for-init scope extends to the entire loop body. */
-		body_end_idx = pparse_idx(_pc, pparse_pair(_pc, body_start));
+		body_end_idx = pparse_idx(_pc, pparse_pair_known(body_start));
 	} else {
 		uint32_t *cache = p1d_ensure_skip_cache(skip_cache);
 		PParseToken *stmt_end = pparse_skip_one_stmt_impl(body_start, cache);
@@ -9170,7 +9110,7 @@ p1_check_defer_same_block_shadow(PParseToken *var_name, uint16_t cur_sid, int p1
 		if (e->kind != P1K_DEFER || e->scope_id != cur_sid) continue;
 		PParseToken *body = pparse_next(_pc, p1_tok(e));
 		if (!body) continue;
-		PParseToken *body_end = pparse_match_ch(body, '{') ? pparse_pair(_pc, body) : NULL;
+		PParseToken *body_end = pparse_match_ch(body, '{') ? pparse_pair_known(body) : NULL;
 		if (!body_end) body_end = pparse_skip_to_semicolon(body, NULL);
 		uint32_t var_idx = pparse_idx(_pc, var_name);
 		uint32_t bi = pparse_idx(_pc, body);
@@ -9184,7 +9124,7 @@ p1_check_defer_same_block_shadow(PParseToken *var_name, uint16_t cur_sid, int p1
 static void p1_check_enum_body_defer_shadow(PParseToken *brace, uint16_t cur_sid, int p1d_cur_func) {
 	PPARSE_CTX();
 	if (!pparse_feat(PPARSE_F_DEFER) || p1d_cur_func < 0) return;
-	PParseToken *end = pparse_pair(_pc, brace);
+	PParseToken *end = pparse_pair_known(brace);
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, brace), end)
 		if (pparse_ann(t) & P1_DEFER_SHADOW_NAME)
 			p1_check_defer_same_block_shadow(t, cur_sid, p1d_cur_func);
@@ -9236,8 +9176,8 @@ static PParseToken *pparse_defer_chain_skip_do_tail(PParseToken *t, uint16_t sid
 	PParseToken *pre = pparse_walk_back(open_idx, PPARSE_WB_PAST_NOISE);
 	if (!pre || !(pre->tag & PPARSE_TT_LOOP) || pre->ch0 != 'd') return NULL;
 	PParseToken *op = pparse_skip_noise(_pc, pparse_next(_pc, t));
-	if (!op || !pparse_match_ch(op, '(') || !pparse_pair(_pc, op)) return NULL;
-	PParseToken *semi = pparse_skip_noise(_pc, pparse_next(_pc, pparse_pair(_pc, op)));
+	if (!op || !pparse_match_ch(op, '(')) return NULL;
+	PParseToken *semi = pparse_skip_noise(_pc, pparse_next(_pc, pparse_pair_known(op)));
 	if (!semi || !pparse_match_ch(semi, ';')) return NULL;
 	return pparse_next(_pc, semi);
 }
@@ -9404,7 +9344,7 @@ static void defer_body_populate_captures(
 			void *fv = pparse_hashmap_get(&for_scopes, name, nlen);
 			if (fv) {
 				uint32_t fe = (uint32_t)(uintptr_t)fv;
-				if (fe == 0 || pparse_idx(_pc, t) <= fe) continue; // hidden by for-init
+				if (pparse_idx(_pc, t) <= fe) continue; // hidden by for-init
 				pparse_hashmap_put(&for_scopes, name, nlen, NULL);
 			}
 			if (val) {
@@ -9428,9 +9368,9 @@ static void defer_body_populate_captures(
 			}
 			if (for_init_pd >= 0 && in_decl) {
 				uint32_t fbe = 0;
-				if (for_header_open && pparse_pair(_pc, for_header_open)) {
+				if (for_header_open) {
 					PParseToken *end =
-					    pparse_skip_one_stmt_impl(pparse_next(_pc, pparse_pair(_pc, for_header_open)), NULL);
+					    pparse_skip_one_stmt_impl(pparse_next(_pc, pparse_pair_known(for_header_open)), NULL);
 					fbe = end ? pparse_idx(_pc, end) : 0;
 				}
 				pparse_hashmap_put(&for_scopes, name, nlen, (void *)(uintptr_t)fbe);
@@ -9453,11 +9393,11 @@ static void p1_reject_defer_in_uneval_operand(PParseToken *defer_tok, uint16_t s
 		if (!pparse_match_ch(se_open, '(')) break;
 		PParseToken *intro = pparse_walk_back(pparse_idx(_pc, se_open), PPARSE_WB_ATTR_NOISE);
 		/* Peel redundant paren wrappers: sizeof((({…}))). */
-		while (intro && pparse_match_ch(intro, '(') && (intro->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, intro)) {
-			PParseToken *outer_close = pparse_pair(_pc, intro);
+		while (intro && pparse_match_ch(intro, '(') && (intro->flags & PPARSE_TF_OPEN)) {
+			PParseToken *outer_close = pparse_pair_known(intro);
 			PParseToken *se_close_brace = &pparse_token_pool[pparse_scope_close(&pparse_scope_tree[s])];
 			PParseToken *se_paren_close = pparse_next(_pc, se_close_brace);
-			if (!outer_close || !se_paren_close ||
+			if (!se_paren_close ||
 			    pparse_idx(_pc, outer_close) < pparse_idx(_pc, se_paren_close))
 				break;
 			intro = pparse_walk_back(pparse_idx(_pc, intro), PPARSE_WB_ATTR_NOISE);
@@ -9506,7 +9446,7 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 	}
 	{
 		PParseToken *body = pparse_skip_noise(_pc, pparse_next(_pc, tok));
-		PParseToken *body_end = body && pparse_match_ch(body, '{') ? pparse_pair(_pc, body) : NULL;
+		PParseToken *body_end = body && pparse_match_ch(body, '{') ? pparse_pair_known(body) : NULL;
 		if (body_end) {
 			pparse_ann(tok) |= P1_DEFER_BODY_RECIPE;
 			tok->pair_idx = pparse_idx(_pc, body_end);
@@ -9584,7 +9524,7 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 	pparse_validate_defer_statement(pparse_next(_pc, tok), false, false, 0);
 	if (defer_entry) {
 		PParseToken *body = pparse_next(_pc, tok);
-		PParseToken *body_end = body && pparse_match_ch(body, '{') ? pparse_pair(_pc, body) : NULL;
+		PParseToken *body_end = body && pparse_match_ch(body, '{') ? pparse_pair_known(body) : NULL;
 		if (body && !body_end) body_end = pparse_skip_to_semicolon(body, NULL);
 		if (body_end)
 			defer_body_populate_captures(body,
@@ -9598,11 +9538,10 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 // the parameter names do not exist.
 static void p1d_scan_param_bracket_orelse(PParseToken *open_paren, bool is_proto) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open_paren);
-	if (!close) return;
+	PParseToken *close = pparse_pair_known(open_paren);
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, open_paren), close) {
-		if (pparse_match_ch(t, '[') && pparse_pair(_pc, t) && !(t->flags & PPARSE_TF_C23_ATTR)) {
-			PParseToken *bc = pparse_pair(_pc, t);
+		if (pparse_match_ch(t, '[') && !(t->flags & PPARSE_TF_C23_ATTR)) {
+			PParseToken *bc = pparse_pair_known(t);
 			PPARSE_FOR_RANGE(s, pparse_next(_pc, t), bc) {
 				PPARSE_SKIP_GROUP_ON_CLOSE(s)
 				if (pparse_is_orelse_kw_shadow(s))
@@ -9616,9 +9555,9 @@ static void p1d_scan_param_bracket_orelse(PParseToken *open_paren, bool is_proto
 			t = bc;
 			continue;
 		}
-		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '(') && pparse_pair(_pc, t)) {
+		if ((t->flags & PPARSE_TF_OPEN) && pparse_match_ch(t, '(')) {
 			p1d_scan_param_bracket_orelse(t, is_proto);
-			t = pparse_pair(_pc, t);
+			t = pparse_pair_known(t);
 			continue;
 		}
 		PPARSE_SKIP_GROUP_ON_CLOSE(t)
@@ -9627,16 +9566,15 @@ static void p1d_scan_param_bracket_orelse(PParseToken *open_paren, bool is_proto
 
 static bool pparse_bracket_in_compound_literal_type(PParseToken *open_bracket) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open_bracket);
-	if (!close) return false;
+	PParseToken *close = pparse_pair_known(open_bracket);
 	PParseToken *t = pparse_next(_pc, close);
 	while (t && t->kind != PPARSE_TK_EOF) {
-		if (pparse_match_ch(t, '[') && pparse_pair(_pc, t) && !(t->flags & PPARSE_TF_C23_ATTR)) {
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+		if (pparse_match_ch(t, '[') && !(t->flags & PPARSE_TF_C23_ATTR)) {
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
-		if ((t->flags & PPARSE_TF_C23_ATTR) && pparse_pair(_pc, t)) {
-			t = pparse_next(_pc, pparse_pair(_pc, t));
+		if (t->flags & PPARSE_TF_C23_ATTR) {
+			t = pparse_next(_pc, pparse_pair_known(t));
 			continue;
 		}
 		break;
@@ -9672,14 +9610,12 @@ static bool pparse_bracket_is_designator_index(PParseToken *open_bracket) {
 }
 static bool pparse_bracket_contains_gnu_range(PParseToken *open_bracket) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, open_bracket);
-	if (!close) return false;
+	PParseToken *close = pparse_pair_known(open_bracket);
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, open_bracket), close) {
 		if (t->kind == PPARSE_TK_PUNCT && t->len == 3 && t->ch0 == '.' && pparse_loc(_pc, t)[1] == '.' &&
 		    pparse_loc(_pc, t)[2] == '.')
 			return true;
-		PParseToken *group_close = t->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, t) : NULL;
-		if (group_close) t = group_close;
+		if (t->flags & PPARSE_TF_OPEN) t = pparse_pair_known(t);
 	}
 	return false;
 }
@@ -9710,13 +9646,12 @@ static PParseToken *p1d_reject_group_orelse(PParseToken *intro, bool skip_dims) 
 	PPARSE_CTX();
 	PParseToken *open = pparse_skip_noise(_pc, pparse_next(_pc, intro));
 	if (!open || !pparse_match_ch(open, '(') || !(open->flags & PPARSE_TF_OPEN)) return NULL;
-	PParseToken *close = pparse_pair(_pc, open);
-	if (!close) return NULL;
+	PParseToken *close = pparse_pair_known(open);
 	PParseToken *prev = open;
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, open), close) {
 		if (skip_dims && pparse_match_ch(t, '[') && (t->flags & PPARSE_TF_OPEN) &&
-		    !(t->flags & PPARSE_TF_C23_ATTR) && pparse_pair(_pc, t)) {
-			t = pparse_pair(_pc, t);
+		    !(t->flags & PPARSE_TF_C23_ATTR)) {
+			t = pparse_pair_known(t);
 			prev = t;
 			continue;
 		}
@@ -9732,15 +9667,15 @@ static void __attribute__((noinline))
 p1d_classify_bracket_orelse_ex(PParseToken *tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx,
 			       bool allow_se_hoist) {
 	PPARSE_CTX();
-	PParseToken *close = pparse_pair(_pc, tok);
+	PParseToken *close = pparse_pair_known(tok);
 	if (!(tok->flags & PPARSE_TF_HAS_PRISM)) return;
 	/* Function-parameter dimensions reject orelse before annotation. */
 	PParseToken *param_open = pparse_feat(PPARSE_F_ORELSE) ? pparse_function_param_open(tok) : NULL;
 	if (param_open) {
 		bool is_proto = true;
-		PParseToken *pc = pparse_pair(_pc, param_open);
-		PParseToken *after = pc ? pparse_skip_asm_specifier_trail(pparse_next(_pc, pc)) : NULL;
-		is_proto = !after || !pparse_match_ch(after, '{');
+		PParseToken *pc = pparse_pair_known(param_open);
+		PParseToken *after = pparse_skip_asm_specifier_trail(pparse_next(_pc, pc));
+		is_proto = !pparse_match_ch(after, '{');
 		/* Walk every token — do not skip nested groups, or
 		 * `int a[sizeof(0 orelse 1)]` in a prototype would lower. */
 		PParseToken *prev_s = tok;
@@ -9909,7 +9844,8 @@ p1d_classify_bracket_orelse_ex(PParseToken *tok, uint16_t cur_sid, int p1d_cur_f
 static void p1d_annotate_typeof_orelse(PParseToken *typeof_tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx) {
 	PPARSE_CTX();
 	PParseToken *paren = pparse_next(_pc, typeof_tok);
-	if (!paren || !pparse_match_ch(paren, '(') || !pparse_pair(_pc, paren)) return;
+	if (!paren || !pparse_match_ch(paren, '(')) return;
+	PParseToken *close = pparse_pair_known(paren);
 	const char *msg = NULL;
 	if (hard_ctx) {
 		if (cur_sid > 0 && cur_sid < pparse_scope_tree_count && pparse_scope_tree[cur_sid].is_struct)
@@ -9919,14 +9855,14 @@ static void p1d_annotate_typeof_orelse(PParseToken *typeof_tok, uint16_t cur_sid
 			msg = "'orelse' inside typeof at file scope is not allowed";
 	}
 	if (msg) {
-		PPARSE_FOR_RANGE(s, pparse_next(_pc, paren), pparse_pair(_pc, paren))
+		PPARSE_FOR_RANGE(s, pparse_next(_pc, paren), close)
 			if ((s->tag & PPARSE_TT_ORELSE) && !pparse_token_has_binding(s)) pparse_error_tok(s, msg);
 		return;
 	}
 	PParseToken *prev_typeof = paren;
 	PParseToken *se_start = pparse_next(_pc, paren);
 	bool typeof_has_oe = false;
-	PPARSE_FOR_RANGE(s, pparse_next(_pc, paren), pparse_pair(_pc, paren)) {
+	PPARSE_FOR_RANGE(s, pparse_next(_pc, paren), close) {
 		/* Uneval intros nested in typeof — `typeof(sizeof(0 orelse 1))` —
 		 * must reject like a bare `sizeof(… orelse …)`, not lower.
 		 * Do NOT treat nested `typeof` as uneval here: expression
@@ -9976,16 +9912,15 @@ static void p1d_reject_orelse_chain_after_ctrl(PParseToken *oe_kw) {
 		if (!(act->tag & PPARSE_TT_RETURN) && u && pparse_is_identifier_like(u) && !orelse_kw_at_bare(u, act))
 			u = pparse_next(_pc, u);
 		sp = act;
-	} else if (pparse_match_ch(act, '{') && (act->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, act)) {
+	} else if (pparse_match_ch(act, '{') && (act->flags & PPARSE_TF_OPEN)) {
 		/* Block-form action: further `orelse` after `}` cannot continue the chain. */
-		sp = pparse_pair(_pc, act);
+		sp = pparse_pair_known(act);
 		u = pparse_next(_pc, sp);
 	} else
 		return;
 	for (; u && u->kind != PPARSE_TK_EOF; u = pparse_next(_pc, u)) {
 		if (u->flags & PPARSE_TF_OPEN) {
-			sp = pparse_pair(_pc, u);
-			u = pparse_pair(_pc, u);
+			u = sp = pparse_pair_known(u);
 			continue;
 		}
 		if ((u->flags & PPARSE_TF_CLOSE) || pparse_match_ch(u, ';') || pparse_match_ch(u, ',')) break;
@@ -10013,8 +9948,8 @@ static bool p1d_lhs_is_const_shadow(PParseToken *start, PParseToken *eq_tok) {
 	PPARSE_CTX();
 	PParseToken *lhs_start = pparse_skip_noise(_pc, start);
 	PParseToken *lhs_end = eq_tok;
-	while (lhs_start && pparse_match_ch(lhs_start, '(') && pparse_pair(_pc, lhs_start)) {
-		PParseToken *close = pparse_pair(_pc, lhs_start);
+	while (lhs_start && pparse_match_ch(lhs_start, '(')) {
+		PParseToken *close = pparse_pair_known(lhs_start);
 		if (pparse_skip_noise(_pc, pparse_next(_pc, close)) != lhs_end) break;
 		lhs_start = pparse_skip_noise(_pc, pparse_next(_pc, lhs_start));
 		lhs_end = close;
@@ -10063,7 +9998,8 @@ static int p1d_try_annotate_init_orelse(PParseToken *t,
 static PParseToken *
 p1d_scan_balanced_group(PParseToken *tok, int brace_depth, int cur_func, uint16_t cur_sid, PParseToken *prev_saved) {
 	PPARSE_CTX();
-	PParseToken *group_end = pparse_pair(_pc, tok);
+	const bool has_orelse = pparse_feat(PPARSE_F_ORELSE);
+	PParseToken *group_end = pparse_pair_known(tok);
 	PParseToken *stmt_expr_open = NULL;
 	PParseToken *prev_inner = NULL;
 	int se_depth = 0;
@@ -10073,7 +10009,7 @@ p1d_scan_balanced_group(PParseToken *tok, int brace_depth, int cur_func, uint16_
 	 * that outer bracket as a declarator dim — otherwise
 	 * `typedef int T[sizeof(int orelse 0)]` and `typedef int T[n orelse 1]`
 	 * never hit p1d_classify_decl_dims and leak orelse. */
-	if (pparse_feat(PPARSE_F_ORELSE) && pparse_match_ch(tok, '[') && pparse_pair(_pc, tok) && !(tok->flags & PPARSE_TF_C23_ATTR) &&
+	if (has_orelse && pparse_match_ch(tok, '[') && !(tok->flags & PPARSE_TF_C23_ATTR) &&
 	    !(pparse_ann(tok) & P1_OE_BRACKET))
 		p1d_classify_bracket_orelse_ex(tok,
 					      cur_sid,
@@ -10082,19 +10018,19 @@ p1d_scan_balanced_group(PParseToken *tok, int brace_depth, int cur_func, uint16_
 					      /*allow_se_hoist=*/cur_func >= 0);
 	PPARSE_FOR_RANGE(inner, pparse_next(_pc, tok), group_end) {
 		if (inner->flags & PPARSE_TF_OPEN) {
-			if (pparse_feat(PPARSE_F_ORELSE) && pparse_match_ch(inner, '[') && pparse_pair(_pc, inner) &&
+			if (has_orelse && pparse_match_ch(inner, '[') &&
 			    !(inner->flags & PPARSE_TF_C23_ATTR) && !(pparse_ann(inner) & P1_OE_BRACKET))
 				p1d_classify_bracket_orelse_ex(
 				    inner, cur_sid, cur_func, cur_func >= 0, /*allow_se_hoist=*/false);
 			if (pparse_is_stmt_expr_open(inner)) {
 				se_depth++;
 				PParseToken *se_brace = pparse_skip_noise(_pc, pparse_next(_pc, inner));
-				PParseToken *brace_close = se_brace ? pparse_pair(_pc, se_brace) : NULL;
+				PParseToken *brace_close = se_brace ? pparse_pair_known(se_brace) : NULL;
 				if (se_close_top < 64 && brace_close)
 					se_close_stack[se_close_top++] = brace_close;
 			}
 		}
-		if (pparse_feat(PPARSE_F_ORELSE) && (inner->tag & PPARSE_TT_TYPEOF))
+		if (has_orelse && (inner->tag & PPARSE_TT_TYPEOF))
 			p1d_annotate_typeof_orelse(inner, cur_sid, cur_func, cur_func >= 0);
 		if (inner->flags & PPARSE_TF_CLOSE) {
 			if (se_close_top > 0 && inner == se_close_stack[se_close_top - 1]) {
@@ -10247,22 +10183,21 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 		pparse_error_tok(eq_tok,
 			  "bare assignment with 'orelse' cannot use compound operators "
 			  "(e.g. +=, -=); use a plain '=' assignment");
-	bool has_eq = eq_tok != NULL;
 	if (tok == bare_oe) pparse_error_tok(tok, PPARSE_ERR_ORELSE_EXPECT_EXPR);
 	if (eq_tok && pparse_skip_noise(_pc, pparse_next(_pc, eq_tok)) == bare_oe)
 		pparse_error_tok(bare_oe, PPARSE_ERR_ORELSE_EXPECT_EXPR);
 	PParseToken *after_oe = pparse_next(_pc, bare_oe);
 	if (orelse_next_is_empty_action(after_oe))
 		pparse_error_tok(after_oe, PPARSE_ERR_ORELSE_EXPECT_STMT);
-	if (!has_eq && is_orelse_value_fallback(after_oe))
+	if (!eq_tok && is_orelse_value_fallback(after_oe))
 		pparse_error_tok(after_oe,
 			  "orelse fallback requires an assignment target "
 			  "(use a declaration)");
-	if (has_eq && eq_tok) {
-		if (scan_start != eq_tok && pparse_match_ch(scan_start, '(') && pparse_pair(_pc, scan_start)) {
+	if (eq_tok) {
+		if (scan_start != eq_tok && pparse_match_ch(scan_start, '(')) {
 			PParseToken *inner_first = pparse_next(_pc, scan_start);
-			PParseToken *pclose = pparse_pair(_pc, scan_start);
-			if (inner_first && pclose && pparse_next(_pc, pclose) != eq_tok &&
+			PParseToken *pclose = pparse_pair_known(scan_start);
+			if (pparse_next(_pc, pclose) != eq_tok &&
 			    (inner_first->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF) ||
 			     pparse_is_known_typedef(inner_first)))
 				pparse_error_tok(scan_start,
@@ -10273,7 +10208,7 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 			pparse_error_tok(eq_tok, "orelse fallback cannot reassign a const-qualified variable");
 	}
 
-	bool value_fallback = has_eq && is_orelse_value_fallback(after_oe);
+	bool value_fallback = eq_tok && is_orelse_value_fallback(after_oe);
 	bool fb_cl_comma = false, fb_cl_semi = false;
 	if (value_fallback) {
 		reject_orelse_side_effects(scan_start, eq_tok, PPARSE_OE_SE_ORELSE_FALLBACK_ON_ASSIGNM_MAIN);
@@ -10309,21 +10244,21 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 				reject_orelse_side_effects(rhs_start, bare_oe, PPARSE_OE_SE_BARE_ORELSE_WITH_INDIRECTI_TYPEOF);
 	}
 
-	if (has_eq) {
+	if (eq_tok) {
 		PParseToken *ppc = pparse_span_find_pp_conditional(scan_start, NULL, true);
 		if (ppc) pparse_error_tok(bare_oe, PPARSE_ERR_BARE_ORELSE_SPANS_PP);
 	}
-	if (has_eq && eq_tok) {
+	if (eq_tok) {
 		PParseToken *rhs = pparse_next(_pc, eq_tok);
 		if (pparse_expr_is_aggregate_value(rhs, bare_oe) || pparse_expr_is_aggregate_value(scan_start, eq_tok))
 			pparse_error_tok(bare_oe, PPARSE_ERR_ORELSE_STRUCT_VALUE);
 	}
 	if (value_fallback) {
 		uint32_t recipe = P1_OE_BARE_RECIPE |
-				  (fb_cl_comma ? P1_OE_FALLBACK_CL_COMMA : 0) |
-				  (fb_cl_semi ? P1_OE_FALLBACK_CL_SEMI : 0) |
-				  (lhs_indirect ? P1_OE_LHS_INDIRECT : 0) |
-				  (bare_lhs_has_indirection(tok, eq_tok) ? P1_OE_FULL_LHS_INDIRECT : 0);
+				  fb_cl_comma * P1_OE_FALLBACK_CL_COMMA |
+				  fb_cl_semi * P1_OE_FALLBACK_CL_SEMI |
+				  lhs_indirect * P1_OE_LHS_INDIRECT |
+				  bare_lhs_has_indirection(tok, eq_tok) * P1_OE_FULL_LHS_INDIRECT;
 		PPARSE_FOR_RANGE(s, pparse_next(_pc, eq_tok), bare_oe)
 			if (s->tag & PPARSE_TT_MEMBER) {
 				recipe |= P1_OE_RHS_MEMBER;
@@ -10341,8 +10276,7 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 		int ternary = 0;
 		PPARSE_FOR_TAIL(s, pparse_next(_pc, bare_oe)) {
 			if (s->flags & PPARSE_TF_OPEN) {
-				prev = pparse_pair(_pc, s);
-				s = pparse_pair(_pc, s);
+				s = prev = pparse_pair_known(s);
 				continue;
 			}
 			if ((s->flags & PPARSE_TF_CLOSE) || pparse_match_ch(s, ';')) break;
@@ -10397,6 +10331,7 @@ static void p1d_reject_decl_orelse_pp(PParseToken *eq, PParseToken *orelse) {
 
 static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, PParseToken **out_first_orelse) {
 	PPARSE_CTX();
+	const bool has_flow_ext = pparse_feat(PPARSE_F_ORELSE | PPARSE_F_DEFER);
 	PParseToken *prev_init_tok = NULL;
 	bool init_is_first = true;
 	int init_td = 0;
@@ -10452,14 +10387,14 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 			if (out_first_orelse && *out_first_orelse == t) p1d_reject_decl_orelse_pp(eq, t);
 		}
 		if (t->flags & PPARSE_TF_OPEN) {
-			PParseToken *m = pparse_pair(_pc, t);
-			if (m && pparse_match_ch(t, '(') && !pparse_is_stmt_expr_open(t)) {
+			PParseToken *m = pparse_pair_known(t);
+			if (pparse_match_ch(t, '(') && !pparse_is_stmt_expr_open(t)) {
 				PParseToken *am = pparse_next(_pc, m);
 				if (init_is_first &&
-				    (!am || pparse_match_ch(am, ',') || pparse_match_ch(am, ';') || am->kind == PPARSE_TK_EOF)) {
+				    (pparse_match_ch(am, ',') || pparse_match_ch(am, ';') || am->kind == PPARSE_TK_EOF)) {
 					PParseToken *prev_inner = NULL;
 					bool p1d_inner_d0_comma = false;
-					for (PParseToken *inner = pparse_next(_pc, t); inner && inner != m;
+					for (PParseToken *inner = pparse_next(_pc, t); inner != m;
 					     inner = pparse_next(_pc, inner)) {
 						if (pparse_match_ch(inner, ',')) p1d_inner_d0_comma = true;
 						if (p1d_try_annotate_init_orelse(inner,
@@ -10473,11 +10408,11 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 							continue;
 						}
 						if (inner->flags & PPARSE_TF_OPEN) {
-							if ((pparse_feat(PPARSE_F_ORELSE) || pparse_feat(PPARSE_F_DEFER)) &&
+							if (has_flow_ext &&
 							    pparse_match_ch(inner, '(') &&
 							    !(prev_inner && (prev_inner->tag & PPARSE_TT_TYPEOF)))
 								check_orelse_in_parens(inner);
-							inner = pparse_pair(_pc, inner);
+							inner = pparse_pair_known(inner);
 							prev_inner = inner;
 							continue;
 						}
@@ -10487,8 +10422,8 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 						PPARSE_FOR_RANGE(u, pparse_next(_pc, t), m) {
 							pparse_ann(u) &=
 							    (uint16_t)~(P1_OE_DECL_INIT | P1_IS_ORELSE_KW);
-							if (u->flags & PPARSE_TF_OPEN && pparse_pair(_pc, u)) {
-								u = pparse_pair(_pc, u);
+							if (u->flags & PPARSE_TF_OPEN) {
+								u = pparse_pair_known(u);
 								continue;
 							}
 						}
@@ -10504,14 +10439,11 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 						eq->flags |= PPARSE_TF_LINK_JUMP;
 						t->flags &= ~PPARSE_TF_OPEN;
 						PParseToken *before_close = t;
-						for (PParseToken *u = pparse_next(_pc, t); u && u != m;) {
+						for (PParseToken *u = pparse_next(_pc, t); u != m;) {
 							if (u->flags & PPARSE_TF_OPEN) {
-								PParseToken *um = pparse_pair(_pc, u);
-								if (um) {
-									before_close = um;
-									u = pparse_next(_pc, um);
-									continue;
-								}
+								before_close = pparse_pair_known(u);
+								u = pparse_next(_pc, before_close);
+								continue;
 							}
 							before_close = u;
 							u = pparse_next(_pc, u);
@@ -10519,12 +10451,12 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 						before_close->parse_data = pparse_idx(_pc, m) + 1;
 						before_close->flags |= PPARSE_TF_LINK_JUMP;
 					}
-				} else if ((pparse_feat(PPARSE_F_ORELSE) || pparse_feat(PPARSE_F_DEFER)) &&
+			} else if (has_flow_ext &&
 					   !(prev_init_tok && (prev_init_tok->tag & PPARSE_TT_TYPEOF)))
 					check_orelse_in_parens(t);
 			}
-			prev_init_tok = m ? m : t;
-			t = m ? pparse_next(_pc, m) : pparse_next(_pc, t);
+			prev_init_tok = m;
+			t = pparse_next(_pc, m);
 			init_is_first = false;
 			continue;
 		}
@@ -10579,8 +10511,7 @@ static void p1d_validate_decl_orelse(PParseToken *var_name,
 		for (PParseToken *s = first_orelse; s && s->kind != PPARSE_TK_EOF && !pparse_match_ch(s, ';') && !pparse_match_ch(s, ',');
 		     s = pparse_next(_pc, s)) {
 			if (s->flags & PPARSE_TF_OPEN) {
-				prev = pparse_pair(_pc, s);
-				s = pparse_pair(_pc, s);
+				s = prev = pparse_pair_known(s);
 				continue;
 			}
 			if ((pparse_ann(s) & P1_IS_ORELSE_KW) || (prev && orelse_kw_at_bare(s, prev)))
@@ -10625,6 +10556,10 @@ static void p1d_probe_declaration(PParseToken *tok,
 				  bool ctrl_pending,
 				  uint32_t **skip_cache) {
 	PPARSE_CTX();
+	const bool has_defer = pparse_feat(PPARSE_F_DEFER);
+	const bool has_orelse = pparse_feat(PPARSE_F_ORELSE);
+	const bool has_zeroinit = pparse_feat(PPARSE_F_ZEROINIT);
+	const bool has_auto_static = pparse_feat(PPARSE_F_AUTO_STATIC);
 	pparse_ASSERT_NOT_NOISE(tok);
 	if (!(tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT)) && !pparse_is_known_typedef(tok))
 		return;
@@ -10632,7 +10567,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 	PParseToken *type_tok = decl_start ? decl_start : tok;
 	PParseTypeSpec type = pparse_type_specifier(type_tok);
 	if (type.has_raw) *saw_raw = true;
-	if (type.saw_type && pparse_feat(PPARSE_F_DEFER) && cur_func >= 0) {
+	if (type.saw_type && has_defer && cur_func >= 0) {
 		int po = 0, bo = 0;
 		PParseToken *sprev = NULL;
 		PPARSE_FOR_TAIL(s, tok) {
@@ -10653,7 +10588,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 			if (bo == 0 && (po > 0 || s != tok) && (s->tag & PPARSE_TT_DEFER) &&
 			    !pparse_is_known_typedef(s) && !(sprev && (sprev->tag & (PPARSE_TT_SUE | PPARSE_TT_MEMBER)))) {
 				PParseToken *nx = pparse_skip_noise(_pc, pparse_next(_pc, s));
-				if (nx && (pparse_is_identifier_like(nx) || pparse_match_ch(nx, '{')))
+				if (pparse_is_identifier_like(nx) || pparse_match_ch(nx, '{'))
 					pparse_error_tok(s, PPARSE_ERR_DEFER_EXPR_CTX);
 			}
 			if (s->kind != PPARSE_TK_PREP_DIR) sprev = s;
@@ -10681,43 +10616,44 @@ static void p1d_probe_declaration(PParseToken *tok,
 	bool vm_type = (type.has_typeof || type.has_atomic) && (type.is_vla || type.type_vm);
 	bool any_would_memset = false;
 	p1d_classify_decl_dims(type_tok, type.end, cur_sid, cur_func, true, false);
-	while (t && !pparse_match_ch(t, ';') && !pparse_match_ch(t, '{') && t->kind != PPARSE_TK_EOF) {
+	while (!pparse_match_ch(t, ';') && !pparse_match_ch(t, '{') && t->kind != PPARSE_TK_EOF) {
 		bool decl_raw = *saw_raw;
 		t = pparse_p1_skip_decl_raw(t, &decl_raw);
 		PParseDecl decl = pparse_declarator(t);
 		if (!decl.var_name || !decl.end) {
 			// Detect GNU nested function definitions inside outer
-			if (cur_func >= 0 && brace_depth > 0 && (pparse_feat(PPARSE_F_DEFER) || pparse_feat(PPARSE_F_ORELSE)) &&
+			if (cur_func >= 0 && brace_depth > 0 && (has_defer || has_orelse) &&
 			    decl.var_name && !saw_static) {
 				PParseToken *p = pparse_skip_noise(_pc, pparse_next(_pc, decl.var_name));
-				if (p && pparse_match_ch(p, '(') && pparse_pair(_pc, p)) {
-					PParseToken *a = pparse_next(_pc, pparse_pair(_pc, p));
-					while (a && (a->tag & (PPARSE_TT_ATTR | PPARSE_TT_ASM))) {
+				if (pparse_match_ch(p, '(')) {
+					PParseToken *param_close = pparse_pair_known(p);
+					PParseToken *a = pparse_next(_pc, param_close);
+					while (a->tag & (PPARSE_TT_ATTR | PPARSE_TT_ASM)) {
 						a = (a->tag & PPARSE_TT_ASM) ? pparse_next(_pc, a) : pparse_skip_noise(_pc, a);
-						if (a && pparse_match_ch(a, '(') && pparse_pair(_pc, a))
-							a = pparse_next(_pc, pparse_pair(_pc, a));
+						if (pparse_match_ch(a, '('))
+							a = pparse_next(_pc, pparse_pair_known(a));
 					}
-					bool nested = a && pparse_match_ch(a, '{');
+					bool nested = pparse_match_ch(a, '{');
 					PParseToken *body_open = nested ? a : NULL;
 					if (!nested && a) {
 						PParseToken *b = a;
-						while (b && b->kind != PPARSE_TK_EOF && !pparse_match_ch(b, '{') &&
+						while (b->kind != PPARSE_TK_EOF && !pparse_match_ch(b, '{') &&
 						       !pparse_match_ch(b, '}'))
-							b = (b->flags & PPARSE_TF_OPEN && pparse_pair(_pc, b))
-								? pparse_next(_pc, pparse_pair(_pc, b))
+							b = (b->flags & PPARSE_TF_OPEN)
+								? pparse_next(_pc, pparse_pair_known(b))
 								: pparse_next(_pc, b);
-						nested = b && pparse_match_ch(b, '{') &&
-							 pparse_is_knr_params(pparse_next(_pc, pparse_pair(_pc, p)), b);
+						nested = pparse_match_ch(b, '{') &&
+							 pparse_is_knr_params(pparse_next(_pc, param_close), b);
 						if (nested) body_open = b;
 					}
 					if (nested) {
 						bool outer_uses_defer = false;
 						PParseToken *fn_open = func_meta[cur_func].body_open;
-						PParseToken *fn_close = fn_open ? pparse_pair(_pc, fn_open) : NULL;
-						if (fn_open && fn_close) {
+						PParseToken *fn_close = pparse_pair_known(fn_open);
+						{
 							PParseToken *prev_s = NULL;
 							for (PParseToken *s = pparse_next(_pc, fn_open);
-							     s && s != fn_close && s->kind != PPARSE_TK_EOF;
+							     s != fn_close;
 							     prev_s = s, s = pparse_next(_pc, s)) {
 								/* Pass prev so a nested function *named*
 								 * defer / a param named defer is not
@@ -10731,11 +10667,11 @@ static void p1d_probe_declaration(PParseToken *tok,
 						/* Nested bodies are passed through verbatim — orelse/
 						 * defer inside them would misscompile at the backend. */
 						bool nested_uses_prism = false;
-						PParseToken *nclose = body_open ? pparse_pair(_pc, body_open) : NULL;
-						if (body_open && nclose) {
+						PParseToken *nclose = pparse_pair_known(body_open);
+						{
 							PParseToken *prev_n = NULL;
 							for (PParseToken *s = pparse_next(_pc, body_open);
-							     s && s != nclose && s->kind != PPARSE_TK_EOF;
+							     s != nclose;
 							     prev_n = s, s = pparse_next(_pc, s)) {
 								if (is_defer_kw(s, prev_n) ||
 								    (pparse_is_orelse_kw_shadow(s) &&
@@ -10757,9 +10693,10 @@ static void p1d_probe_declaration(PParseToken *tok,
 			break;
 		}
 		if (pparse_match_ch(decl.end, '(') && brace_depth == 0) break; // func def
-		if (decl.end && !pparse_match_ch(decl.end, '=') && !pparse_match_ch(decl.end, ',') &&
-		    !pparse_match_ch(decl.end, ';') && !pparse_match_ch(decl.end, '[') && !pparse_match_ch(decl.end, '(') &&
-		    !pparse_match_ch(decl.end, '{') && !pparse_match_ch(decl.end, ')') && !pparse_match_ch(decl.end, ':'))
+		if (!pparse_match_set(decl.end,
+				      pparse_CH('=') | pparse_CH(',') | pparse_CH(';') | pparse_CH('[') |
+					  pparse_CH('(') | pparse_CH(')') | pparse_CH(':')) &&
+		    !pparse_match_ch(decl.end, '{'))
 			break;
 		if (!annotated && brace_depth > 0) {
 			pparse_ann(type_tok) |= P1_IS_DECL;
@@ -10769,41 +10706,29 @@ static void p1d_probe_declaration(PParseToken *tok,
 		/* Declarator dimensions may hoist when in a function. */
 		decl.has_bracket_orelse =
 		    p1d_classify_decl_dims(t, decl.end, cur_sid, cur_func, true, cur_func >= 0);
-		/* Function / function-pointer parameter dims are never allocated
-		 * VLAs — orelse must not hoist or leak there. */
-		if (pparse_feat(PPARSE_F_ORELSE) && (decl.is_func_ptr || decl.is_func_decl)) {
-			PPARSE_FOR_RANGE(b, t, decl.end) {
-				if (pparse_match_ch(b, '[') && pparse_pair(_pc, b) && (pparse_ann(b) & P1_OE_BRACKET)) {
-					PParseToken *bc = pparse_pair(_pc, b);
-					PPARSE_FOR_RANGE(s, pparse_next(_pc, b), bc) {
-						if (pparse_ann(s) & P1_IS_ORELSE_KW) {
-							pparse_error_tok(s,
-								  PPARSE_ERR_ORELSE_PROTO_DIM);
-							break;
-						}
-					}
-				}
-			}
-		}
-		/* static/extern/TLS/constexpr dims must be ICEs (C11 §6.7.6.2 /
+		/* Function parameter dims never allocate VLAs; static/extern/TLS/
+		 * constexpr dims must be ICEs (C11 §6.7.6.2 /
 		 * C23 constexpr). Bracket orelse lowering inserts a runtime
 		 * temporary, turning even `static int a[0 orelse 1]` / 
 		 * `constexpr int a[0 orelse 1]` into an illegal non-ICE dim. */
-		if (pparse_feat(PPARSE_F_ORELSE) &&
-		    (saw_static || type.has_static || type.has_extern || type.has_thread_local ||
-		     type.has_constexpr)) {
+		bool proto_dims = decl.is_func_ptr | decl.is_func_decl;
+		bool ice_dims = saw_static | type.has_static | type.has_extern |
+				type.has_thread_local | type.has_constexpr;
+		if (decl.has_bracket_orelse && (proto_dims | ice_dims)) {
+			const char *dim_error = proto_dims
+						? PPARSE_ERR_ORELSE_PROTO_DIM
+						: "orelse inside array dimension of a "
+						  "static/extern/_Thread_local/constexpr "
+						  "declaration is not allowed (dimension "
+						  "must be an integer constant expression; "
+						  "orelse lowering introduces a runtime "
+						  "temporary)";
 			PPARSE_FOR_RANGE(b, type_tok, decl.end) {
-				if (pparse_match_ch(b, '[') && pparse_pair(_pc, b) && (pparse_ann(b) & P1_OE_BRACKET)) {
-					PParseToken *bc = pparse_pair(_pc, b);
+				if (pparse_match_ch(b, '[') && (pparse_ann(b) & P1_OE_BRACKET)) {
+					PParseToken *bc = pparse_pair_known(b);
 					PPARSE_FOR_RANGE(s, pparse_next(_pc, b), bc) {
 						if (pparse_ann(s) & P1_IS_ORELSE_KW) {
-							pparse_error_tok(s,
-								  "orelse inside array dimension of a "
-								  "static/extern/_Thread_local/constexpr "
-								  "declaration is not allowed (dimension "
-								  "must be an integer constant expression; "
-								  "orelse lowering introduces a runtime "
-								  "temporary)");
+							pparse_error_tok(s, dim_error);
 							break;
 						}
 					}
@@ -10814,10 +10739,10 @@ static void p1d_probe_declaration(PParseToken *tok,
 		{
 			bool has_init = pparse_match_ch(decl.end, '=');
 			bool has_explicit_intent =
-			    has_init || decl_raw || saw_static || type.is_typedef || type.is_struct ||
-			    type.is_enum || type.has_static || type.has_extern || type.has_thread_local ||
-			    type.has_register || type.has_atomic || type.has_constexpr || type.has_alignas;
-			if (pparse_feat(PPARSE_F_ZEROINIT) && brace_depth > 0 && !has_explicit_intent &&
+			    has_init | decl_raw | saw_static | type.is_typedef | type.is_struct |
+			    type.is_enum | type.has_static | type.has_extern | type.has_thread_local |
+			    type.has_register | type.has_atomic | type.has_constexpr | type.has_alignas;
+			if (has_zeroinit && brace_depth > 0 && !has_explicit_intent &&
 			    braceless_close_idx == 0 && cur_sid < pparse_scope_tree_count &&
 			    pparse_scope_tree[cur_sid].is_switch)
 				SAFETY_DIAG(
@@ -10833,10 +10758,9 @@ static void p1d_probe_declaration(PParseToken *tok,
 		 * get shadow registration above, then skip the width expr. */
 		if (pparse_match_ch(t, ':')) {
 			t = pparse_next(_pc, t);
-			while (t && t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
+			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
 				if (t->flags & PPARSE_TF_OPEN) {
-					PParseToken *m = pparse_pair(_pc, t);
-					t = m ? pparse_next(_pc, m) : pparse_next(_pc, t);
+					t = pparse_next(_pc, pparse_pair_known(t));
 					continue;
 				}
 				if (pparse_match_ch(t, ',') || pparse_match_ch(t, ';')) break;
@@ -10845,7 +10769,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 		}
 		bool has_init = pparse_match_ch(t, '=');
 		bool in_aggregate_body =
-		    cur_sid > 0 && cur_sid < pparse_scope_tree_count && pparse_scope_tree[cur_sid].is_struct;
+		    (cur_sid > 0) & (cur_sid < pparse_scope_tree_count) && pparse_scope_tree[cur_sid].is_struct;
 		/* Locals inside a GNU nested function must not land on the outer
 		 * function's CFG / cgoto×zeroinit gate — nested bodies are passed
 		 * through; only the outer function's own decls matter. */
@@ -10856,20 +10780,19 @@ static void p1d_probe_declaration(PParseToken *tok,
 				break;
 			}
 		}
-		P1FuncEntry *p1e = NULL;
-		uint16_t decl_sid = cur_func >= 0 && !in_nested_func ? cur_sid : 0;
-		bool storage_static = saw_static || type.has_static || type.has_extern;
-		unsigned plan_flags = in_aggregate_body ? 0 : P1DP_CONST;
-		if (brace_depth > 0 && !in_aggregate_body)
-			plan_flags |= P1DP_REGISTER | P1DP_REGISTER_VLA;
+		uint16_t decl_sid = (cur_func >= 0 && !in_nested_func) ? cur_sid : 0;
+		bool storage_static = saw_static | type.has_static | type.has_extern;
+		unsigned plan_flags = !in_aggregate_body * P1DP_CONST |
+				      ((brace_depth > 0) & !in_aggregate_body) *
+					  (P1DP_REGISTER | P1DP_REGISTER_VLA);
 		uint8_t zero_kind;
-		p1e = p1_analyze_decl(type_tok,
+		P1FuncEntry *p1e = p1_analyze_decl(type_tok,
 					      &type,
 					      &decl,
 					      decl_raw,
 					      brace_depth,
 					      true,
-					      decl.var_name && brace_depth > 0 && !in_aggregate_body,
+					      (brace_depth > 0) & !in_aggregate_body,
 					      decl_sid,
 					      storage_static,
 					      braceless_close_idx,
@@ -10885,9 +10808,9 @@ static void p1d_probe_declaration(PParseToken *tok,
 			if (first_orelse) {
 				decl.end->pair_idx = pparse_idx(_pc, first_orelse) + 1;
 				pparse_ann(first_orelse) |= P1_OE_DECL_RECIPE;
-				first_orelse->pair_idx = t && pparse_match_ch(t, ',') ? pparse_idx(_pc, t) : 0;
+				first_orelse->pair_idx = pparse_match_ch(t, ',') ? pparse_idx(_pc, t) : 0;
 			}
-			if (decl_has_orelse && pparse_feat(PPARSE_F_ORELSE))
+			if (decl_has_orelse && has_orelse)
 				p1d_validate_decl_orelse(decl.var_name,
 							 &type,
 							 &decl,
@@ -10898,7 +10821,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 			    (pparse_ann(decl.var_name) & P1_DECL_EFFECTIVE_CONST))
 				pparse_ann(decl.var_name) |= P1_DECL_CONST_ORELSE;
 		}
-		if (pparse_feat(PPARSE_F_AUTO_STATIC) && brace_depth > 0 && !decl_raw && !saw_static &&
+		if (has_auto_static && brace_depth > 0 && !decl_raw && !saw_static &&
 		    !decl_has_leading_attr &&
 		    (pparse_decl_const_flags(&type, &decl) & PPARSE_DECL_CONST_EXPLICIT) &&
 		    !type.has_volatile && !type.has_hidden_volatile && !type.has_volatile_member && !type.has_static &&
@@ -10908,30 +10831,27 @@ static void p1d_probe_declaration(PParseToken *tok,
 		    !decl_has_orelse && !pparse_range_has_attribute(type_tok, type.end, PPARSE_TT_ASM) &&
 		    !pparse_range_has_attribute(pparse_next(_pc, decl.var_name), decl.end, 0)) {
 			PParseToken *init = pparse_next(_pc, decl.end);
-			if (init && ((init->kind == PPARSE_TK_STR && pparse_is_const_literal_initializer(decl.end)) ||
-				     (pparse_match_ch(init, '{') && pparse_pair(_pc, init) &&
-				      pparse_match_ch(pparse_next(_pc, pparse_pair(_pc, init)), ';') &&
-				      pparse_is_const_literal_initializer(decl.end))))
+			if ((init->kind == PPARSE_TK_STR && pparse_is_const_literal_initializer(decl.end)) ||
+				     (pparse_match_ch(init, '{') &&
+				      pparse_match_ch(pparse_next(_pc, pparse_pair_known(init)), ';') &&
+				      pparse_is_const_literal_initializer(decl.end)))
 				pparse_ann(decl.var_name) |= P1_DECL_AUTO_STATIC;
 		}
 
-		if (zero_kind == P1Z_MEMSET) any_would_memset = true;
-		if (t && pparse_match_ch(t, ',') && brace_depth > 0)
-			p1d_check_multi_decl_constraints(
-			    t, &type, any_would_memset, vm_type, decl_has_orelse);
-		if (t && pparse_match_ch(t, ',')) {
-			t = pparse_next(_pc, t);
-		} else
-			break;
+		any_would_memset |= zero_kind == P1Z_MEMSET;
+		if (!pparse_match_ch(t, ',')) break;
+		if (brace_depth > 0)
+			p1d_check_multi_decl_constraints(t, &type, any_would_memset, vm_type, decl_has_orelse);
+		t = pparse_next(_pc, t);
 	}
 	PPARSE_TD_SCOPE_RESTORE();
 }
 static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbrace, uint16_t sid, int brace_depth) {
 	PPARSE_CTX();
 	if (!rparen || !lbrace || sid == 0 || brace_depth <= 0 || sid >= pparse_scope_tree_count) return;
-	if (!pparse_match_ch(rparen, ')') || !pparse_pair(_pc, rparen)) return;
-	PParseToken *id_list_open = pparse_pair(_pc, rparen);
-	if (!id_list_open || !pparse_is_knr_params(pparse_next(_pc, id_list_open), lbrace)) return;
+	if (!pparse_match_ch(rparen, ')')) return;
+	PParseToken *id_list_open = pparse_pair_known(rparen);
+	if (!pparse_is_knr_params(pparse_next(_pc, id_list_open), lbrace)) return;
 	PPARSE_TD_SCOPE_SAVE();
 	pparse_td_scope_close = pparse_scope_close(&pparse_scope_tree[sid]);
 	for (PParseToken *stmt = pparse_next(_pc, rparen); stmt && stmt != lbrace && stmt->kind != PPARSE_TK_EOF;) {
@@ -10953,16 +10873,17 @@ static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbr
 		for (PParseToken *seg = ts.end; seg && seg != semi && seg != lbrace;) {
 			PParseDecl decl = pparse_declarator(seg);
 			if (!decl.var_name || !decl.end) break;
-			bool plain = !decl.is_pointer && !decl.is_func_ptr;
-			bool is_const = plain ? ts.has_const : decl.is_const;
-			bool is_vol = plain ? (ts.has_volatile || ts.has_volatile_member) : decl.is_volatile;
-			bool is_atomic = plain ? ts.has_atomic : decl.is_atomic;
-			bool is_long_double = plain && !ts.is_ptr && ts.has_long_double;
-			unsigned traits = (is_const ? PPARSE_BIND_CONST : 0) |
-					  (is_vol ? PPARSE_BIND_VOLATILE : 0) |
-					  (plain && ts.has_volatile_member ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
-					  (is_atomic ? PPARSE_BIND_ATOMIC : 0) |
-					  (is_long_double ? PPARSE_BIND_LONG_DOUBLE : 0);
+			bool plain = !(decl.is_pointer | decl.is_func_ptr);
+			bool is_const = (plain & ts.has_const) | (!plain & decl.is_const);
+			bool is_vol = (plain & (ts.has_volatile | ts.has_volatile_member)) |
+				      (!plain & decl.is_volatile);
+			bool is_atomic = (plain & ts.has_atomic) | (!plain & decl.is_atomic);
+			bool is_long_double = plain & !ts.is_ptr & ts.has_long_double;
+			unsigned traits = is_const * PPARSE_BIND_CONST |
+					  is_vol * PPARSE_BIND_VOLATILE |
+					  (plain & ts.has_volatile_member) * PPARSE_BIND_VOLATILE_MEMBER |
+					  is_atomic * PPARSE_BIND_ATOMIC |
+					  is_long_double * PPARSE_BIND_LONG_DOUBLE;
 			pparse_register_parameter_binding(
 			    decl.var_name, brace_depth, sid, true, traits);
 			/* The identifier-list token already owns the binding used inside
@@ -10976,7 +10897,7 @@ static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbr
 				if (pparse_match_ch(s, '[') && (s->flags & PPARSE_TF_OPEN)) {
 					if (skip_first) {
 						skip_first = false;
-						if (pparse_pair(_pc, s)) s = pparse_pair(_pc, s);
+						s = pparse_pair_known(s);
 						continue;
 					}
 					if (pparse_array_size_is_vla(s)) {
@@ -10986,7 +10907,7 @@ static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbr
 				}
 			}
 			seg = decl.end;
-			if (seg && pparse_match_ch(seg, ',')) seg = pparse_next(_pc, seg);
+			if (pparse_match_ch(seg, ',')) seg = pparse_next(_pc, seg);
 			else
 				break;
 		}
@@ -10998,15 +10919,17 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	PPARSE_CTX();
 	PParseToken *tok = s->tok;
 	uint16_t sid = pparse_scope_id(tok);
+	bool valid_sid = sid < pparse_scope_tree_count;
+	bool function_body = valid_sid && pparse_scope_tree[sid].is_func_body;
 
 	// Phase 1E: function body detection at file scope
-	if (s->brace_depth == 0 && sid < pparse_scope_tree_count && pparse_scope_tree[sid].is_func_body) {
+	if (s->brace_depth == 0 && function_body) {
 		PParseFunctionReturn ret = pparse_function_return(s->file_scope_stmt_start);
 		if (ret.kind == PPARSE_FUNC_RETURN_NONE) {
 			PParseToken *prev = pparse_walk_back(pparse_idx(_pc, tok) - 1, PPARSE_WB_SKIP_NOISE);
 			if (prev && pparse_match_ch(prev, ';')) prev = pparse_p1_knr_find_close_paren(prev);
-			if (prev && pparse_match_ch(prev, ')') && pparse_pair(_pc, prev)) {
-				PParseToken *open = pparse_pair(_pc, prev);
+			if (prev && pparse_match_ch(prev, ')')) {
+				PParseToken *open = pparse_pair_known(prev);
 				for (uint32_t pi = pparse_idx(_pc, open); pi > 1; pi--) {
 					PParseToken *pt = &pparse_token_pool[pi - 1];
 					if (pt->kind == PPARSE_TK_PREP_DIR) continue;
@@ -11026,19 +10949,14 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 				 .ret_type_suffix_start = ret.kind == PPARSE_FUNC_RETURN_VALUE ? ret.suffix_start : NULL,
 				 .ret_type_suffix_end = ret.kind == PPARSE_FUNC_RETURN_VALUE ? ret.suffix_end : NULL,
 				 .returns_void = ret.kind == PPARSE_FUNC_RETURN_VOID};
-		if (sid < pparse_scope_tree_count) {
-			pparse_td_scope_close = pparse_scope_close(&pparse_scope_tree[sid]);
-		}
+		pparse_td_scope_close = pparse_scope_close(&pparse_scope_tree[sid]);
 		PParseToken *prev_tok = pparse_walk_back(pparse_idx(_pc, tok) - 1, PPARSE_WB_SKIP_NOISE);
 		if (prev_tok && pparse_match_ch(prev_tok, ';')) prev_tok = pparse_p1_knr_find_close_paren(prev_tok);
-		if (prev_tok && pparse_match_ch(prev_tok, ')') && pparse_pair(_pc, prev_tok)) {
+		if (prev_tok && pparse_match_ch(prev_tok, ')')) {
 			p1_register_param_shadows(
-			    pparse_pair(_pc, prev_tok), prev_tok, sid, s->brace_depth + 1, true);
+			    pparse_pair_known(prev_tok), prev_tok, sid, s->brace_depth + 1, true);
 			p1_register_knr_param_bindings(prev_tok, tok, sid, s->brace_depth + 1);
 		}
-	}
-
-	if (s->brace_depth == 0 && sid < pparse_scope_tree_count && pparse_scope_tree[sid].is_func_body) {
 		s->p1d_cur_func = func_meta_count - 1;
 		func_meta[s->p1d_cur_func].entry_start = p1_entry_count;
 		func_meta[s->p1d_cur_func].entry_count = 0;
@@ -11046,7 +10964,7 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		s->p1d_prev = NULL;
 	}
 
-	if (s->p1d_cur_func >= 0 && sid < pparse_scope_tree_count && pparse_scope_tree[sid].is_switch) {
+	if (s->p1d_cur_func >= 0 && valid_sid && pparse_scope_tree[sid].is_switch) {
 		p1d_ensure_switch_cap(s);
 		p1_alloc(P1K_SWITCH, sid, tok);
 		s->p1d_switch_stack[s->p1d_switch_top] = sid;
@@ -11059,8 +10977,8 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	PPARSE_ARENA_ENSURE_CAP(
 	    &_pc->main_arena, s->scope_stack, s->scope_depth + 1, s->scope_cap, 256, uint16_t);
 	s->scope_stack[s->scope_depth] = sid;
-	if (sid < pparse_scope_tree_count && pparse_scope_tree[sid].is_init) s->p1d_init_brace_depth++;
-	if (sid < pparse_scope_tree_count) {
+	if (valid_sid) {
+		if (pparse_scope_tree[sid].is_init) s->p1d_init_brace_depth++;
 		pparse_td_scope_close = pparse_scope_close(&pparse_scope_tree[sid]);
 	}
 
@@ -11119,6 +11037,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 	PPARSE_CTX();
 	const bool has_orelse = pparse_feat(PPARSE_F_ORELSE);
 	const bool has_defer = pparse_feat(PPARSE_F_DEFER);
+	const bool has_flow_extensions = has_orelse | has_defer;
 	P1ScanState _ps = {0};
 	P1ScanState *ps = &_ps;
 	ps->tok = tok;
@@ -11140,7 +11059,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 	uint64_t p1_wd_steps = 0;
 	const uint64_t p1_wd_budget = 256ull * (uint64_t)pparse_token_count + 65536ull;
 #endif
-	while (ps->tok && ps->tok->kind != PPARSE_TK_EOF) {
+	while (ps->tok->kind != PPARSE_TK_EOF) {
 #ifdef PRISM_DEBUG
 		if (++p1_wd_steps > p1_wd_budget)
 			pparse_error_tok(ps->tok,
@@ -11150,9 +11069,10 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		while (ps->p1d_switch_top > 0 && ps->p1d_switch_end[ps->p1d_switch_top - 1] > 0 &&
 		       pparse_idx(_pc, ps->tok) > ps->p1d_switch_end[ps->p1d_switch_top - 1])
 			ps->p1d_switch_top--;
+		unsigned char tok_ch = ps->tok->ch0;
 		if (pparse_token_can_name_function(ps->tok)) {
 			PParseToken *nx = pparse_next(_pc, ps->tok);
-			if (nx && pparse_match_ch(nx, '(')) {
+			if (pparse_match_ch(nx, '(')) {
 				bool is_func_decl = false;
 				PParseFunctionSymbolKind proto_tag = pparse_function_decl_returns_aggregate(ps->tok)
 								 ? PPARSE_FS_AGGREGATE_RETURN
@@ -11169,11 +11089,11 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 						is_func_decl = true;
 					}
 				}
-				if (is_func_decl && has_orelse && pparse_pair(_pc, nx)) {
+				if (is_func_decl && has_orelse) {
 					/* pparse_skip_noise handles attributes but not asm specifiers. */
 					PParseToken *after =
-					    pparse_skip_asm_specifier_trail(pparse_next(_pc, pparse_pair(_pc, nx)));
-					if (after && (pparse_match_ch(after, ';') || pparse_match_ch(after, '{')))
+					    pparse_skip_asm_specifier_trail(pparse_next(_pc, pparse_pair_known(nx)));
+					if (pparse_match_ch(after, ';') || pparse_match_ch(after, '{'))
 						p1d_scan_param_bracket_orelse(nx, pparse_match_ch(after, ';'));
 				}
 			}
@@ -11193,7 +11113,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					  "function body)");
 		}
 
-		if (has_orelse && pparse_match_ch(ps->tok, '[') && pparse_pair(_pc, ps->tok) &&
+		if (has_orelse && tok_ch == '[' &&
 		    !(ps->tok->flags & PPARSE_TF_C23_ATTR) && !(pparse_ann(ps->tok) & P1_OE_BRACKET))
 			p1d_classify_bracket_orelse_ex(ps->tok, CUR_SID(), ps->p1d_cur_func, true,
 						       /*allow_se_hoist=*/false);
@@ -11221,22 +11141,24 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		if (has_orelse && (ps->tok->tag & PPARSE_TT_TYPEOF))
 			p1d_annotate_typeof_orelse(ps->tok, CUR_SID(), ps->p1d_cur_func, true);
 
-		if (pparse_match_ch(ps->tok, '{')) {
+		if (tok_ch == '{') {
 			p1d_handle_open_brace(ps);
 			continue;
 		}
-		if (pparse_match_ch(ps->tok, '}')) {
+		if (tok_ch == '}') {
 			p1d_handle_close_brace(ps);
 			continue;
 		}
 
-		if (pparse_match_ch(ps->tok, ';')) {
+		if (tok_ch == ';') {
 			p1d_stmt_reset(ps, true);
 			ps->p1d_prev = ps->tok;
 			if (ps->brace_depth == 0) {
 				// Phase 1C: C99 prototype parameter scope (§6.2.1p4).
 				PParseToken *prev_tok = pparse_walk_back(pparse_idx(_pc, ps->tok) - 1, PPARSE_WB_SKIP_NOISE);
-				PParseToken *open = prev_tok && pparse_match_ch(prev_tok, ')') ? pparse_pair(_pc, prev_tok) : NULL;
+				PParseToken *open = prev_tok && pparse_match_ch(prev_tok, ')')
+						    ? pparse_pair_known(prev_tok)
+						    : NULL;
 				if (open) {
 					PPARSE_TD_SCOPE_SAVE();
 					pparse_td_scope_close = pparse_idx(_pc, prev_tok);
@@ -11265,7 +11187,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			if (ps->p1d_cur_func >= 0) {
 				uint16_t cur_sid = CUR_SID();
 				p1d_record_goto(ps, ps->tok, cur_sid, ps->p1d_cur_func);
-				if (is_defer_kw(ps->tok, ps->p1d_prev) &&
+				if (has_defer && is_defer_kw(ps->tok, ps->p1d_prev) &&
 				    !(pparse_is_known_function_call(ps->tok) && !ps->p1d_ctrl_pending))
 					p1_try_alloc_defer(ps->tok, cur_sid, ps->p1d_cur_func);
 			}
@@ -11273,8 +11195,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			p1d_register_enum_at(ps->tok, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
 			PParseToken *p1d_prev_saved = ps->p1d_prev;
 			ps->p1d_prev = ps->tok;
-			PParseToken *group_close = ps->tok->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, ps->tok) : NULL;
-			if (group_close) {
+			if (ps->tok->flags & PPARSE_TF_OPEN) {
+				PParseToken *group_close = pparse_pair_known(ps->tok);
 				// Do not skip GNU statement expressions — process their body normally
 				if (pparse_is_stmt_expr_open(ps->tok)) {
 					ps->tok = pparse_next(_pc, ps->tok); // advance past '(' to '{'
@@ -11285,14 +11207,14 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				// parentheses (hoisted from Pass 2 check_orelse_in_parens).
 				// typeof keeps expr-orelse (`typeof(p orelse 0)`) but still
 				// rejects type-junk leaks (`typeof(int orelse 0)`).
-				if ((has_orelse || has_defer) && pparse_match_ch(ps->tok, '(') &&
+				if (has_flow_extensions && tok_ch == '(' &&
 				    !(p1d_prev_saved &&
 				      (p1d_prev_saved->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH | PPARSE_TT_ATTR | PPARSE_TT_ASM)))) {
 					if (p1d_prev_saved && (p1d_prev_saved->tag & PPARSE_TT_TYPEOF)) {
 						/* typeof(expr orelse fb) is valid; type-junk is not. */
-						if (pparse_feat(PPARSE_F_ORELSE)) {
+						if (has_orelse) {
 							for (PParseToken *pi = ps->tok, *t = pparse_next(_pc, ps->tok);
-							     t && t != group_close; pi = t, t = pparse_next(_pc, t)) {
+							     t != group_close; pi = t, t = pparse_next(_pc, t)) {
 								PParseToken *skipped = paren_scan_skip_nested(t);
 								if (skipped) { t = skipped; continue; }
 								if (orelse_after_type_in_parens(t, pi))
@@ -11304,12 +11226,12 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				}
 				// Phase 1D: reject orelse/CF inside attribute and asm paren
 				// groups (pre-/post-declarator attrs; __asm__(...)).
-				if ((pparse_match_ch(ps->tok, '(') && p1d_prev_saved &&
+				if ((tok_ch == '(' && p1d_prev_saved &&
 				      (p1d_prev_saved->tag & (PPARSE_TT_ATTR | PPARSE_TT_ASM))) ||
 				    (ps->tok->flags & PPARSE_TF_C23_ATTR)) {
 					int in_asm = p1d_prev_saved && (p1d_prev_saved->tag & PPARSE_TT_ASM);
 					/* `asm volatile (` — walk back through asm qualifiers. */
-					if (!in_asm && pparse_match_ch(ps->tok, '(')) {
+					if (!in_asm && tok_ch == '(') {
 						PParseToken *aw = pparse_walk_back(pparse_idx(_pc, ps->tok), PPARSE_WB_ATTR_NOISE);
 						while (aw && (aw->tag & PPARSE_TT_QUALIFIER))
 							aw = pparse_walk_back(pparse_idx(_pc, aw), PPARSE_WB_ATTR_NOISE);
@@ -11341,7 +11263,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 								  s->len, pparse_loc(_pc, s));
 					}
 				}
-				if (pparse_match_ch(ps->tok, '(') || pparse_match_ch(ps->tok, '[')) {
+				if (tok_ch == '(' || tok_ch == '[') {
 					PParseToken *se_open = p1d_scan_balanced_group(
 					    ps->tok, ps->brace_depth, ps->p1d_cur_func, CUR_SID(), p1d_prev_saved);
 					if (se_open) {
@@ -11359,7 +11281,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					ps->p1d_ctrl_pending = true;
 				}
 			} else {
-				PParseToken *open = pparse_match_ch(ps->tok, ')') ? pparse_pair(_pc, ps->tok) : NULL;
+				PParseToken *open = tok_ch == ')' ? pparse_pair_known(ps->tok) : NULL;
 				if (open && pparse_ctrl_condition_kw_before_paren(open)) {
 					/* Must not use PPARSE_WB_PAST_NOISE inside the helper: it jumps
 					 * }/{ and nested (), so `} (expr)` after `while (c){}`
@@ -11375,8 +11297,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		// Skip noise (attributes, C23 [[...]], pragmas)
 		PParseToken *clean = pparse_skip_noise(_pc, ps->tok);
 		if (clean != ps->tok) {
-			if (ps->at_stmt_start &&
-			    pparse_range_has_attribute(ps->tok, clean, PPARSE_TT_ASM))
+			if (pparse_range_has_attribute(ps->tok, clean, PPARSE_TT_ASM))
 				ps->p1d_decl_has_attr = true;
 			PPARSE_FOR_RANGE(s, ps->tok, clean) {
 				uint32_t st = s->tag;
@@ -11406,8 +11327,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		// Skip storage/inline/noreturn/extension specifiers before type
 		if (((ps->tok->tag & (PPARSE_TT_STORAGE | PPARSE_TT_INLINE)) || pparse_equal(ps->tok, "__extension__")) &&
 		    !(pparse_is_soft_keyword_identifier(ps->tok) && pparse_token_is_label_name(ps->tok))) {
-			if (ps->at_stmt_start && !ps->p1d_decl_start)
-				ps->p1d_decl_start = ps->tok;
+			if (!ps->p1d_decl_start) ps->p1d_decl_start = ps->tok;
 			if (ps->tok->tag & PPARSE_TT_STORAGE) ps->p1d_saw_static = true;
 			ps->tok = pparse_next(_pc, ps->tok);
 			continue;
@@ -11417,26 +11337,24 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			PParseToken *rnext = pparse_next(_pc, ps->tok);
 			PParseToken *after_raw = pparse_skip_noise(_pc, rnext);
 			bool typedef_kw_prefix =
-			    pparse_is_known_typedef(ps->tok) && after_raw &&
+			    pparse_is_known_typedef(ps->tok) &&
 			    (pparse_is_type_keyword(after_raw) || pparse_is_known_typedef(after_raw) ||
 			     (after_raw->tag &
 			      (PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_STORAGE | PPARSE_TT_INLINE | PPARSE_TT_TYPEDEF)) ||
 			     (after_raw->flags & PPARSE_TF_RAW));
 			if (!pparse_is_known_typedef(ps->tok) || typedef_kw_prefix) {
-				PParseToken *after_colon = rnext ? pparse_next(_pc, rnext) : NULL;
-				if (!(rnext && pparse_match_ch(rnext, ':') &&
-				      !(after_colon && pparse_match_ch(after_colon, ':')))) {
+				PParseToken *after_colon = pparse_next(_pc, rnext);
+				if (!(pparse_match_ch(rnext, ':') && !pparse_match_ch(after_colon, ':'))) {
 					/* `raw { ... }` — annotate the brace so Pass 2 / decls
 					 * suppress transforms for the whole block. */
-					if (after_raw && pparse_match_ch(after_raw, '{')) {
+					if (pparse_match_ch(after_raw, '{')) {
 						after_raw->ann |= P1_RAW_BLOCK;
-						pparse_pair(_pc, after_raw)->ann |= P1_RAW_BLOCK;
+						pparse_pair_known(after_raw)->ann |= P1_RAW_BLOCK;
 						pparse_p1_has_raw_block = true;
 						ps->tok = after_raw;
 						continue;
 					}
-					if (ps->at_stmt_start && !ps->p1d_decl_start)
-						ps->p1d_decl_start = ps->tok;
+					if (!ps->p1d_decl_start) ps->p1d_decl_start = ps->tok;
 					ps->p1d_saw_raw = true;
 					ps->tok = pparse_next(_pc, ps->tok);
 					continue;
@@ -11456,14 +11374,14 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			}
 			pparse_typedef_declaration(ps->tok, ps->brace_depth);
 			if (td_saved_close) pparse_td_scope_close = td_saved_close;
-			while (ps->tok && ps->tok->kind != PPARSE_TK_EOF && !pparse_match_ch(ps->tok, ';')) {
+			while (ps->tok->kind != PPARSE_TK_EOF && !pparse_match_ch(ps->tok, ';')) {
 				p1d_register_enum_at(ps->tok, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
-				PParseToken *close = pparse_match_ch(ps->tok, '{') ? pparse_pair(_pc, ps->tok) : NULL;
-				if (close) {
+				if (pparse_match_ch(ps->tok, '{')) {
+					PParseToken *close = pparse_pair_known(ps->tok);
 					PPARSE_TD_SCOPE_SAVE();
 					pparse_td_scope_close = pparse_idx(_pc, close);
 					for (PParseToken *m = pparse_next(_pc, ps->tok);
-					     m && m != close && m->kind != PPARSE_TK_EOF;) {
+					     m != close;) {
 						if (pparse_is_enum_kw(m)) {
 							uint32_t sc = pparse_td_scope_close;
 							pparse_td_scope_close = _tds_c;
@@ -11471,8 +11389,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 							    m, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
 							pparse_td_scope_close = sc;
 						}
-						PParseToken *mclose = m->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, m) : NULL;
-						if (mclose) {
+						if (m->flags & PPARSE_TF_OPEN) {
+							PParseToken *mclose = pparse_pair_known(m);
 							if (has_orelse &&
 							    (pparse_match_ch(m, '(') || pparse_match_ch(m, '[')))
 								p1d_scan_balanced_group(m,
@@ -11487,10 +11405,10 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 						    (pparse_is_known_typedef(m) ||
 						     (m->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE)))) {
 							PParseToken *nxt = pparse_next(_pc, m);
-							if (nxt &&
-							    (pparse_match_ch(nxt, ';') || pparse_match_ch(nxt, ',') ||
-							     pparse_match_ch(nxt, ':') || pparse_match_ch(nxt, '[') ||
-							     pparse_match_ch(nxt, '='))) {
+							if (nxt && pparse_match_set(nxt,
+										      pparse_CH(';') | pparse_CH(',') |
+											  pparse_CH(':') | pparse_CH('[') |
+											  pparse_CH('='))) {
 								// Only shadow if a type specifier precedes m in this member.
 								if (pparse_match_ch(nxt, ':')) {
 									bool has_type = false;
@@ -11509,11 +11427,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 											break;
 										if (pt->tag & PPARSE_TT_QUALIFIER)
 											continue;
-										PParseToken *group_open =
-										    (pparse_match_ch(pt, ')') || pparse_match_ch(pt, ']'))
-											? pparse_pair(_pc, pt)
-											: NULL;
-										if (group_open) {
+									if (pparse_match_ch(pt, ')') || pparse_match_ch(pt, ']')) {
+										PParseToken *group_open = pparse_pair_known(pt);
 											pi = pparse_idx(_pc, group_open) + 1;
 											continue;
 										}
@@ -11534,8 +11449,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					ps->tok = pparse_next(_pc, close);
 					continue;
 				}
-				PParseToken *group_close = ps->tok->flags & PPARSE_TF_OPEN ? pparse_pair(_pc, ps->tok) : NULL;
-				if (group_close) {
+				if (ps->tok->flags & PPARSE_TF_OPEN) {
+					PParseToken *group_close = pparse_pair_known(ps->tok);
 					if (has_orelse &&
 					    (pparse_match_ch(ps->tok, '(') || pparse_match_ch(ps->tok, '[')))
 						p1d_scan_balanced_group(ps->tok,
@@ -11547,7 +11462,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				} else
 					ps->tok = pparse_next(_pc, ps->tok);
 			}
-			if (ps->tok && pparse_match_ch(ps->tok, ';')) ps->tok = pparse_next(_pc, ps->tok);
+			if (pparse_match_ch(ps->tok, ';')) ps->tok = pparse_next(_pc, ps->tok);
 			ps->at_stmt_start = true;
 			if (ps->brace_depth == 0) ps->file_scope_stmt_start = ps->tok;
 			continue;
@@ -11562,7 +11477,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					p1d_register_enum_at(ps->tok, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
 				} else {
 					unsigned body_traits = pparse_struct_body_traits(brace);
-					for (PParseToken *t = pparse_skip_noise(_pc, pparse_next(_pc, ps->tok)); t && t != brace;
+					for (PParseToken *t = pparse_skip_noise(_pc, pparse_next(_pc, ps->tok)); t != brace;
 					     t = pparse_skip_noise(_pc, pparse_next(_pc, t))) {
 						if ((t->tag & PPARSE_TT_QUALIFIER) && !pparse_is_soft_keyword_identifier(t))
 							continue;
@@ -11581,21 +11496,18 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		if ((ps->tok->flags & PPARSE_TF_STATIC_ASSERT) &&
 		    !(pparse_is_soft_keyword_identifier(ps->tok) && pparse_token_is_label_name(ps->tok))) {
 			/* Classify bracket orelse inside static assertions; reject other forms. */
-				if (has_orelse || has_defer) {
+				if (has_flow_extensions) {
 				PParseToken *lp = pparse_skip_noise(_pc, pparse_next(_pc, ps->tok));
-				PParseToken *rp = lp && pparse_match_ch(lp, '(') && (lp->flags & PPARSE_TF_OPEN)
-						      ? pparse_pair(_pc, lp)
-						      : NULL;
-				if (rp) {
+				if (pparse_match_ch(lp, '(')) {
+					PParseToken *rp = pparse_pair_known(lp);
 					/* Walk every token — do not skip nested groups or
 					 * `sizeof(char[…])` brackets are never classified. */
 					if (has_orelse)
-						for (PParseToken *inner = pparse_next(_pc, lp); inner && inner != rp;
+						for (PParseToken *inner = pparse_next(_pc, lp); inner != rp;
 						     inner = pparse_next(_pc, inner)) {
-							PParseToken *bc = pparse_match_ch(inner, '[') && (inner->flags & PPARSE_TF_OPEN)
-									      ? pparse_pair(_pc, inner)
-									      : NULL;
-							if (bc && !(inner->flags & PPARSE_TF_C23_ATTR) &&
+							if (pparse_match_ch(inner, '[')) {
+								PParseToken *bc = pparse_pair_known(inner);
+							if (!(inner->flags & PPARSE_TF_C23_ATTR) &&
 							    !(pparse_ann(inner) & P1_OE_BRACKET))
 								p1d_classify_bracket_orelse_ex(inner,
 											     CUR_SID(),
@@ -11604,8 +11516,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 											     /*allow_se_hoist=*/false);
 							/* _Static_assert needs an ICE — VLA dims from
 							 * `sizeof(char[n orelse 1])` are not ICEs. */
-							if (bc && (pparse_ann(inner) & P1_OE_BRACKET)) {
-								for (PParseToken *oe = pparse_next(_pc, inner); oe && oe != bc;
+							if (pparse_ann(inner) & P1_OE_BRACKET) {
+								for (PParseToken *oe = pparse_next(_pc, inner); oe != bc;
 								     oe = pparse_next(_pc, oe)) {
 									if (!(pparse_ann(oe) & P1_IS_ORELSE_KW))
 										continue;
@@ -11620,6 +11532,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 										    "side");
 								}
 							}
+							}
 						}
 					PParseToken *prev_sa = lp;
 					PPARSE_FOR_RANGE(s, pparse_next(_pc, lp), rp) {
@@ -11633,10 +11546,9 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 								  "_Static_assert/static_assert except "
 								  "inside an array dimension");
 						/* Reject defer statements, but preserve defer identifiers. */
-						PParseToken *sn = has_defer && (s->tag & PPARSE_TT_DEFER)
-								 ? pparse_next(_pc, s)
-								 : NULL;
-						if (sn && (pparse_is_identifier_like(sn) || pparse_match_ch(sn, '{')))
+						PParseToken *sn = pparse_next(_pc, s);
+						if (has_defer && (s->tag & PPARSE_TT_DEFER) &&
+						    (pparse_is_identifier_like(sn) || pparse_match_ch(sn, '{')))
 							pparse_error_tok(s,
 								  "'defer' cannot be used inside "
 								  "_Static_assert/static_assert");
@@ -11651,38 +11563,47 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			continue;
 		}
 
-		if ((ps->tok->tag & PPARSE_TT_LOOP) && ps->tok->ch0 == 'f' && ps->brace_depth > 0 && ps->p1d_cur_func >= 0)
-			p1d_scan_ctrl_init(ps->tok,
-					   &ps->skip_cache,
-					   ps->brace_depth,
-					   CUR_SID(),
-					   /*is_for=*/true);
-		if ((ps->tok->tag & (PPARSE_TT_IF | PPARSE_TT_SWITCH)) && ps->brace_depth > 0 && ps->p1d_cur_func >= 0 &&
-		    !pparse_is_else_kw(ps->tok))
-			p1d_scan_ctrl_init(ps->tok,
-					   &ps->skip_cache,
-					   ps->brace_depth,
-					   CUR_SID(),
-					   /*is_for=*/false);
-		/* C does not allow declaration in while (...); reject C23-looking while-init. */
-		if ((ps->tok->tag & PPARSE_TT_LOOP) && ps->tok->ch0 == 'w' && ps->brace_depth > 0) {
-			PParseToken *wopen = pparse_p1d_find_open_paren(ps->tok);
-			if (wopen && pparse_pair(_pc, wopen)) {
-				PParseToken *inner = pparse_skip_noise(_pc, pparse_next(_pc, wopen));
-				if (inner &&
-				    ((inner->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE | PPARSE_TT_SUE | PPARSE_TT_TYPEDEF)) ||
-				     (inner->kind == PPARSE_TK_IDENT && pparse_is_known_typedef(inner))))
-					pparse_error_tok(inner,
-						  "declaration in 'while' condition is not allowed");
+		if (ps->brace_depth > 0) {
+			if (ps->tok->tag & PPARSE_TT_LOOP) {
+				if (ps->tok->ch0 == 'f' && ps->p1d_cur_func >= 0)
+					p1d_scan_ctrl_init(ps->tok,
+							   &ps->skip_cache,
+							   ps->brace_depth,
+							   CUR_SID(),
+							   /*is_for=*/true);
+				/* C does not allow declaration in while (...); reject C23-looking while-init. */
+				else if (ps->tok->ch0 == 'w') {
+					PParseToken *wopen = pparse_p1d_find_open_paren(ps->tok);
+					if (wopen) {
+						PParseToken *inner =
+						    pparse_skip_noise(_pc, pparse_next(_pc, wopen));
+						if ((inner->tag &
+						      (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER |
+						       PPARSE_TT_STORAGE | PPARSE_TT_SUE |
+						       PPARSE_TT_TYPEDEF)) ||
+						     (inner->kind == PPARSE_TK_IDENT &&
+						      pparse_is_known_typedef(inner)))
+							pparse_error_tok(inner,
+									  "declaration in 'while' condition is not allowed");
+					}
+				}
+			} else if (ps->p1d_cur_func >= 0 &&
+				   (ps->tok->tag & (PPARSE_TT_IF | PPARSE_TT_SWITCH)) &&
+				   !pparse_is_else_kw(ps->tok)) {
+				p1d_scan_ctrl_init(ps->tok,
+						   &ps->skip_cache,
+						   ps->brace_depth,
+						   CUR_SID(),
+						   /*is_for=*/false);
 			}
 		}
 		if (ps->p1d_cur_func >= 0) {
 			uint16_t cur_sid = CUR_SID();
 			// GNU __label__ local label declaration: __label__ id1, id2, ...;
-			if (ps->at_stmt_start && ps->tok->kind == PPARSE_TK_IDENT && ps->tok->len == 9 &&
+			if (ps->tok->kind == PPARSE_TK_IDENT && ps->tok->len == 9 &&
 			    prism_memeq_static(pparse_loc(_pc, ps->tok), "__label__", 9)) {
 				PParseToken *t = pparse_next(_pc, ps->tok);
-				while (t && t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
+			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
 					if (pparse_is_identifier_like(t)) {
 						PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena,
 								 ps->local_labels,
@@ -11709,7 +11630,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					}
 					t = pparse_next(_pc, t);
 				}
-				if (t && pparse_match_ch(t, ';')) t = pparse_next(_pc, t);
+				if (pparse_match_ch(t, ';')) t = pparse_next(_pc, t);
 				ps->p1d_prev = ps->tok;
 				ps->tok = t;
 				ps->at_stmt_start = true;
@@ -11718,18 +11639,17 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			}
 
 			/* `do int x=1; while(0);` — declaration is not a valid braceless do body. */
-			if (ps->at_stmt_start && ps->p1d_prev && pparse_is_do_kw(ps->p1d_prev) &&
-			    !pparse_match_ch(ps->tok, '{') &&
+			if (ps->p1d_prev && pparse_is_do_kw(ps->p1d_prev) &&
 			    ((ps->tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE | PPARSE_TT_SUE | PPARSE_TT_TYPEDEF)) ||
 			     (ps->tok->kind == PPARSE_TK_IDENT && pparse_is_known_typedef(ps->tok))))
 				pparse_error_tok(ps->tok, "'do' body starting with a declaration requires braces");
 
-			if (ps->at_stmt_start && pparse_is_identifier_like(ps->tok) &&
+			if (pparse_is_identifier_like(ps->tok) &&
 			    (!(ps->tok->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE)) ||
 			     pparse_is_soft_keyword_identifier(ps->tok))) {
 				PParseToken *colon = pparse_skip_noise(_pc, pparse_next(_pc, ps->tok));
-				if (colon && pparse_match_ch(colon, ':') &&
-				    !(pparse_next(_pc, colon) && pparse_match_ch(pparse_next(_pc, colon), ':')) &&
+				if (pparse_match_ch(colon, ':') &&
+				    !pparse_match_ch(pparse_next(_pc, colon), ':') &&
 				    !(ps->tok->tag & (PPARSE_TT_CASE | PPARSE_TT_DEFAULT)) && ps->p1d_init_brace_depth == 0) {
 					pparse_ann(colon) |= P1_STMT_COLON;
 					P1FuncEntry *e = p1_alloc(P1K_LABEL, cur_sid, ps->tok);
@@ -11755,7 +11675,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 				PParseToken *ct = pparse_next(_pc, ps->tok);
 				PParseToken *cprev = ps->tok;
 				int td = 0;
-				while (ct && ct->kind != PPARSE_TK_EOF) {
+				while (ct->kind != PPARSE_TK_EOF) {
 					if (pparse_match_ch(ct, ';') || pparse_match_ch(ct, '{')) break;
 					/* case label expressions are integer constant
 					 * expressions: an orelse there has no statement
@@ -11766,11 +11686,11 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 						pparse_error_tok(ct,
 							  "'orelse' cannot be used inside a case "
 							  "label expression");
-					if (ct->flags & PPARSE_TF_OPEN && pparse_pair(_pc, ct)) {
-						PParseToken *cam = pparse_pair(_pc, ct);
+					if (ct->flags & PPARSE_TF_OPEN) {
+						PParseToken *cam = pparse_pair_known(ct);
 						if (has_orelse) {
 							PParseToken *cip = ct;
-							for (PParseToken *s = pparse_next(_pc, ct); s && s != cam;
+							for (PParseToken *s = pparse_next(_pc, ct); s != cam;
 							     s = pparse_next(_pc, s)) {
 								if ((s->tag & PPARSE_TT_ORELSE) &&
 								    !(cip->tag & PPARSE_TT_MEMBER) &&
@@ -11805,7 +11725,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					cprev = ct;
 					ct = pparse_next(_pc, ct);
 				}
-				if (ct && pparse_match_ch(ct, ':')) {
+				if (pparse_match_ch(ct, ':')) {
 					pparse_ann(ct) |= P1_STMT_COLON;
 					ps->p1d_prev = ct;
 					ps->tok = pparse_next(_pc, ct);
@@ -11815,11 +11735,9 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			}
 		}
 
-		if (pparse_ann(ps->tok) & P1_IS_DEFER_KW) {
-			p1d_validate_defer(ps->tok, ps->p1d_cur_func, ps->p1d_ctrl_pending, CUR_SID(),
-					   ps->brace_depth);
-		} else if (has_defer && (ps->tok->tag & PPARSE_TT_DEFER) &&
-			   is_defer_kw(ps->tok, ps->p1d_prev)) {
+		if ((pparse_ann(ps->tok) & P1_IS_DEFER_KW) ||
+		    (has_defer && (ps->tok->tag & PPARSE_TT_DEFER) &&
+		     is_defer_kw(ps->tok, ps->p1d_prev))) {
 			pparse_ann(ps->tok) |= P1_IS_DEFER_KW;
 			p1d_validate_defer(ps->tok, ps->p1d_cur_func, ps->p1d_ctrl_pending, CUR_SID(),
 					   ps->brace_depth);
@@ -11838,9 +11756,9 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 		ps->p1d_decl_has_attr = false;
 		if (ps->p1d_cur_func >= 0 && (ps->tok->tag & PPARSE_TT_SWITCH) && !pparse_is_known_typedef(ps->tok)) {
 			PParseToken *p = pparse_skip_prep_dirs(pparse_next(_pc, ps->tok));
-			if (p && pparse_match_ch(p, '(') && pparse_pair(_pc, p)) {
-				PParseToken *body = pparse_skip_prep_dirs(pparse_next(_pc, pparse_pair(_pc, p)));
-				if (body && !pparse_match_ch(body, '{')) {
+			if (pparse_match_ch(p, '(')) {
+				PParseToken *body = pparse_skip_prep_dirs(pparse_next(_pc, pparse_pair_known(p)));
+				if (!pparse_match_ch(body, '{')) {
 					uint32_t synth_sid = ps->p1d_braceless_next_sid++;
 					if (synth_sid > UINT16_MAX)
 						pparse_error_tok(ps->tok,
@@ -11864,7 +11782,7 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			continue;
 		}
 
-		if (ps->at_stmt_start && has_orelse && ps->p1d_cur_func >= 0 && ps->brace_depth > 0 &&
+		if (has_orelse && ps->p1d_cur_func >= 0 && ps->brace_depth > 0 &&
 		    !(ps->tok->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH | PPARSE_TT_GOTO | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_CASE |
 				  PPARSE_TT_DEFAULT | PPARSE_TT_DEFER))) {
 			if (ps->tok->tag & PPARSE_TT_RETURN) {
@@ -11889,8 +11807,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 
 		/* Paren-led braceless bodies: `if (c) (x = get() orelse 0);`
 		 * open at stmt-start, so the !at_stmt_start paren scan misses them. */
-		if (ps->at_stmt_start && (has_orelse || has_defer) && pparse_match_ch(ps->tok, '(') &&
-		    pparse_pair(_pc, ps->tok) && !pparse_is_stmt_expr_open(ps->tok))
+		if (has_flow_extensions && tok_ch == '(' &&
+		    !pparse_is_stmt_expr_open(ps->tok))
 			check_orelse_in_parens(ps->tok);
 
 		ps->at_stmt_start = false;
@@ -12086,10 +12004,12 @@ static void cfg_check_range(P1FuncEntry *ents,
 
 static void p1_verify_cfg(void) {
 	PPARSE_CTX();
+	const bool has_defer = pparse_feat(PPARSE_F_DEFER);
+	const bool has_zeroinit = pparse_feat(PPARSE_F_ZEROINIT);
 	for (int fi = 0; fi < func_meta_count; fi++) {
 		FuncMeta *fm = &func_meta[fi];
 		if (fm->entry_count == 0) continue;
-		if (!pparse_feat(PPARSE_F_DEFER | PPARSE_F_ZEROINIT)) {
+		if (!(has_defer | has_zeroinit)) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			bool has_vla = false;
 			for (int i = 0; i < fm->entry_count; i++)
@@ -12101,7 +12021,7 @@ static void p1_verify_cfg(void) {
 		}
 
 		// Computed gotos cannot be verified statically: they could jump
-		bool unverifiable_jump = fm->has_computed_goto || (fm->body_open->tag & PPARSE_TT_ASM);
+		bool unverifiable_jump = fm->has_computed_goto | ((fm->body_open->tag & PPARSE_TT_ASM) != 0);
 		if (unverifiable_jump) {
 			const char *jump_kind = fm->has_computed_goto ? "computed goto" : "asm goto";
 			static const char fmt[] = "%s cannot be used in a function that "
@@ -12110,10 +12030,10 @@ static void p1_verify_cfg(void) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
 				const char *blocker = NULL;
-				if (ents[i].kind == P1K_DEFER && pparse_feat(PPARSE_F_DEFER)) blocker = "defer statements";
+				if (ents[i].kind == P1K_DEFER && has_defer) blocker = "defer statements";
 				else if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla)
 					blocker = "variable-length arrays";
-				else if (ents[i].kind == P1K_DECL && pparse_feat(PPARSE_F_ZEROINIT) &&
+				else if (ents[i].kind == P1K_DECL && has_zeroinit &&
 					 !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
 					 !ents[i].decl.is_vla && !ents[i].decl.has_init)
 					blocker = "zero-initialized declarations";
@@ -12121,7 +12041,7 @@ static void p1_verify_cfg(void) {
 			}
 		}
 
-		if (pparse_feat(PPARSE_F_DEFER) && !fm->returns_void && !fm->ret_type_start) {
+		if (has_defer && !fm->returns_void && !fm->ret_type_start) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
 				if (ents[i].kind == P1K_DEFER)
@@ -12134,7 +12054,6 @@ static void p1_verify_cfg(void) {
 		// Allocated before arena mark so it persists in FuncMeta for Pass 2 O(1)
 		// lookup.
 		int cnt = fm->entry_count;
-		if (cnt < 0) cnt = 0; // GCC VRP guard: entry_count is always ≥ 0
 		int hash_sz = 16;
 		while (hash_sz < cnt * 2) hash_sz <<= 1;
 		int *label_hash = pparse_arena_alloc(&_pc->main_arena, (size_t)hash_sz * sizeof(int));
@@ -12311,7 +12230,7 @@ static void p1_verify_cfg(void) {
 							0,
 							wm_decl[li],
 							af_cache[li]);
-					if (pparse_feat(PPARSE_F_DEFER))
+					if (has_defer)
 						cfg_error_if_looped_between(
 						    ents,
 						    g,
@@ -12365,7 +12284,7 @@ static void p1_verify_cfg(void) {
 				if (!sw_defer_wm || sw_i < 0 || sw_i >= sw_sz) break;
 				int sw_dm = sw_defer_wm[sw_i];
 				int sw_cm = sw_decl_wm[sw_i];
-				if (pparse_feat(PPARSE_F_DEFER)) {
+				if (has_defer) {
 					for (int di = sw_dm; di < defer_n; di++) {
 						P1FuncEntry *d = &ents[defer_list[di]];
 						if (!pparse_scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
@@ -12398,7 +12317,7 @@ static void p1_verify_cfg(void) {
 						SAFETY_DIAG(p1_tok(&ents[i]),
 							    "case/default label may bypass declaration with "
 							    "initializer (undefined if jumped into)");
-					if (!pparse_feat(PPARSE_F_ZEROINIT)) continue;
+					if (!has_zeroinit) continue;
 					SAFETY_DIAG(
 					    p1_tok(&ents[i]),
 					    "case/default label inside a nested block within a switch "
@@ -12430,15 +12349,17 @@ static void p1_verify_cfg(void) {
 /* Tokenization already classified every spelling that changes context. */
 static unsigned pparse_context_intro(PParseToken *t) {
 	if (!t) return 0;
-	unsigned r = ((t->flags & (PPARSE_TF_SIZEOF | PPARSE_TF_STATIC_ASSERT)) ||
-		      (t->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_GENERIC))) ? PPARSE_CI_UNEVAL : 0;
-	if (t->flags & PPARSE_TF_ALIGNOF) r |= PPARSE_CI_ALIGNOF;
-	if (t->flags & PPARSE_TF_OFFSETOF) r |= PPARSE_CI_OFFSETOF;
-	if ((t->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS)) ||
-	    (t->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER)) ==
-		(PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER))
-		r |= PPARSE_CI_TYPE_CTOR;
-	return r;
+	uint32_t tag = t->tag;
+	uint16_t flags = t->flags;
+	unsigned uneval = ((flags & (PPARSE_TF_SIZEOF | PPARSE_TF_STATIC_ASSERT)) != 0) |
+			   ((tag & (PPARSE_TT_TYPEOF | PPARSE_TT_GENERIC)) != 0);
+	unsigned type_ctor = ((tag & (PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS)) != 0) |
+			     ((tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER)) ==
+			      (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER));
+	return uneval * PPARSE_CI_UNEVAL |
+	       (unsigned)((flags & PPARSE_TF_ALIGNOF) != 0) * PPARSE_CI_ALIGNOF |
+	       (unsigned)((flags & PPARSE_TF_OFFSETOF) != 0) * PPARSE_CI_OFFSETOF |
+	       type_ctor * PPARSE_CI_TYPE_CTOR;
 }
 
 static bool pparse_analyze(PParseToken *tok) {

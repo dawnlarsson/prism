@@ -5,8 +5,118 @@
  * through the same oracle pipeline.  New coverage is a row, never a new test
  * function.
  */
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+/* Test-only allocation fault injection. Including the libc declarations
+ * before these macros keeps system prototypes intact; only direct allocation
+ * calls in the embedded Prism implementation are redirected. */
+#ifdef _MSC_VER
+#define TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define TEST_THREAD_LOCAL _Thread_local
+#endif
+
+static TEST_THREAD_LOCAL long fault_alloc_at;
+static TEST_THREAD_LOCAL long fault_alloc_calls;
+static TEST_THREAD_LOCAL int fault_alloc_fired;
+static TEST_THREAD_LOCAL const char *fault_alloc_file;
+static TEST_THREAD_LOCAL int fault_alloc_line;
+#define FAULT_LIVE_CAP 4096
+static TEST_THREAD_LOCAL void *fault_live[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL const char *fault_live_file[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL int fault_live_line[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL uint64_t fault_live_id[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL size_t fault_live_count;
+static TEST_THREAD_LOCAL int fault_live_overflow;
+static TEST_THREAD_LOCAL uint64_t fault_live_next_id;
+
+static size_t fault_live_find(void *ptr) {
+	for (size_t i = 0; i < fault_live_count; i++)
+		if (fault_live[i] == ptr) return i;
+	return SIZE_MAX;
+}
+
+static void fault_live_add(void *ptr, const char *file, int line) {
+	if (!ptr) return;
+	if (fault_live_count == FAULT_LIVE_CAP) {
+		fault_live_overflow = 1;
+		return;
+	}
+	fault_live[fault_live_count] = ptr;
+	fault_live_file[fault_live_count] = file;
+	fault_live_line[fault_live_count] = line;
+	fault_live_id[fault_live_count] = ++fault_live_next_id;
+	fault_live_count++;
+}
+
+static void fault_live_remove_at(size_t i) {
+	if (i == SIZE_MAX) return;
+	fault_live_count--;
+	fault_live[i] = fault_live[fault_live_count];
+	fault_live_file[i] = fault_live_file[fault_live_count];
+	fault_live_line[i] = fault_live_line[fault_live_count];
+	fault_live_id[i] = fault_live_id[fault_live_count];
+}
+
+static int fault_alloc_should_fail(const char *file, int line) {
+	if (fault_alloc_at <= 0) return 0;
+	fault_alloc_calls++;
+	if (fault_alloc_calls != fault_alloc_at) return 0;
+	fault_alloc_fired = 1;
+	fault_alloc_file = file;
+	fault_alloc_line = line;
+	return 1;
+}
+
+static void *fault_malloc(size_t size, const char *file, int line) {
+	if (fault_alloc_should_fail(file, line)) return NULL;
+	void *ptr = malloc(size);
+	fault_live_add(ptr, file, line);
+	return ptr;
+}
+
+static void *fault_calloc(size_t count, size_t size, const char *file, int line) {
+	if (fault_alloc_should_fail(file, line)) return NULL;
+	void *ptr = calloc(count, size);
+	fault_live_add(ptr, file, line);
+	return ptr;
+}
+
+static void *fault_realloc(void *ptr, size_t size, const char *file, int line) {
+	if (fault_alloc_should_fail(file, line)) return NULL;
+	size_t tracked = fault_live_find(ptr);
+	void *resized = realloc(ptr, size);
+	if (!resized) {
+		if (size == 0) fault_live_remove_at(tracked);
+		return NULL;
+	}
+	if (tracked == SIZE_MAX) fault_live_add(resized, file, line);
+	else {
+		fault_live[tracked] = resized;
+		fault_live_file[tracked] = file;
+		fault_live_line[tracked] = line;
+	}
+	return resized;
+}
+
+static void fault_free(void *ptr) {
+	fault_live_remove_at(fault_live_find(ptr));
+	free(ptr);
+}
+
+#define malloc(size) fault_malloc((size), __FILE__, __LINE__)
+#define calloc(count, size) fault_calloc((count), (size), __FILE__, __LINE__)
+#define realloc(ptr, size) fault_realloc((ptr), (size), __FILE__, __LINE__)
+#define free(ptr) fault_free(ptr)
 #define PRISM_LIB_MODE
 #include "../prism.c"
+#undef free
+#undef realloc
+#undef calloc
+#undef malloc
 
 #include <stdarg.h>
 
@@ -60,6 +170,7 @@ enum {
 	O_INTERNAL = 1u << 18,
 	O_TRAP = 1u << 19,
 	O_REFERENCE_RUN = 1u << 20,
+	O_ALLOC_FAIL = 1u << 21,
 };
 
 typedef struct {
@@ -252,6 +363,210 @@ static int normalized_equal(const char *a, const char *b) {
 	int ok = na && nb && !strcmp(na, nb);
 	free(na);
 	free(nb);
+	return ok;
+}
+
+static void fault_alloc_disable(void) {
+	fault_alloc_at = 0;
+	fault_alloc_calls = 0;
+	fault_alloc_fired = 0;
+	fault_alloc_file = NULL;
+	fault_alloc_line = 0;
+}
+
+static void fault_alloc_enable(long fail_at) {
+	fault_alloc_calls = 0;
+	fault_alloc_fired = 0;
+	fault_alloc_file = NULL;
+	fault_alloc_line = 0;
+	fault_alloc_at = fail_at;
+}
+
+static TEST_THREAD_LOCAL uint64_t fault_live_baseline_id[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL size_t fault_live_baseline_count;
+
+static int fault_alloc_tracker_snapshot(char *why, size_t why_cap) {
+	if (fault_live_overflow) {
+		snprintf(why, why_cap, "allocation tracker overflowed");
+		return 0;
+	}
+	fault_live_baseline_count = fault_live_count;
+	memcpy(fault_live_baseline_id, fault_live_id, fault_live_count * sizeof(uint64_t));
+	return 1;
+}
+
+static int fault_alloc_tracker_matches(char *why, size_t why_cap, const char *phase) {
+	const char *file = "-";
+	int line = 0;
+	int has_new = fault_live_overflow;
+	for (size_t i = 0; i < fault_live_count; i++) {
+		int expected = 0;
+		for (size_t j = 0; j < fault_live_baseline_count; j++)
+			if (fault_live_id[i] == fault_live_baseline_id[j]) expected = 1;
+		if (!expected) {
+			file = fault_live_file[i];
+			line = fault_live_line[i];
+			has_new = 1;
+			break;
+		}
+	}
+	if (!has_new) return 1;
+	snprintf(why, why_cap, "%s changed tracked allocations: %zu -> %zu, first new site %s:%d%s",
+		 phase, fault_live_baseline_count, fault_live_count, file, line,
+		 fault_live_overflow ? " (tracker overflowed)" : "");
+	return 0;
+}
+
+static int prism_result_shape_ok(const PrismResult *r) {
+	if (r->status < PRISM_OK || r->status > PRISM_ERR_IO) return 0;
+	if (r->status == PRISM_OK)
+		return r->output && !r->error_msg && r->output_len == strlen(r->output);
+	return !r->output && r->output_len == 0 && r->error_msg && r->error_msg[0];
+}
+
+static int prism_result_equal(const PrismResult *a, const PrismResult *b) {
+	if (a->status != b->status || a->error_line != b->error_line || a->error_col != b->error_col) return 0;
+	if (a->status == PRISM_OK)
+		return a->output && b->output && a->output_len == b->output_len && !strcmp(a->output, b->output);
+	return a->error_msg && b->error_msg && !strcmp(a->error_msg, b->error_msg);
+}
+
+static PrismResult alloc_fault_transpile(const char *input, int file_api, PrismFeatures f) {
+	return file_api ? prism_transpile_file(input, f)
+			: prism_transpile_source(input, "alloc-fault.c", f);
+}
+
+static int run_alloc_failure_sweep(const char *src, int file_api, int expect_ok, int expect_reject,
+				   PrismFeatures f, char *why, size_t why_cap) {
+	int ok = 0;
+	const char *input = src;
+	const char *site_file = NULL;
+	char path[256] = "";
+	long allocation_count = 0;
+	long i = 0;
+	int fired = 0;
+	int site_line = 0;
+	int tracker_baseline_set = 0;
+	PrismResult base = {0}, measured = {0}, failed = {0}, recovery = {0};
+#ifndef _WIN32
+	if (file_api) {
+		static unsigned serial;
+		snprintf(path, sizeof(path), "/tmp/prism_alloc_fault_%ld_%u.c", (long)getpid(), ++serial);
+		FILE *fp = fopen(path, "wb");
+		if (!fp) {
+			snprintf(why, why_cap, "could not create file-API input");
+			return 0;
+		}
+		size_t src_len = strlen(src);
+		size_t written = fwrite(src, 1, src_len, fp);
+		int close_status = fclose(fp);
+		if (written != src_len || close_status != 0) {
+			remove(path);
+			snprintf(why, why_cap, "could not write file-API input");
+			return 0;
+		}
+		input = path;
+	}
+#else
+	if (file_api) {
+		snprintf(why, why_cap, "file allocation sweep is POSIX-only");
+		return 0;
+	}
+#endif
+	fault_alloc_disable();
+	prism_thread_cleanup();
+	pparse_ctx_init();
+	base = alloc_fault_transpile(input, file_api, f);
+	if (!prism_result_shape_ok(&base) || (expect_ok && base.status != PRISM_OK) ||
+	    (expect_reject && base.status == PRISM_OK)) {
+		snprintf(why, why_cap, "baseline failed: status=%d diag=%s", base.status,
+			 base.error_msg ? base.error_msg : "-");
+		goto done;
+	}
+
+	prism_thread_cleanup();
+	if (!fault_alloc_tracker_snapshot(why, why_cap)) goto done;
+	tracker_baseline_set = 1;
+	pparse_ctx_init();
+	fault_alloc_enable(LONG_MAX);
+	measured = alloc_fault_transpile(input, file_api, f);
+	allocation_count = fault_alloc_calls;
+	fault_alloc_disable();
+	if (!prism_result_shape_ok(&measured) || !prism_result_equal(&base, &measured)) {
+		snprintf(why, why_cap, "allocation-count pass changed output: status=%d", measured.status);
+		goto done;
+	}
+	prism_free(&measured);
+	prism_thread_cleanup();
+	if (!fault_alloc_tracker_matches(why, why_cap, "allocation-count cleanup")) goto done;
+	if (allocation_count <= 0) {
+		snprintf(why, why_cap, "source reached no injected allocation sites");
+		goto done;
+	}
+
+	for (i = 1; i <= allocation_count; i++) {
+		prism_thread_cleanup();
+		pparse_ctx_init();
+		fault_alloc_enable(i);
+		failed = alloc_fault_transpile(input, file_api, f);
+		fired = fault_alloc_fired;
+		site_file = fault_alloc_file;
+		site_line = fault_alloc_line;
+		fault_alloc_disable();
+		if (!fired) {
+			snprintf(why, why_cap, "allocation %ld/%ld was not reached", i, allocation_count);
+			goto done;
+		}
+		if (!prism_result_shape_ok(&failed)) {
+			snprintf(why, why_cap, "allocation %ld/%ld at %s:%d returned invalid result: status=%d output=%p "
+				 "len=%zu diag=%s",
+				 i, allocation_count, site_file, site_line, failed.status, (void *)failed.output, failed.output_len,
+				 failed.error_msg ? failed.error_msg : "-");
+			goto done;
+		}
+		if (failed.status == PRISM_OK &&
+		    (base.status != PRISM_OK || !prism_result_equal(&base, &failed))) {
+			snprintf(why, why_cap, "allocation %ld/%ld at %s:%d succeeded with changed output", i,
+				 allocation_count, site_file, site_line);
+			goto done;
+		}
+		prism_free(&failed);
+
+		recovery = alloc_fault_transpile(input, file_api, f);
+		if (!prism_result_shape_ok(&recovery) || !prism_result_equal(&base, &recovery)) {
+			snprintf(why, why_cap, "allocation %ld/%ld at %s:%d poisoned next call: status=%d diag=%s", i,
+				 allocation_count, site_file, site_line, recovery.status,
+				 recovery.error_msg ? recovery.error_msg : "-");
+			goto done;
+		}
+		prism_free(&recovery);
+		prism_thread_cleanup();
+		if (!fault_alloc_tracker_matches(why, why_cap, "fault recovery cleanup")) {
+			char phase[160];
+			snprintf(phase, sizeof(phase), "allocation %ld/%ld at %s:%d cleanup", i,
+				 allocation_count, site_file, site_line);
+			fault_alloc_tracker_matches(why, why_cap, phase);
+			goto done;
+		}
+	}
+	ok = 1;
+
+done:
+	fault_alloc_disable();
+	prism_free(&recovery);
+	prism_free(&failed);
+	prism_free(&measured);
+	prism_free(&base);
+	prism_thread_cleanup();
+	if (tracker_baseline_set && !fault_alloc_tracker_matches(why, why_cap, "final cleanup")) {
+		char tracker_why[256];
+		fault_alloc_tracker_matches(tracker_why, sizeof(tracker_why), "final cleanup");
+		if (ok) {
+			ok = 0;
+			snprintf(why, why_cap, "%s", tracker_why);
+		}
+	}
+	if (path[0]) remove(path);
 	return ok;
 }
 
@@ -502,25 +817,29 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			out_close();
 			ok = ok && out_total_flushed > 0;
 		} else if (*p == 'D') {
-			char **names = NULL;
-			bool *enabled = NULL, undef_gnu = false;
+			ConsumedDef *defs = NULL;
+			bool undef_gnu = false;
 			int n = 0, cap = 0;
-			emit_consumed_def_upsert(&names, &enabled, &n, &cap, "", true, &undef_gnu);
+			emit_consumed_def_upsert(&defs, &n, &cap, "", true, &undef_gnu);
 			for (int i = 0; i < 20; i++) {
 				char spec[32];
 				snprintf(spec, sizeof spec, "RECIPE_%d=%d", i, i);
-				emit_consumed_def_upsert(&names, &enabled, &n, &cap, spec, true, &undef_gnu);
+				emit_consumed_def_upsert(&defs, &n, &cap, spec, true, &undef_gnu);
 			}
-			emit_consumed_def_upsert(&names, &enabled, &n, &cap, "RECIPE_3", false, &undef_gnu);
-			emit_consumed_def_upsert(&names, &enabled, &n, &cap, "_GNU_SOURCE", false, &undef_gnu);
-			ok = ok && n == 21 && !enabled[3] && undef_gnu;
-			for (int i = 0; i < n; i++) free(names[i]);
-			free(names);
-			free(enabled);
+			emit_consumed_def_upsert(&defs, &n, &cap, "RECIPE_3", false, &undef_gnu);
+			emit_consumed_def_upsert(&defs, &n, &cap, "_GNU_SOURCE", false, &undef_gnu);
+			ok = ok && n == 21 && !defs[3].on && undef_gnu;
+			free_consumed_defs(defs, n);
 		} else if (*p == 'A') {
 			/* The stdin preprocessor path must always carry an explicit language.
 			 * A user-provided `-x none` means extension guessing, which is impossible
 			 * for `-`, so it is normalized to C instead of being passed through. */
+			const char *prefix_define[] = {"_GNU_SOURCE_EXTRA=1"};
+			PrismFeatures prefix = prism_defaults();
+			prefix.defines = prefix_define;
+			prefix.define_count = N(prefix_define);
+			apply_features(prefix);
+			ok = ok && !api_mentions_macro("_GNU_SOURCE", 11);
 			const char *xnone[] = {"-x", "none"};
 			PrismFeatures f = prism_defaults();
 			f.compiler_flags = xnone;
@@ -587,11 +906,11 @@ static int run_internal(const Recipe *r, char *failed_action) {
 				collect_source_defines(path);
 				PRISM_STATE();
 				ok = _ps->source_define_count == scans[i].count &&
-				     _ps->source_defines && !strcmp(_ps->source_defines[0], scans[i].want);
+				     _ps->source_defines && !strcmp(_ps->source_defines[0].text, scans[i].want);
 				if (!ok && getenv("PRISM_INTERNAL_TRACE"))
 					fprintf(stderr, "scan %zu: count=%d value=%s want=%s\n", i,
 						_ps->source_define_count,
-						_ps->source_define_count ? _ps->source_defines[0] : "-", scans[i].want);
+						_ps->source_define_count ? _ps->source_defines[0].text : "-", scans[i].want);
 				prism_reset();
 				unlink(path);
 			}
@@ -612,9 +931,10 @@ static int run_internal(const Recipe *r, char *failed_action) {
 					collect_source_defines(path);
 					PRISM_STATE();
 					ok = _ps->source_define_count == 1 &&
-					     !strcmp(_ps->source_defines[0], "DEEP=41") &&
-					     _ps->source_define_guards && _ps->source_define_guards[0] &&
-					     count_kw(_ps->source_define_guards[0], "if") == 40;
+					     !strcmp(_ps->source_defines[0].text, "DEEP=41") &&
+					     _ps->source_defines[0].guard &&
+					     _ps->source_defines[0].guard_depth == 40 &&
+					     count_kw(_ps->source_defines[0].guard, "if") == 40;
 					prism_reset();
 					unlink(path);
 				}
@@ -812,6 +1132,14 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 	char *src = (oracle & O_NULL_SOURCE) ? NULL : render(r, sel, cell);
 	if (!(oracle & O_NULL_SOURCE) && !src) {
 		fail(st, r, sel, "source rendering failed");
+		return;
+	}
+	if (oracle & O_ALLOC_FAIL) {
+		char why[512] = "allocation fault sweep failed";
+		if (!run_alloc_failure_sweep(src, (oracle & O_FILE) != 0, (oracle & O_REJECT) == 0,
+					     (oracle & O_REJECT) != 0, f, why, sizeof(why)))
+			fail(st, r, sel, "%s", why);
+		free(src);
 		return;
 	}
 	if (oracle & O_DRIVER_TRANSPILE) {
@@ -1165,6 +1493,8 @@ static const char *api_cflag_ok[] = {
 	"-o", "discard.o", "-save-temps", "sibling.c", "-include", "/dev/null",
 };
 static const char *api_force_ok[] = {"/dev/null"};
+static const char *api_order_defines[] = {"RECIPE_ORDER=1", "RECIPE_ORDER=2"};
+static const char *api_order_cflags[] = {"-DRECIPE_ORDER=1", "-DRECIPE_ORDER=2"};
 static const char *api_null[] = {NULL};
 static const char *api_include_mixed[] = {NULL, "."};
 static const char *api_define_mixed[] = {NULL, "RECIPE_DEF=7"};
@@ -1200,6 +1530,14 @@ static const AxisValue api_feature_values[] = {
 	{.tag="compiler/failing", .api_field=AF_COMPILER, .api_compiler="false"},
 };
 static const Axis ax_api_features = {"state", api_feature_values, N(api_feature_values)};
+
+static const AxisValue api_order_values[] = {
+	{.tag="defines", .text="", .api_field=AF_DEFINE, .api_values=api_order_defines,
+	 .api_count=N(api_order_defines)},
+	{.tag="compiler-flags", .text="", .api_field=AF_CFLAG, .api_values=api_order_cflags,
+	 .api_count=N(api_order_cflags)},
+};
+static const Axis ax_api_order = {"source", api_order_values, N(api_order_values)};
 
 static const AxisValue msvc_target_values[] = {
 	{.tag="cl", .api_field=AF_COMPILER, .api_compiler="cl"},
@@ -1575,6 +1913,125 @@ static const Axis ax_runtime_autostatic = {
 	"shape", runtime_autostatic_values, N(runtime_autostatic_values)
 };
 
+#define AF_BLOCK_1 "{int x;}"
+#define AF_BLOCK_2 AF_BLOCK_1 AF_BLOCK_1
+#define AF_BLOCK_4 AF_BLOCK_2 AF_BLOCK_2
+#define AF_BLOCK_8 AF_BLOCK_4 AF_BLOCK_4
+#define AF_BLOCK_16 AF_BLOCK_8 AF_BLOCK_8
+#define AF_BLOCK_32 AF_BLOCK_16 AF_BLOCK_16
+#define AF_BLOCK_64 AF_BLOCK_32 AF_BLOCK_32
+#define AF_BLOCK_128 AF_BLOCK_64 AF_BLOCK_64
+#define AF_BLOCK_256 AF_BLOCK_128 AF_BLOCK_128
+#define AF_BLOCK_512 AF_BLOCK_256 AF_BLOCK_256
+#define AF_BLOCK_1024 AF_BLOCK_512 AF_BLOCK_512
+static const char alloc_fault_large_source[] = "void f(void){" AF_BLOCK_1024 "}";
+#undef AF_BLOCK_1024
+#undef AF_BLOCK_512
+#undef AF_BLOCK_256
+#undef AF_BLOCK_128
+#undef AF_BLOCK_64
+#undef AF_BLOCK_32
+#undef AF_BLOCK_16
+#undef AF_BLOCK_8
+#undef AF_BLOCK_4
+#undef AF_BLOCK_2
+#undef AF_BLOCK_1
+
+#define AF_IF_1 "#if 1\n"
+#define AF_IF_2 AF_IF_1 AF_IF_1
+#define AF_IF_4 AF_IF_2 AF_IF_2
+#define AF_IF_8 AF_IF_4 AF_IF_4
+#define AF_IF_16 AF_IF_8 AF_IF_8
+#define AF_IF_32 AF_IF_16 AF_IF_16
+#define AF_ENDIF_1 "#endif\n"
+#define AF_ENDIF_2 AF_ENDIF_1 AF_ENDIF_1
+#define AF_ENDIF_4 AF_ENDIF_2 AF_ENDIF_2
+#define AF_ENDIF_8 AF_ENDIF_4 AF_ENDIF_4
+#define AF_ENDIF_16 AF_ENDIF_8 AF_ENDIF_8
+#define AF_ENDIF_32 AF_ENDIF_16 AF_ENDIF_16
+static const char alloc_fault_cond_growth_source[] =
+	AF_IF_32 AF_IF_2 "#define V 7\n" AF_ENDIF_2 AF_ENDIF_32
+	"int f(void){return V;}\n";
+#undef AF_ENDIF_32
+#undef AF_ENDIF_16
+#undef AF_ENDIF_8
+#undef AF_ENDIF_4
+#undef AF_ENDIF_2
+#undef AF_ENDIF_1
+#undef AF_IF_32
+#undef AF_IF_16
+#undef AF_IF_8
+#undef AF_IF_4
+#undef AF_IF_2
+#undef AF_IF_1
+
+#define AF_TEXT_64 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define AF_TEXT_128 AF_TEXT_64 AF_TEXT_64
+#define AF_TEXT_256 AF_TEXT_128 AF_TEXT_128
+#define AF_TEXT_512 AF_TEXT_256 AF_TEXT_256
+static const char alloc_fault_long_define_source[] =
+	"#define V \"" AF_TEXT_256 "\" \\\n\"" AF_TEXT_512 "\"\n"
+	"const char *f(void){return V;}\n";
+#undef AF_TEXT_512
+#undef AF_TEXT_256
+#undef AF_TEXT_128
+#undef AF_TEXT_64
+
+static const AxisValue alloc_fault_values[] = {
+	{"basic", "int f(void){int x;return x;}", 0, 0},
+	{"types",
+	 "typedef typeof((long double)0) LD;typedef int*volatile VP;"
+	 "void f(const int source,VP p){typeof(source)x;typeof_unqual(source)y;LD z;"
+	 "(void)x;(void)y;(void)z;(void)p;}",
+	 0, 0},
+	{"control",
+	 "int g(void);void c(int);int f(int n){int a[4];defer c(n);int x=g() orelse 3;"
+	 "if(n)return a[n&3]+x;return x;}",
+	 0, 0},
+	{"source-defines", "#define V 7\n#if V\nint f(void){int x;return x+V;}\n#endif\n", 0, FB_FLAT},
+	{"token-growth", alloc_fault_large_source, 0, 0},
+};
+static const Axis ax_alloc_fault = {"source", alloc_fault_values, N(alloc_fault_values)};
+
+static const AxisValue alloc_fault_reject_values[] = {
+	{"syntax", "void f(void){if(1){", 0, 0},
+	{"defer-control", "void f(void){defer return;}", 0, 0},
+	{"goto-vla", "void f(int n){goto L;int a[n];L:(void)a;}", 0, 0},
+	{"const-atomic", "void f(void){_Atomic int source;const typeof(source) copy;(void)copy;}", 0, 0},
+};
+static const Axis ax_alloc_fault_reject = {
+	"source", alloc_fault_reject_values, N(alloc_fault_reject_values)
+};
+
+static const AxisValue alloc_fault_file_values[] = {
+	{"basic", "int f(void){int x;return x;}", 0, 0},
+	{"defines", "#define V 7\nint f(void){int x;return x+V;}\n", 0, FB_FLAT},
+	{"conditional",
+	 "#if 1\n#define V 7\n#elif 0\n#define V 8\n#else\n#define V 9\n#endif\n"
+	 "int f(void){return V;}\n",
+	 0, FB_FLAT},
+	{"define-growth",
+	 "#define A0 0\n#define A1 1\n#define A2 2\n#define A3 3\n#define A4 4\n#define A5 5\n"
+	 "#define A6 6\n#define A7 7\n#define A8 8\n#define A9 9\n#define A10 10\n#define A11 11\n"
+	 "int f(void){return A0+A5+A11;}\n",
+	 0, FB_FLAT},
+	{"continued-growth", alloc_fault_long_define_source, 0, FB_FLAT},
+	{"comment-splice", "#define V 1 /* open\n*/ + 2\nint f(void){return V;}\n", 0, FB_FLAT},
+	{"conditional-growth", alloc_fault_cond_growth_source, 0, FB_FLAT},
+	{.tag="api-include", .text="int f(void){return 0;}", .api_field=AF_INCLUDE,
+	 .api_values=api_include_ok, .api_count=N(api_include_ok)},
+	{.tag="api-defines", .text="#ifdef RECIPE_DEF\nint v=RECIPE_DEF;\n#endif\n",
+	 .clear_features=FB_FLAT, .api_field=AF_DEFINE, .api_values=api_define_ok,
+	 .api_count=N(api_define_ok)},
+	{.tag="api-cflags", .text="int f(void){return RECIPE_FLAG;}", .api_field=AF_CFLAG,
+	 .api_values=api_cflag_ok, .api_count=N(api_cflag_ok)},
+	{.tag="api-force-include", .text="int f(void){return 0;}", .api_field=AF_FORCE,
+	 .api_values=api_force_ok, .api_count=N(api_force_ok)},
+	{.tag="api-compiler", .text="int f(void){return 0;}", .api_field=AF_COMPILER,
+	 .api_compiler="cc -std=gnu11"},
+};
+static const Axis ax_alloc_fault_file = {"source", alloc_fault_file_values, N(alloc_fault_file_values)};
+
 #include "test.recipes.inc"
 
 /* ---- Recipes -------------------------------------------------------- */
@@ -1620,6 +2077,11 @@ static const char *const av_run_sep[] = {"prism", "run", "x.c", "--", "--flag"};
 static const Recipe recipes[] = {
 	{"internal/platform", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "KCSPODAFJTN"},
+	{"fault/alloc-source-api", "@0@", NULL, {&ax_alloc_fault}, O_ALLOC_FAIL, 0, 0, 0},
+	{"fault/alloc-source-reject", "@0@", NULL, {&ax_alloc_fault_reject}, O_ALLOC_FAIL | O_REJECT,
+	 0, 0, 0},
+	{"fault/alloc-file-api", "@0@", NULL, {&ax_alloc_fault_file}, O_ALLOC_FAIL | O_FILE,
+	 0, 0, CAP_POSIX},
 	{"api/msvc-first-call-prologue", "int f(void){int a[1];return a[0];}", NULL,
 	 {&ax_msvc_target}, O_OK, 0, FB_LINE, 0,
 	 "#pragma warning(push, 0)|#pragma warning(pop)", "#pragma GCC diagnostic"},
@@ -1630,6 +2092,9 @@ static const Recipe recipes[] = {
 	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0},
 	{"api/feature-struct", "#ifdef RECIPE_DEF\nint v=RECIPE_DEF;\n#else\nint v;\n#endif\n",
 	 NULL, {&ax_api_features}, O_FILE | O_ANY_STATUS, 0, FB_LINE, CAP_POSIX},
+	{"api/define-last-wins", "@0@int f(void){return RECIPE_ORDER;}", NULL,
+	 {&ax_api_order}, O_FILE | O_OK, 0, FB_FLAT | FB_LINE, CAP_POSIX,
+	 "#define RECIPE_ORDER 2", "#define RECIPE_ORDER 1"},
 	{"files/product", "@0@", NULL, {&ax_files, &ax_features}, O_FILE | O_TRICHOTOMY,
 	 0, FB_LINE, CAP_POSIX},
 	{"driver/transpile", "@0@", NULL, {&ax_driver, &ax_features},
