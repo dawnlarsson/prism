@@ -361,13 +361,15 @@ static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures 
 	return ok;
 }
 
-/* Keep the oversized-write length opaque to GCC's inliner. The public
+/* Keep the oversized-write length opaque to GCC's optimizer. The public
  * out_str dispatch is what this test covers, but folding its deliberately
  * over-buffer constant through two nested helpers produces a false-positive
- * -Wstringop-overflow warning on GCC 15 even though the slow branch writes
- * directly to the FILE. */
+ * -Wstringop-overflow warning even though the slow branch writes directly to
+ * the FILE. GCC 16 can constprop-clone a noinline function, hence the volatile
+ * read as well as the cold boundary. */
 static PRISM_COLD void exercise_out_str_dispatch(const char *s, int len) {
-	out_str(s, len);
+	volatile int opaque_len = len;
+	out_str(s, opaque_len);
 }
 
 static int run_internal(const Recipe *r, char *failed_action) {
@@ -1422,6 +1424,24 @@ static const AxisValue runtime_zero_values[] = {
 	{"pointer", "int main(void){dirty();char *v;return nz(&v,sizeof v);}", 0, 0},
 	{"long-double", "int main(void){dirty();long double v;return nz(&v,sizeof v);}", 0, 0},
 	{"long-double-typedef", "typedef long double LD;int main(void){dirty();LD v;return nz(&v,sizeof v);}", 0, 0},
+	{"long-double-typeof-typedef",
+	 "typedef typeof((long double)0) LD;static volatile int poison;"
+	 "__attribute__((noinline))static int check(void){LD v;volatile unsigned char*p=(void*)&v;"
+	 "if(poison){for(unsigned long i=0;i<sizeof v;i++)p[i]=0xAA;return 0;}"
+	 "for(unsigned long i=0;i<sizeof v;i++)if(p[i])return 1;return 0;}"
+	 "int main(void){poison=1;check();poison=0;return check();}", 0, 0},
+	{"long-double-typeof-typedef-chain",
+	 "typedef typeof((long double)0) Base;typedef Base LD;static volatile int poison;"
+	 "__attribute__((noinline))static int check(void){LD v;volatile unsigned char*p=(void*)&v;"
+	 "if(poison){for(unsigned long i=0;i<sizeof v;i++)p[i]=0xAA;return 0;}"
+	 "for(unsigned long i=0;i<sizeof v;i++)if(p[i])return 1;return 0;}"
+	 "int main(void){poison=1;check();poison=0;return check();}", 0, 0},
+	{"long-double-typeof-type-typedef",
+	 "typedef typeof(long double) LD;static volatile int poison;"
+	 "__attribute__((noinline))static int check(void){LD v;volatile unsigned char*p=(void*)&v;"
+	 "if(poison){for(unsigned long i=0;i<sizeof v;i++)p[i]=0xAA;return 0;}"
+	 "for(unsigned long i=0;i<sizeof v;i++)if(p[i])return 1;return 0;}"
+	 "int main(void){poison=1;check();poison=0;return check();}", 0, 0},
 	{"long-double-complex", "int main(void){dirty();_Complex long double v;return nz(&v,sizeof v);}", 0, 0},
 	{"long-double-volatile", "int main(void){dirty();volatile long double v;return nz((const void*)&v,sizeof v);}", 0, 0},
 	{"char-array", "int main(void){dirty();char v[13];return nz(&v,sizeof v);}", 0, 0},
@@ -1474,6 +1494,10 @@ static const AxisValue defer_ident_shape_values[] = {
 	{"label", "int f(void){goto defer;defer:return 0;}", 0, 0},
 	{"function-empty-stmt", "int defer(void);void f(void){defer();}", 0, 0},
 	{"function-arg-stmt", "void defer(int);void f(void){defer(1);}", 0, 0},
+	{"function-pointer-param", "void f(void(*defer)(int)){defer(1);}", 0, 0},
+	{"function-pointer-typedef-param", "typedef void(*F)(int);void f(F defer){defer(1);}", 0, 0},
+	{"function-pointer-local", "void g(int);void f(void){void(*defer)(int)=g;defer(1);}", 0, 0},
+	{"function-pointer-knr-param", "void f(defer)void(*defer)(int);{defer(1);}", 0, 0},
 };
 static const Axis ax_defer_ident_shape = {
 	"shape", defer_ident_shape_values, N(defer_ident_shape_values)
@@ -1489,6 +1513,10 @@ static const AxisValue orelse_ident_shape_values[] = {
 	{"label", "int f(void){goto orelse;orelse:return 0;}", 0, 0},
 	{"function-empty-stmt", "int orelse(void);void f(void){orelse();}", 0, 0},
 	{"function-arg-stmt", "void orelse(int);void f(void){orelse(1);}", 0, 0},
+	{"function-pointer-param", "void f(void(*orelse)(int)){orelse(1);}", 0, 0},
+	{"function-pointer-typedef-param", "typedef void(*F)(int);void f(F orelse){orelse(1);}", 0, 0},
+	{"function-pointer-local", "void g(int);void f(void){void(*orelse)(int)=g;orelse(1);}", 0, 0},
+	{"function-pointer-knr-param", "void f(orelse)void(*orelse)(int);{orelse(1);}", 0, 0},
 };
 static const Axis ax_orelse_ident_shape = {
 	"shape", orelse_ident_shape_values, N(orelse_ident_shape_values)
@@ -1635,6 +1663,11 @@ static const Recipe recipes[] = {
 	{"runtime/orelse-chain-matrix", "@0@",
 	 "static int gc,fc;static int g(int v){gc++;return v;}static int fb(int v){fc++;return v;}",
 	 {&ax_runtime_chain}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-function-pointer-shadow",
+	 "static int calls;static void hit(int x){calls+=x;}"
+	 "static void invoke(void(*defer)(int)){defer(2);}"
+	 "int main(void){void(*defer)(int)=hit;defer(1);invoke(defer);return calls==3?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_OUTPUT_EQ_OFF, 0, FB_LINE, CAP_POSIX},
 	{"runtime/orelse-qualified-product",
 	 "static int gc,fc;static int g(int v){gc++;return v;}static int fb(int v){fc++;return v;}"
 	 "int main(void){@0@ int x=g(@1@) orelse fb(9);return "
@@ -1716,6 +1749,9 @@ static const Recipe recipes[] = {
 	{"exact/long-double-typedef-full-object-zero",
 	 "typedef long double LD;void f(void){LD x;(void)x;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = 0"},
+	{"exact/typeof-typedef-preserves-zero-strategy",
+	 "typedef typeof((long double)0) Base;typedef Base LD;void f(void){LD x;(void)x;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = {0}"},
 	{"reject/const-long-double-auto-zero",
 	 "void f(void){const long double x;(void)x;}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
@@ -1725,6 +1761,66 @@ static const Recipe recipes[] = {
 	{"exact/typeof-sizeof-atomic-is-not-atomic",
 	 "void f(void){_Atomic int source;const typeof(sizeof(source)) n;(void)source;(void)n;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", NULL},
+	{"exact/typeof-const-binding-brace-init",
+	 "void f(void){const int source=1;typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-parenthesized-const-binding-brace-init",
+	 "void f(void){const int source=1;typeof(((source))) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-const-parameter-brace-init",
+	 "void f(const int source){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-const-pointer-parameter-brace-init",
+	 "void f(int *const source){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-pointer-to-const-parameter-not-const",
+	 "void f(const int *source){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "memset", "= {0}"},
+	{"exact/typeof-array-parameter-element-const-not-pointer-const",
+	 "void f(const int source[2]){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "memset", "= {0}"},
+	{"exact/typeof-array-parameter-pointer-const-brace-init",
+	 "void f(int source[const 2]){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-volatile-pointer-binding-uses-volatile-zero",
+	 "void f(void){int *volatile source=0;typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "volatile char", "__builtin_memset"},
+	{"exact/typeof-volatile-pointer-parameter-uses-volatile-zero",
+	 "void f(int *volatile source){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "volatile char", "__builtin_memset"},
+	{"exact/typeof-volatile-pointer-typedef-uses-volatile-zero",
+	 "typedef int *volatile VP;void f(void){VP source=0;typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "volatile char", "__builtin_memset"},
+	{"exact/typeof-inner-volatile-pointer-is-not-top-level",
+	 "void f(int *volatile *source){typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "volatile char"},
+	{"exact/typeof-knr-const-parameter-brace-init",
+	 "void f(source)const int source;{typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-knr-volatile-pointer-parameter",
+	 "void f(source)int *volatile source;{typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "volatile char", "__builtin_memset"},
+	{"exact/typeof-knr-pointer-to-const-not-const",
+	 "void f(source)const int *source;{typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "= {0}"},
+	{"exact/typeof-unqual-drops-const-binding",
+	 "void f(void){const int source=1;typeof_unqual(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "memset", "= {0}"},
+	{"exact/typeof-sizeof-const-is-not-const",
+	 "void f(void){const int source=1;typeof(sizeof(source)) n;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "memset", "= {0}"},
+	{"exact/typeof-sizeof-atomic-type-is-not-atomic",
+	 "void f(void){const typeof(sizeof(_Atomic int)) n;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-alignof-atomic-type-is-not-atomic",
+	 "void f(void){const typeof(_Alignof(_Atomic int)) n;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
+	{"exact/typeof-sizeof-const-type-is-not-inherently-const",
+	 "void f(void){typeof(sizeof(const int)) n;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "memset", "= {0}"},
+	{"exact/typeof-real-const-deref-remains-const",
+	 "void f(void){typeof(*(const int*)0) n;(void)n;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
 	{"reject/const-atomic-typeof-scalar-memset",
 	 "void f(void){const _Atomic typeof(int) x;(void)x;}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
@@ -1734,6 +1830,18 @@ static const Recipe recipes[] = {
 	{"reject/const-typeof-atomic-binding-memset",
 	 "void f(void){_Atomic int source;const typeof(source) copy;(void)source;(void)copy;}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-typeof-atomic-pointer-binding",
+	 "void f(void){int *_Atomic source=0;const typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-typeof-atomic-pointer-parameter",
+	 "void f(int *_Atomic source){const typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"reject/const-typeof-atomic-pointer-typedef",
+	 "typedef int *_Atomic AP;void f(void){AP source=0;const typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "const"},
+	{"exact/const-typeof-pointer-to-atomic-is-not-atomic",
+	 "void f(_Atomic int *source){const typeof(source) copy;(void)copy;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
 	{"exact/constexpr-dimension-not-vla",
 	 "int f(void){goto L;raw constexpr int N=4;raw int a[N];L:return 0;}", NULL,
 	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
@@ -1825,6 +1933,24 @@ static const Recipe recipes[] = {
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
 	{"exact/bounds-control-deref-add-warn", "void f(int c,int i){int a[4]={0};if(c)*(a+i)=0;}", NULL,
 	 {0}, O_OK, FB_BOUNDS | FB_WARN, FB_LINE, 0, NULL, "__prism_bchk(("},
+	{"exact/bounds-unevaluated-nested-paren-deref-add",
+	 "int f(int i){int a[4];return sizeof((*(a+i)));}", NULL,
+	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-unevaluated-comma-deref-add",
+	 "int f(int i){int a[4];return sizeof((0,*(a+i)));}", NULL,
+	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-generic-control-comma-deref-add",
+	 "int f(int i){int a[4];return _Generic((0,*(a+i)),int:1);}", NULL,
+	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-typeof-comma-deref-add",
+	 "int f(int i){int a[4];typeof((0,*(a+i)))x=0;return x;}", NULL,
+	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"reject/bounds-evaluated-nested-paren-deref-add",
+	 "int f(int i){int a[4];return ((0,*(a+i)));}", NULL,
+	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
+	{"reject/bounds-generic-association-deref-add-is-evaluated",
+	 "int f(int i){int a[4];return _Generic(0,int:*(a+i),default:0);}", NULL,
+	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
 	{"exact/bounds-parenthesized-reverse-address", "int*f(int i){int a[4]={0};return &(i[a]);}", NULL,
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
 	{"exact/special-wrapper-transitive",

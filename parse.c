@@ -466,6 +466,7 @@ typedef struct {
 	bool has_volatile_member : 1;
 	bool is_atomic : 1;	     // _Atomic(...) spelling baked into this typedef name
 	bool is_long_double : 1;      // scalar long double (including _Complex)
+	bool is_typeof : 1;           // typedef originated from typeof()/__typeof__
 	bool is_constexpr : 1;	     // C23 'constexpr' shadow: usable as an array-dimension ICE
 	bool is_struct_tag : 1;	     // struct/union tag (not a typedef name)
 	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
@@ -2711,6 +2712,8 @@ typedef struct {
 	bool paren_array : 1;
 	bool has_init : 1;
 	bool is_const : 1;
+	bool is_volatile : 1;
+	bool is_atomic : 1;
 	bool array_dim_complete : 1;
 	bool has_bracket_orelse : 1;
 	bool has_zero_dim : 1;
@@ -2935,6 +2938,7 @@ enum {
 	PPARSE_TDF_ATOMIC = 8192,
 	PPARSE_TDF_CONSTEXPR = 16384, // C23 'constexpr': value is an integer constant expression
 	PPARSE_TDF_LONG_DOUBLE = 32768,
+	PPARSE_TDF_TYPEOF = 65536,
 };
 
 // Apply typedef traits to a parsed type.
@@ -2954,6 +2958,7 @@ static inline void pparse_typedef_apply_tdf_flags(PParseTypeSpec *r, PParseToken
 		r->has_volatile_member = r->has_hidden_volatile = true;
 	if (tflags & PPARSE_TDF_ATOMIC) r->has_atomic = true;
 	if (tflags & PPARSE_TDF_LONG_DOUBLE) r->has_long_double = true;
+	if (tflags & PPARSE_TDF_TYPEOF) r->has_typeof = true;
 	if (tflags & PPARSE_TDF_PTR) r->is_ptr = true;
 	if (tflags & PPARSE_TDF_FUNC) r->is_func = true;
 	if (tflags & PPARSE_TDF_ARRAY) {
@@ -3539,7 +3544,8 @@ static inline PRISM_PURE int pparse_typedef_flags_(PParseToken *tok, bool includ
 	       (e->is_aggregate ? PPARSE_TDF_AGGREGATE : 0) | (e->is_func ? PPARSE_TDF_FUNC : 0) |
 	       (e->has_volatile_member ? PPARSE_TDF_HAS_VOL_MEMBER : 0) | (e->is_union ? PPARSE_TDF_UNION : 0) |
 	       (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) |
-	       (e->is_long_double ? PPARSE_TDF_LONG_DOUBLE : 0);
+	       (e->is_long_double ? PPARSE_TDF_LONG_DOUBLE : 0) |
+	       (e->is_typeof ? PPARSE_TDF_TYPEOF : 0);
 }
 
 #define pparse_typedef_flags(tok) pparse_typedef_flags_((tok), true)
@@ -5256,6 +5262,8 @@ static PParseDecl pparse_declarator_parse(PParseToken *tok) {
 		if (pparse_match_ch(tok, '*')) {                                                                    \
 			r.is_pointer = true;                                                                 \
 			r.is_const = false;                                                                  \
+			r.is_volatile = false;                                                               \
+			r.is_atomic = false;                                                                 \
 			extra_ptr_action;                                                                    \
 			if (++ptr_depth > 1024) {                                                            \
 				pparse_warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped");    \
@@ -5266,6 +5274,9 @@ static PParseDecl pparse_declarator_parse(PParseToken *tok) {
 		} else if ((tok->tag & PPARSE_TT_QUALIFIER) &&                                                      \
 			   !(pparse_is_soft_keyword_identifier(tok) && pparse_soft_keyword_decl_name_boundary(tok))) {     \
 			if (r.is_pointer && (tok->tag & PPARSE_TT_CONST)) r.is_const = true;                        \
+			if (r.is_pointer && (tok->tag & PPARSE_TT_VOLATILE)) r.is_volatile = true;                  \
+			if (r.is_pointer && (tok->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==                  \
+						      (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) r.is_atomic = true;        \
 			tok = pparse_next(_pc, tok);                                                                 \
 		} else                                                                                       \
 			break;                                                                               \
@@ -5505,6 +5516,18 @@ static void pparse_scan_type_constructor(PParseToken *start,
 	int depth = 0, fn_skip = 0;
 	uint32_t sizeof_end = 0;
 	for (PParseToken *t = start; t && t != end; prev = t, t = pparse_next(_pc, t)) {
+		/* sizeof/alignof/offsetof yield an unqualified size type. Qualifiers
+		 * written inside their balanced operand describe that operand, not the
+		 * result of an enclosing typeof. Scanning through `_Atomic int` here
+		 * made `const typeof(sizeof(_Atomic int))` falsely require the atomic
+		 * memset path and reject otherwise valid code. */
+		if (copy_quals && pparse_is_sizeof_like(t)) {
+			PParseToken *op = pparse_skip_noise(_pc, pparse_next(_pc, t));
+			if (op && pparse_match_ch(op, '(') && pparse_pair(_pc, op)) {
+				t = pparse_pair(_pc, op);
+				continue;
+			}
+		}
 		PParseToken *attr_open = (t->tag & PPARSE_TT_ATTR) ? pparse_next(_pc, t) : NULL;
 		PParseToken *attr_close = attr_open && pparse_match_ch(attr_open, '(')
 					   ? pparse_pair(_pc, attr_open)
@@ -5911,6 +5934,10 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 				if (operand && operand_close && pparse_next(_pc, operand) == operand_close &&
 				    pparse_is_identifier_like(operand)) {
 					int operand_flags = pparse_typedef_flags(operand);
+					PParseTypedefEntry *operand_binding = pparse_typedef_lookup(_pc, operand);
+					if (!is_unqual && operand_binding && operand_binding->is_const) {
+						r.has_const = r.has_decl_const = r.has_hidden_const = true;
+					}
 					if (!is_unqual && (operand_flags & PPARSE_TDF_ATOMIC)) r.has_atomic = true;
 					if (operand_flags & PPARSE_TDF_LONG_DOUBLE) r.has_long_double = true;
 				}
@@ -6035,7 +6062,9 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 			    decl.var_name, scope_depth, PPARSE_TDK_TYPEDEF, type_spec.is_vla || decl.is_vla, is_void);
 			if (added) {
 				added->is_const = is_const;
-				added->is_volatile = !decl.is_pointer && !decl.is_func_ptr && type_spec.has_volatile;
+				added->is_volatile = (decl.is_pointer || decl.is_func_ptr)
+							 ? decl.is_volatile
+							 : type_spec.has_volatile;
 				added->has_volatile_member = type_spec.has_volatile_member && !decl.is_pointer && !decl.is_func_ptr;
 				added->is_ptr = is_ptr;
 				added->is_array = is_array;
@@ -6052,8 +6081,11 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 						      !decl.is_pointer && !decl.is_func_ptr;
 				added->is_union = type_spec.is_union && !decl.is_pointer && !decl.is_func_ptr;
 				added->is_long_double = type_spec.has_long_double && !is_ptr && !is_array;
+				added->is_typeof = type_spec.has_typeof;
 				if (decl.is_func_decl) added->is_func = true;
-				if (type_spec.has_atomic) added->is_atomic = true;
+				added->is_atomic = (decl.is_pointer || decl.is_func_ptr)
+						      ? decl.is_atomic
+						      : type_spec.has_atomic;
 				if (!decl.end) {
 					PParseToken *after_name = pparse_skip_noise(_pc, pparse_next(_pc, decl.var_name));
 					if (after_name && pparse_match_ch(after_name, '(')) added->is_func = true;
@@ -6616,7 +6648,7 @@ static void pparse_build_scopes(PParseToken *start) {
 	stack[0] = 0;
 	struct {
 		uint32_t bits;
-		bool is_generic, seen_comma;
+		bool is_generic, seen_comma, sticky_uneval;
 	} context[PPARSE_CTX_STACK_MAX] = {0};
 	for (PParseToken *t = start; t && t->kind != PPARSE_TK_EOF; t++) {
 		uint32_t here = context[context_depth].bits;
@@ -6632,7 +6664,18 @@ static void pparse_build_scopes(PParseToken *start) {
 				int d = ++context_depth;
 				context[d].bits = 0;
 				context[d].is_generic = context[d].seen_comma = false;
+				context[d].sticky_uneval = false;
+				/* A delimiter nested anywhere inside an unevaluated operand
+				 * remains unevaluated across its own commas and child groups.
+				 * Previously only a group immediately preceded by sizeof/typeof
+				 * inherited the bit, so one redundant pair of parentheses made
+				 * bounds checking reject dead pointer arithmetic. */
+				if (here & P1_CTX_UNEVAL) {
+					context[d].bits |= P1_CTX_UNEVAL;
+					context[d].sticky_uneval = true;
+				}
 				if (prev_ci & PPARSE_CI_UNEVAL) context[d].bits |= P1_CTX_UNEVAL;
+				if (prev_ci & PPARSE_CI_UNEVAL) context[d].sticky_uneval = true;
 				context[d].is_generic = intro && (intro->tag & PPARSE_TT_GENERIC);
 				if (!paren) {
 					context[d].bits |= here &
@@ -6654,6 +6697,11 @@ static void pparse_build_scopes(PParseToken *start) {
 				if (pparse_match_ch(t, ',')) {
 					context[context_depth].seen_comma = true;
 					context[context_depth].bits |= P1_CTX_GENERIC_ASSOC;
+					/* The first comma ends _Generic's unevaluated controlling
+					 * expression; association expressions are ordinary evaluated
+					 * expressions. Nested comma expressions are in child frames. */
+					context[context_depth].bits &= ~P1_CTX_UNEVAL;
+					context[context_depth].sticky_uneval = false;
 				} else if (pparse_match_ch(t, ':') && context[context_depth].seen_comma) {
 					context[context_depth].bits &= ~P1_CTX_GENERIC_ASSOC;
 				}
@@ -6661,8 +6709,9 @@ static void pparse_build_scopes(PParseToken *start) {
 			if (pparse_context_intro(t) & PPARSE_CI_UNEVAL) {
 				PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, t));
 				if (!(after && pparse_match_ch(after, '('))) context[context_depth].bits |= P1_CTX_UNEVAL;
-			} else if (pparse_match_ch(t, ';') || pparse_match_ch(t, ',') ||
-				   pparse_match_ch(t, '{') || pparse_match_ch(t, '}')) {
+			} else if (!context[context_depth].sticky_uneval &&
+				   (pparse_match_ch(t, ';') || pparse_match_ch(t, ',') ||
+				    pparse_match_ch(t, '{') || pparse_match_ch(t, '}'))) {
 				context[context_depth].bits &= ~P1_CTX_UNEVAL;
 			}
 		}
@@ -7912,6 +7961,10 @@ static inline bool is_defer_kw(PParseToken *tok, PParseToken *prev) {
 	 * (`is_shadow`) must still allow braceless `defer stmt;` — otherwise the
 	 * keyword leaks to the backend. */
 	PParseIdentifierBindingKind binding = pparse_identifier_binding_kind(tok);
+	/* A value binding followed by `(` is a function-pointer call. Ordinary
+	 * variables named defer must still permit the keyword in `defer cleanup()`;
+	 * only the syntactically callable spelling is unambiguous. */
+	if (binding == PPARSE_BINDING_VALUE && nx && pparse_match_ch(nx, '(')) return false;
 	if (binding == PPARSE_BINDING_TYPE && !(nx && pparse_match_ch(nx, '{'))) return false;
 	/* `defer {…}` cannot be a parameter name — skip the param-list walk. */
 	if (!(nx && pparse_match_ch(nx, '{')) && pparse_function_param_open(tok)) return false;
@@ -8680,14 +8733,51 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 					if (tf & PPARSE_TDF_ATOMIC) has_atomic_qual = true;
 				}
 			}
+			bool is_const_param = false;
 			bool is_vol_param = (has_vol_qual || has_vol_member) && !saw_star;
 			bool is_atomic_param = has_atomic_qual && !saw_star;
-			/* Record only params that can affect array/volatile/atomic lookup. */
+			/* Recover top-level declarator qualifiers exactly. A qualifier before
+			 * `*` belongs to the pointee; one after the final `*` belongs to the
+			 * parameter object. Array-parameter qualifiers live inside `[]` and
+			 * qualify the adjusted pointer. */
+			PParseTypeSpec param_type = pparse_type_specifier(param_start);
+			PParseDecl param_decl = pparse_declarator(param_type.end);
+			if (param_decl.var_name == last_ident) {
+				if (param_decl.is_pointer || param_decl.is_func_ptr) {
+					is_const_param = param_decl.is_const;
+					is_vol_param = param_decl.is_volatile;
+					is_atomic_param = param_decl.is_atomic;
+				} else if (param_decl.is_array) {
+					is_const_param = is_vol_param = is_atomic_param = false;
+					for (PParseToken *s = pparse_next(_pc, last_ident);
+					     s && s != param_end && s->kind != PPARSE_TK_EOF;
+					     s = pparse_next(_pc, s)) {
+						if (!pparse_match_ch(s, '[') || !(s->flags & PPARSE_TF_OPEN) ||
+						    !pparse_pair(_pc, s))
+							continue;
+						PParseToken *bc = pparse_pair(_pc, s);
+						PPARSE_FOR_RANGE(q, pparse_next(_pc, s), bc) {
+							if (q->tag & PPARSE_TT_CONST) is_const_param = true;
+							if (q->tag & PPARSE_TT_VOLATILE) is_vol_param = true;
+							if ((q->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
+							    (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE))
+								is_atomic_param = true;
+						}
+						break;
+					}
+				} else {
+					is_const_param = param_type.has_const;
+					is_vol_param = param_type.has_volatile || param_type.has_volatile_member;
+					is_atomic_param = param_type.has_atomic;
+				}
+			}
+			/* Record only params that can affect array or qualified-type lookup. */
 			bool hides_outer_array = pparse_bounds_is_tracked_array(last_ident);
 			bool param_needs_shadow =
-			    param_has_bracket || is_vol_param || is_atomic_param || hides_outer_array ||
+			    param_has_bracket || is_const_param || is_vol_param || is_atomic_param || hides_outer_array ||
 			    (!saw_star && (saw_typedef_or_sue || !saw_builtin_type));
-			unsigned traits = (has_vol_qual && is_vol_param ? PPARSE_BIND_VOLATILE : 0) |
+			unsigned traits = (is_const_param ? PPARSE_BIND_CONST : 0) |
+					  (is_vol_param ? PPARSE_BIND_VOLATILE : 0) |
 					  (has_vol_member && is_vol_param ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
 					  (is_atomic_param ? PPARSE_BIND_ATOMIC : 0);
 			pparse_register_parameter_binding(
@@ -8791,8 +8881,8 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 				    uint8_t *out_zero) {
 	PPARSE_CTX();
 	bool plain = !decl->is_pointer && !decl->is_func_ptr;
-	bool is_vol = plain && (type->has_volatile || type->has_volatile_member);
-	bool is_atomic = plain && type->has_atomic;
+	bool is_vol = plain ? (type->has_volatile || type->has_volatile_member) : decl->is_volatile;
+	bool is_atomic = plain ? type->has_atomic : decl->is_atomic;
 	bool is_long_double = plain && !type->is_ptr && type->has_long_double;
 	bool is_const = track_const &&
 			(pparse_decl_const_flags(type, decl) & PPARSE_DECL_CONST_EFFECTIVE);
@@ -8808,7 +8898,7 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 	if (create) {
 		unsigned bind = (decl->is_func_decl ? PPARSE_BIND_FUNC : 0) |
 				(is_const ? PPARSE_BIND_CONST : 0) |
-				(type->has_volatile && is_vol ? PPARSE_BIND_VOLATILE : 0) |
+				(is_vol ? PPARSE_BIND_VOLATILE : 0) |
 				(type->has_volatile_member && is_vol ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
 				(is_atomic ? PPARSE_BIND_ATOMIC : 0) |
 				(is_long_double ? PPARSE_BIND_LONG_DOUBLE : 0) |
@@ -10836,7 +10926,7 @@ static void p1d_probe_declaration(PParseToken *tok,
 	}
 	PPARSE_TD_SCOPE_RESTORE();
 }
-static void p1_register_knr_param_vlas(PParseToken *rparen, PParseToken *lbrace, uint16_t sid, int brace_depth) {
+static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbrace, uint16_t sid, int brace_depth) {
 	PPARSE_CTX();
 	if (!rparen || !lbrace || sid == 0 || brace_depth <= 0 || sid >= pparse_scope_tree_count) return;
 	if (!pparse_match_ch(rparen, ')') || !pparse_pair(_pc, rparen)) return;
@@ -10863,6 +10953,23 @@ static void p1_register_knr_param_vlas(PParseToken *rparen, PParseToken *lbrace,
 		for (PParseToken *seg = ts.end; seg && seg != semi && seg != lbrace;) {
 			PParseDecl decl = pparse_declarator(seg);
 			if (!decl.var_name || !decl.end) break;
+			bool plain = !decl.is_pointer && !decl.is_func_ptr;
+			bool is_const = plain ? ts.has_const : decl.is_const;
+			bool is_vol = plain ? (ts.has_volatile || ts.has_volatile_member) : decl.is_volatile;
+			bool is_atomic = plain ? ts.has_atomic : decl.is_atomic;
+			bool is_long_double = plain && !ts.is_ptr && ts.has_long_double;
+			unsigned traits = (is_const ? PPARSE_BIND_CONST : 0) |
+					  (is_vol ? PPARSE_BIND_VOLATILE : 0) |
+					  (plain && ts.has_volatile_member ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
+					  (is_atomic ? PPARSE_BIND_ATOMIC : 0) |
+					  (is_long_double ? PPARSE_BIND_LONG_DOUBLE : 0);
+			pparse_register_parameter_binding(
+			    decl.var_name, brace_depth, sid, true, traits);
+			/* The identifier-list token already owns the binding used inside
+			 * the body; the following declaration repeats its name at a second
+			 * token. Apply traits to whichever same-name entry covers this
+			 * declaration as well as registering the declaration token. */
+			pparse_binding_apply_traits(pparse_typedef_lookup(_pc, decl.var_name), traits);
 			bool skip_first = true;
 			for (PParseToken *s = seg; s && s != decl.end && s != semi && s->kind != PPARSE_TK_EOF;
 			     s = pparse_next(_pc, s)) {
@@ -10927,7 +11034,7 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		if (prev_tok && pparse_match_ch(prev_tok, ')') && pparse_pair(_pc, prev_tok)) {
 			p1_register_param_shadows(
 			    pparse_pair(_pc, prev_tok), prev_tok, sid, s->brace_depth + 1, true);
-			p1_register_knr_param_vlas(prev_tok, tok, sid, s->brace_depth + 1);
+			p1_register_knr_param_bindings(prev_tok, tok, sid, s->brace_depth + 1);
 		}
 	}
 
