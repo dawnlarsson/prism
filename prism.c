@@ -654,8 +654,17 @@ static void emit_define_guarded(const char *def) {
 	const char *eq = strchr(def, '=');
 	int name_len = eq ? (int)(eq - def) : (int)strlen(def);
 	if (name_len <= 0) return;
+	/* Function-like macro parameters belong on #define but not #ifndef:
+	 * `#ifndef F(x)` is not a valid preprocessing directive (the operand must
+	 * be one identifier).  Source-define collection deliberately retains the
+	 * adjacent parameter list so the reconstructed definition keeps its
+	 * function-like shape; use only the identifier portion for the guard. */
+	int guard_len = name_len;
+	const char *params = memchr(def, '(', (size_t)name_len);
+	if (params) guard_len = (int)(params - def);
+	if (guard_len <= 0) return;
 	OUT_LIT("#ifndef ");
-	out_str(def, name_len);
+	out_str(def, guard_len);
 	OUT_LIT("\n#define ");
 	out_str(def, name_len);
 	if (eq) {
@@ -667,6 +676,7 @@ static void emit_define_guarded(const char *def) {
 
 static void emit_consumed_def_upsert(char ***names, bool **on, int *n, int *cap,
 				       const char *spec, bool defined, bool *undef_gnu) {
+	if (!spec) return;
 	const char *eq = strchr(spec, '=');
 	int nlen = eq ? (int)(eq - spec) : (int)strlen(spec);
 	if (nlen <= 0) return;
@@ -697,6 +707,7 @@ static void emit_consumed_defines(void) {
 	bool user_undef_gnu = false;
 	for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 		const char *f = _ps->extra_compiler_flags[i];
+		if (!f) continue;
 		if (f[0] == '-' && (f[1] == 'D' || f[1] == 'U')) {
 			any = true;
 			break;
@@ -709,11 +720,15 @@ static void emit_consumed_defines(void) {
 	bool *def_on = NULL;
 	int def_n = 0, def_cap = 0;
 
-	for (int i = 0; i < _ps->extra_define_count; i++)
-		emit_consumed_def_upsert(&def_names, &def_on, &def_n, &def_cap, _ps->extra_defines[i], true,
+	for (int i = 0; i < _ps->extra_define_count; i++) {
+		const char *def = _ps->extra_defines[i];
+		if (!def) continue;
+		emit_consumed_def_upsert(&def_names, &def_on, &def_n, &def_cap, def, true,
 					 &user_undef_gnu);
+	}
 	for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 		const char *f = _ps->extra_compiler_flags[i];
+		if (!f) continue;
 		if (f[0] != '-' || (f[1] != 'D' && f[1] != 'U')) continue;
 		bool defined = (f[1] == 'D');
 		const char *spec = f[2] ? f + 2 : NULL;
@@ -728,6 +743,7 @@ static void emit_consumed_defines(void) {
 			const char *emit = def_names[i];
 			for (int j = 0; j < _ps->extra_define_count; j++) {
 				const char *s = _ps->extra_defines[j];
+				if (!s) continue;
 				int nlen = (int)strlen(def_names[i]);
 				if (!strncmp(s, def_names[i], (size_t)nlen) &&
 				    (s[nlen] == '\0' || s[nlen] == '=')) {
@@ -738,6 +754,7 @@ static void emit_consumed_defines(void) {
 			for (int j = 0; j < _ps->extra_compiler_flags_count; j++) {
 				const char *f = _ps->extra_compiler_flags[j];
 				const char *s = NULL;
+				if (!f) continue;
 				if (f[0] == '-' && f[1] == 'D')
 					s = f[2] ? f + 2
 						 : (j + 1 < _ps->extra_compiler_flags_count
@@ -1293,6 +1310,14 @@ static inline PParseToken *try_strip_raw(PParseToken *t) {
 		after = pparse_raw_strip_recipe(after);
 	}
 	emit_noise_between_raws(t, last);
+	/* `raw` is elided outright: it never reaches emit_tok, so the newline
+	 * its own beginning-of-line position would have produced is lost, and
+	 * the next emitted token fuses onto the previous output line. Usually
+	 * cosmetic, but when the previous line is a preprocessor directive
+	 * (`#pragma pack(push,1)` immediately followed by `raw struct S {...}`)
+	 * the directive swallows the declaration and the backend silently
+	 * drops it. Re-open the line `raw` would have started. */
+	if (pparse_at_bol(t)) out_char('\n');
 	return pparse_next(_pc, last);
 }
 
@@ -1395,6 +1420,7 @@ static PParseToken *emit_generic_open(PParseToken *tok) {
 }
 
 static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode mode) {
+	PRISM_STATE();
 	PPARSE_CTX();
 	PParseToken *unreachable_tok = NULL;
 	bool dr_braceless_body = false;
@@ -1538,9 +1564,13 @@ static PParseToken *emit_statements(PParseToken *tok, PParseToken *end, EmitMode
 		 * ternary index. try_bounds_check_subscript already lowers
 		 * P1_OE_BRACKET indexes inside __prism_bchk; orelse-only
 		 * brackets (declarator dims, uneval, non-arrays) still fall
-		 * through to try_orelse_expr_rewrites. */
+		 * through to try_orelse_expr_rewrites. Gate on raw_block_depth
+		 * the same way transpile_tokens does (same ordering, same
+		 * suppression): without it, a bracket-orelse array dimension
+		 * inside `raw { ... }` was still being lowered to a hoisted
+		 * temp + ternary instead of passing through untouched. */
 		EMIT_TRY_BOUNDS(tok)
-		{
+		if (_ps->raw_block_depth == 0) {
 			PParseToken *next = try_orelse_expr_rewrites(tok);
 			if (next) {
 				tok = next;
@@ -1701,6 +1731,7 @@ static inline bool walk_balanced_tail(PParseToken **tp) {
 /* Emit a balanced group. The non-emitting form was identical to
  * pparse_skip_balanced_group, so it is gone and callers use that. */
 static PRISM_HOT PParseToken *walk_balanced(PParseToken *tok) {
+	PRISM_STATE();
 	PPARSE_CTX();
 	PParseToken *end = pparse_pair(_pc, tok);
 	if (!end) return pparse_next(_pc, tok);
@@ -1718,7 +1749,15 @@ static PRISM_HOT PParseToken *walk_balanced(PParseToken *tok) {
 					t = emit_c23_attr(t);
 					continue;
 				}
-				{
+				/* raw_block_depth guard: same gap as the two above. This is
+				 * the path a plain declaration's bracket dimension actually
+				 * takes once emit_declarator's own P1_DECL_BRACKET branch is
+				 * suppressed (its generic fallback calls walk_balanced,
+				 * which independently re-discovers the bracket via
+				 * pparse_ann rather than trusting the caller), so without
+				 * this guard too the inline-ternary fallback in
+				 * walk_balanced_orelse still fired inside `raw { ... }`. */
+				if (_ps->raw_block_depth == 0) {
 					PParseToken *next = try_bracket_orelse(t);
 					if (next) {
 						t = next;
@@ -2047,6 +2086,7 @@ static PParseToken *walk_balanced_orelse(PParseToken *tok) {
 }
 
 static void emit_declarator(PParseToken *tok, PParseToken *end) {
+	PRISM_STATE();
 	PPARSE_CTX();
 	while (tok && tok != end && tok->kind != PPARSE_TK_EOF) {
 		/* Attribute interiors are not declarator dimensions: keep them opaque
@@ -2061,7 +2101,17 @@ static void emit_declarator(PParseToken *tok, PParseToken *end) {
 			tok = emit_c23_attr(tok);
 			continue;
 		}
-		if (pparse_match_ch(tok, '[') && (pparse_ann(tok) & P1_DECL_BRACKET)) {
+		/* raw_block_depth guard: P1_DECL_BRACKET is set by Phase 1 without
+		 * regard to raw-block scope (same root cause as the has_bo guard
+		 * in process_declarators above). Without it, a bracket-orelse
+		 * array dimension inside `raw { ... }` still got lowered to an
+		 * inline ternary instead of passing through untouched -- the
+		 * hoisted-temp form is blocked by that other guard, but this
+		 * simpler in-place form is a separate call site with the same gap.
+		 * Falling through to the generic balanced-group branch below emits
+		 * the bracket's tokens verbatim, exactly like any other raw-
+		 * suppressed orelse form. */
+		if (pparse_match_ch(tok, '[') && (pparse_ann(tok) & P1_DECL_BRACKET) && _ps->raw_block_depth == 0) {
 			tok = walk_balanced_orelse(tok);
 			continue;
 		}
@@ -2497,8 +2547,14 @@ static PParseToken *process_declarators(PParseToken *tok,
 					       ? pparse_decl_init_orelse(decl.end)
 					       : NULL;
 		bool is_const_orelse_fallback = orelse_tok && (recipe & P1_DECL_CONST_ORELSE);
-		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
-		bool has_bo = pparse_feat(PPARSE_F_ORELSE) && (recipe & P1_DECL_BRACKET_OE);
+		// Step 2b: Pre-hoist bracket orelse temps (before type emission).
+		// raw_block_depth guard matches the is_const_orelse_fallback check
+		// further below in this same function: P1_DECL_BRACKET_OE is set by
+		// Phase 1 (p1d_classify_decl_dims) without regard to raw-block scope,
+		// so Pass 2 is where suppression has to happen. Without this, a
+		// bracket-orelse array dimension inside `raw { ... }` was still
+		// hoisted to a temp + ternary instead of passing through untouched.
+		bool has_bo = pparse_feat(PPARSE_F_ORELSE) && (recipe & P1_DECL_BRACKET_OE) && _ps->raw_block_depth == 0;
 		bool brace_opened = false;
 		BOFrame bo_frame;
 		if (has_bo) {
@@ -2962,6 +3018,17 @@ emit_orelse_action(PParseToken *tok, PParseToken *var_name, bool single_eval_lhs
 	}
 	PParseToken *chain_next;
 	tok = emit_orelse_fallback_value(tok, stop_comma, &chain_next);
+	/* If the fallback's last token was a raw preprocessor directive (library
+	 * mode, unpreprocessed input: a #if/#else/#endif entirely inside the
+	 * fallback is permitted per SPEC.md Part II constraint 16), the ';' we
+	 * are about to splice on is a synthetic literal, not an emitted token,
+	 * so it never goes through emit_tok's at-bol newline logic. Appending it
+	 * straight onto the directive's line produces "#endif;", and a
+	 * standards-conforming preprocessor discards trailing tokens on a
+	 * directive line (GCC: "extra tokens at end of #endif directive"),
+	 * silently eating the statement terminator. Force the directive onto
+	 * its own line first. */
+	if (last_emitted && last_emitted->kind == PPARSE_TK_PREP_DIR) out_char('\n');
 	if (chain_next) {
 		if (single_eval_lhs) OUT_LIT("; }");
 		else
@@ -3407,6 +3474,10 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 		const char *f = _ps->extra_compiler_flags[i];
+		/* A NULL entry mid-array (count correct, one slot unset) would
+		 * otherwise reach strcmp/strncmp below and crash; treat it as
+		 * absent rather than trusting every caller-supplied slot. */
+		if (!f) continue;
 		if (msvc) {
 			// MSVC cl: /c compile-only, /Fo<path>|/Fo <path>, /Fe likewise.
 			if (strcmp(f, "/c") == 0 || strcmp(f, "-c") == 0) continue;
@@ -3454,6 +3525,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	for (int i = 0; i < _ps->dep_flags_count; i++) args[(*argc)++] = _ps->dep_flags[i];
 	for (int i = 0; i < _ps->extra_include_count; i++) {
+		if (!_ps->extra_include_paths[i]) continue;
 		args[(*argc)++] = msvc ? "/I" : "-I";
 		args[(*argc)++] = _ps->extra_include_paths[i];
 	}
@@ -3471,6 +3543,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		}
 		int buf_idx = 0;
 		for (int i = 0; i < _ps->extra_define_count; i++) {
+			if (!_ps->extra_defines[i]) continue; /* NULL slot: snprintf("%s", NULL) is UB */
 			int len = snprintf(NULL, 0, "/D%s", _ps->extra_defines[i]) + 1;
 			pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], len);
 			if (!pp_define_bufs[buf_idx]) pparse_error("out of memory");
@@ -3492,6 +3565,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 #undef MSVC_DEFINE
 	} else {
 		for (int i = 0; i < _ps->extra_define_count; i++) {
+			if (!_ps->extra_defines[i]) continue;
 			args[(*argc)++] = "-D";
 			args[(*argc)++] = _ps->extra_defines[i];
 		}
@@ -3505,15 +3579,17 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	if (!msvc) {
 		bool user_has_gnu = false;
 		for (int i = 0; i < _ps->extra_define_count; i++) {
-			if (strncmp(_ps->extra_defines[i], "_GNU_SOURCE", 11) == 0) user_has_gnu = true;
+			if (_ps->extra_defines[i] && strncmp(_ps->extra_defines[i], "_GNU_SOURCE", 11) == 0)
+				user_has_gnu = true;
 		}
 		for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 			const char *f = _ps->extra_compiler_flags[i];
+			if (!f) continue;
 			if (strncmp(f, "-D_GNU_SOURCE", 13) == 0 || strncmp(f, "-U_GNU_SOURCE", 13) == 0)
 				user_has_gnu = true;
 			/* Split `-U _GNU_SOURCE` / `-D _GNU_SOURCE`. */
 			if ((strcmp(f, "-U") == 0 || strcmp(f, "-D") == 0) &&
-			    i + 1 < _ps->extra_compiler_flags_count &&
+			    i + 1 < _ps->extra_compiler_flags_count && _ps->extra_compiler_flags[i + 1] &&
 			    strncmp(_ps->extra_compiler_flags[i + 1], "_GNU_SOURCE", 11) == 0)
 				user_has_gnu = true;
 		}
@@ -3522,10 +3598,11 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		{
 			bool user_has_darwin = false;
 			for (int i = 0; i < _ps->extra_define_count; i++)
-				if (strncmp(_ps->extra_defines[i], "_DARWIN_C_SOURCE", 16) == 0)
+				if (_ps->extra_defines[i] && strncmp(_ps->extra_defines[i], "_DARWIN_C_SOURCE", 16) == 0)
 					user_has_darwin = true;
 			for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 				const char *f = _ps->extra_compiler_flags[i];
+				if (!f) continue;
 				if (strncmp(f, "-D_DARWIN_C_SOURCE", 18) == 0 ||
 				    strncmp(f, "-U_DARWIN_C_SOURCE", 18) == 0)
 					user_has_darwin = true;
@@ -3537,6 +3614,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 #endif
 
 	for (int i = 0; i < _ps->extra_force_include_count; i++) {
+		if (!_ps->extra_force_includes[i]) continue;
 		args[(*argc)++] = msvc ? "/FI" : "-include";
 		args[(*argc)++] = _ps->extra_force_includes[i];
 	}
@@ -5788,14 +5866,21 @@ static void apply_features(PrismFeatures features) {
 	PPARSE_CTX();
 	_pc->features = features_to_bits(features);
 	_ps->extra_compiler = features.compiler;
+	/* A library caller that sets a *_count without its matching pointer (e.g.
+	 * a partially-filled PrismFeatures) must not turn into a NULL[i] crash
+	 * deep inside build_pp_argv. Negative counts can also overflow argv capacity
+	 * arithmetic before the loops see that there is nothing to consume. Clamp
+	 * both forms at the one place every count/pointer pair enters _ps. */
 	_ps->extra_include_paths = features.include_paths;
-	_ps->extra_include_count = features.include_count;
+	_ps->extra_include_count = features.include_paths && features.include_count > 0 ? features.include_count : 0;
 	_ps->extra_defines = features.defines;
-	_ps->extra_define_count = features.define_count;
+	_ps->extra_define_count = features.defines && features.define_count > 0 ? features.define_count : 0;
 	_ps->extra_compiler_flags = features.compiler_flags;
-	_ps->extra_compiler_flags_count = features.compiler_flags_count;
+	_ps->extra_compiler_flags_count =
+	    features.compiler_flags && features.compiler_flags_count > 0 ? features.compiler_flags_count : 0;
 	_ps->extra_force_includes = features.force_includes;
-	_ps->extra_force_include_count = features.force_include_count;
+	_ps->extra_force_include_count =
+	    features.force_includes && features.force_include_count > 0 ? features.force_include_count : 0;
 }
 
 #ifdef PRISM_LIB_MODE
@@ -5859,6 +5944,11 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 
 static void prism_transpile_file_into(PrismResult *result, const char *input_file, PrismFeatures features) {
 	pparse_ctx_init();
+	if (!input_file) {
+		result->status = PRISM_ERR_IO;
+		result->error_msg = strdup("input_file is NULL");
+		return;
+	}
 
 #ifdef PRISM_LIB_MODE
 	PPARSE_CTX();
@@ -6012,6 +6102,7 @@ static const char *const cc_separate_operand_flags[] = {
 };
 
 static bool cc_flag_takes_arg(const char *a) {
+	if (!a) return false;
 	if (a[0] != '-' || !a[1]) return false;
 	if (!a[2]) {
 		switch (a[1]) {

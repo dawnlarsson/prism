@@ -465,6 +465,7 @@ typedef struct {
 	bool is_param : 1;
 	bool has_volatile_member : 1;
 	bool is_atomic : 1;	     // _Atomic(...) spelling baked into this typedef name
+	bool is_constexpr : 1;	     // C23 'constexpr' shadow: usable as an array-dimension ICE
 	bool is_struct_tag : 1;	     // struct/union tag (not a typedef name)
 	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	uint8_t array_rank;	     // # of array dimensions (0 if not array);
@@ -2391,7 +2392,7 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 					int qh = 0, qt = 0;
 					for (int j = 0; j < function_count; j++) {
 						if (wrapper_taint[j] ||
-						    (functions[j].body->tag & PPARSE_TT_NORETURN_FN)) {
+						    (functions[j].body->tag & (PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN))) {
 							queue[qt++] = j;
 							queued[j] = 1;
 						}
@@ -2407,6 +2408,32 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 							if (wrapper_taint[j]) body->tag |= wrapper_taint[j];
 							if (functions[j].body->tag & PPARSE_TT_NORETURN_FN)
 								body->tag |= PPARSE_TT_NORETURN_FN;
+							/* SPECIAL_FN propagates transitively like NORETURN_FN just
+							 * above, but only within the same original source file.
+							 * Unlike vfork, setjmp/longjmp are how PRISM_LIB_MODE itself
+							 * recovers from errors (prism_transpile_source_into calls
+							 * setjmp; pparse_lib_error_jump calls longjmp), so an
+							 * unguarded propagation taints every caller of the library
+							 * entry points transitively -- nearly every test in the
+							 * suite -- whenever prism transpiles a TU that #includes
+							 * prism.c, which is exactly what the self-hosted suite
+							 * build does. Restricting the relay to same-file edges
+							 * still closes the real gap: a multi-statement helper that
+							 * calls setjmp/longjmp directly, in the same file as its
+							 * caller, now taints that caller too instead of only the
+							 * one function whose body literally names the call.
+							 *
+							 * "Same file" is a name compare, not a file_idx compare:
+							 * file_idx mints a fresh PParseFile on every system/line-
+							 * marker flag toggle emitted by cc -E, including ones a
+							 * glibc/macOS macro produces mid-statement (`setjmp(buf)`
+							 * itself expands through a `# N "file.c" 3 4` bracket), so
+							 * two functions written back-to-back in one file can carry
+							 * different file_idx values with an identical name. */
+							if ((functions[j].body->tag & PPARSE_TT_SPECIAL_FN) &&
+							    !strcmp(pparse_tok_file(functions[j].body)->name,
+								    pparse_tok_file(body)->name))
+								body->tag |= PPARSE_TT_SPECIAL_FN;
 							if (body->tag == before) continue;
 							if (!queued[i]) {
 								queue[qt++] = i;
@@ -2896,6 +2923,7 @@ enum {
 	PPARSE_TDF_HAS_VOL_MEMBER = 2048,
 	PPARSE_TDF_UNION = 4096,
 	PPARSE_TDF_ATOMIC = 8192,
+	PPARSE_TDF_CONSTEXPR = 16384, // C23 'constexpr': value is an integer constant expression
 };
 
 // Apply typedef traits to a parsed type.
@@ -3310,6 +3338,7 @@ enum {
 	PPARSE_BIND_VOLATILE_MEMBER = 1u << 3,
 	PPARSE_BIND_ATOMIC = 1u << 4,
 	PPARSE_BIND_AGGREGATE = 1u << 5,
+	PPARSE_BIND_CONSTEXPR = 1u << 6,
 };
 
 static inline void pparse_binding_apply_traits(PParseTypedefEntry *entry, unsigned traits) {
@@ -3320,6 +3349,7 @@ static inline void pparse_binding_apply_traits(PParseTypedefEntry *entry, unsign
 	if (traits & PPARSE_BIND_VOLATILE_MEMBER) entry->has_volatile_member = true;
 	if (traits & PPARSE_BIND_ATOMIC) entry->is_atomic = true;
 	if (traits & PPARSE_BIND_AGGREGATE) entry->is_aggregate = true;
+	if (traits & PPARSE_BIND_CONSTEXPR) entry->is_constexpr = true;
 }
 
 /* Register or update an ordinary identifier without exposing table insertion
@@ -3432,7 +3462,8 @@ static inline PRISM_PURE int pparse_typedef_flags_(PParseToken *tok, bool includ
 	if (e->is_shadow) {
 		int fl = (e->is_volatile ? PPARSE_TDF_VOLATILE : 0) |
 			 (e->has_volatile_member ? PPARSE_TDF_HAS_VOL_MEMBER : 0) |
-			 (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) | (e->is_array ? PPARSE_TDF_ARRAY : 0);
+			 (e->is_atomic ? PPARSE_TDF_ATOMIC : 0) | (e->is_array ? PPARSE_TDF_ARRAY : 0) |
+			 (e->is_constexpr ? PPARSE_TDF_CONSTEXPR : 0);
 		/* Decayed params must not inherit PPARSE_TDF_ARRAY from an outer
 		 * file-scope array of the same name. */
 		if (!(fl & PPARSE_TDF_ARRAY) && !e->is_param) {
@@ -3460,6 +3491,7 @@ static inline PRISM_PURE int pparse_typedef_flags_(PParseToken *tok, bool includ
 #define pparse_is_known_typedef(tok) (pparse_typedef_flags_((tok), false) & PPARSE_TDF_TYPEDEF)
 #define pparse_is_vla_typedef(tok) (pparse_typedef_flags(tok) & PPARSE_TDF_VLA)
 #define pparse_is_known_enum_const(tok) (pparse_typedef_flags_((tok), false) & PPARSE_TDF_ENUM_CONST)
+#define pparse_is_constexpr_ident(tok) (pparse_typedef_flags_((tok), false) & PPARSE_TDF_CONSTEXPR)
 
 static inline bool pparse_token_can_name_function(PParseToken *tok) {
 	return tok &&
@@ -4261,9 +4293,24 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 			       (next->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, next)) {
 				PParseToken *inner = pparse_next(_pc, next), *ic = pparse_pair(_pc, next);
 				if (!inner || inner == close) break;
-				if (pparse_is_value_name_token(inner) && pparse_next(_pc, inner) == ic) {
-					next = inner;
-					break;
+				/* `(name)` -- bare, or `(name[...][...]...)` -- name with a
+				 * trailing subscript chain that fills the rest of this
+				 * paren exactly. Unparenthesized `&a[0]` is already caught
+				 * below by the plain next-token check; without this, only
+				 * wrapping the *whole* address-of (`(&a[0])`) was
+				 * recognized and `&(a[0])` -- parens around just the
+				 * element access -- silently slipped past as a "no derived
+				 * form here" span, a full bypass of the commutative-
+				 * subscript rejection for that one paren placement. */
+				if (pparse_is_value_name_token(inner)) {
+					PParseToken *after = pparse_next(_pc, inner);
+					while (after && after != ic && pparse_match_ch(after, '[') &&
+					       (after->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, after))
+						after = pparse_next(_pc, pparse_pair(_pc, after));
+					if (after == ic) {
+						next = inner;
+						break;
+					}
 				}
 				if (!pparse_match_ch(inner, '(')) break;
 				next = inner;
@@ -4315,6 +4362,13 @@ static bool pparse_bounds_paren_has_array_arithmetic(PParseToken *open) {
 	return pparse_bounds_span_has_array_arithmetic(lhs, scan_end);
 }
 
+/* Forward-declared: definition sits near its other P1D control-flow callers
+ * below, but the unary-`*`/`&` disambiguation here needs it first. A control
+ * statement's condition `)` (if/while/for/switch, not else/do) is followed by
+ * a new statement, not a value -- it must not be mistaken for a value-close
+ * paren the way a cast or a parenthesized subexpression is. */
+static PParseToken *pparse_ctrl_condition_kw_before_paren(PParseToken *open);
+
 static bool pparse_bounds_deref_add_is_unverifiable(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!pparse_feat(PPARSE_F_BOUNDS_CHECK)) return false;
@@ -4328,9 +4382,15 @@ static bool pparse_bounds_deref_add_is_unverifiable(PParseToken *tok) {
 		    !(prev->tag & (PPARSE_TT_RETURN | PPARSE_TT_GOTO | PPARSE_TT_DEFER)))
 			return false;
 		if (pparse_match_ch(prev, ']')) return false;
-		if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE) &&
-		    !pparse_bounds_group_is_cast(pparse_pair(_pc, prev)))
-			return false;
+		if (pparse_match_ch(prev, ')') && (prev->flags & PPARSE_TF_CLOSE)) {
+			PParseToken *popen = pparse_pair(_pc, prev);
+			/* A control statement's condition close (`if (c) *(a+i) = 0;`)
+			 * is not a value: the `)` ends `if (c)`, not an operand of `*`.
+			 * Treating it like one let this exact pattern silently skip the
+			 * pointer-arithmetic-dereference rejection below. */
+			if (!pparse_bounds_group_is_cast(popen) && !pparse_ctrl_condition_kw_before_paren(popen))
+				return false;
+		}
 	}
 
 	PParseToken *op = pparse_next(_pc, tok);
@@ -4515,6 +4575,26 @@ static PParseAnalysisRecord *pparse_analysis_add(PParseToken *tok, PParseAnalysi
 		}                                                                                    \
 		pparse_error_tok((t), msg);                                                          \
 	} while (0)
+
+/* Does this token end a value, so that a following `&` or `*` is the binary
+ * operator rather than the unary one? Three bounds sites asked this question
+ * with three separately maintained copies of the list, and every copy that
+ * fell behind produced either a silent unchecked subscript or a spurious trap
+ * on correct C. One list, one place to add to. A control statement's condition
+ * close is deliberately not a value: in `if (c) &a[len];` the `)` ends the
+ * `if`, so nothing carries into the statement that follows it. */
+static bool pparse_bounds_tok_ends_value(PParseToken *pp) {
+	PPARSE_CTX();
+	if (!pp) return false;
+	if (pparse_is_value_name_token(pp) || pp->kind == PPARSE_TK_NUM || pp->kind == PPARSE_TK_STR)
+		return true;
+	if (pparse_match_ch(pp, ']') || pparse_match_ch(pp, '}')) return true;
+	if (pparse_equal(pp, "++") || pparse_equal(pp, "--")) return true;
+	if (pparse_match_ch(pp, ')') && !pparse_close_paren_ends_cast_type_name(pp) &&
+	    !pparse_ctrl_condition_kw_before_paren(pparse_pair(_pc, pp)))
+		return true;
+	return false;
+}
 
 static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					 PParseToken *last_emitted,
@@ -4719,7 +4799,13 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return false;
 	if (pparse_idx(_pc, name_tok) >= 1) {
 		PParseToken *operand_start = name_tok;
-		PParseToken *operand_end = name_tok;
+		/* Include this subscript in the operand span.  Otherwise `&(a[i])`
+		 * cannot peel the parentheses: the close follows `]`, not the bare
+		 * name token, and the address-of suppression is lost even though it
+		 * is semantically identical to `&a[i]` (including a valid one-past
+		 * address at i == length). */
+		PParseToken *operand_end = pparse_pair(_pc, tok);
+		if (!operand_end) operand_end = name_tok;
 		PParseToken *prev = &pparse_token_pool[pparse_idx(_pc, operand_start) - 1];
 		while (pparse_match_ch(prev, '(') && (prev->flags & PPARSE_TF_OPEN) && pparse_pair(_pc, prev)) {
 			PParseToken *rp = pparse_pair(_pc, prev);
@@ -4736,10 +4822,55 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			bool unary = true;
 			if (pparse_idx(_pc, prev) >= 1) {
 				PParseToken *pp = &pparse_token_pool[pparse_idx(_pc, prev) - 1];
-				if (pparse_is_value_name_token(pp) || pp->kind == PPARSE_TK_NUM ||
-				    pp->kind == PPARSE_TK_STR || pparse_match_ch(pp, ']') ||
-				    (pparse_match_ch(pp, ')') && !pparse_close_paren_ends_cast_type_name(pp)))
-					unary = false;
+				/* A control statement's condition close is not a value
+				 * (`if (c) &a[len];` -- the `)` ends `if (c)`, so `&` still
+				 * addresses `a[len]` unarily); mistaking it for one made
+				 * this one-past-end address spuriously wrap and trap.
+				 * `}` (compound-literal close, e.g. `(int){5} & a[i]`) and
+				 * postfix `++`/`--` (`x++ & a[i]`) are value-producing too:
+				 * without them here, `&` after either was misread as unary
+				 * address-of and `a[i]` silently kept its raw, unchecked
+				 * subscript instead of being wrapped. */
+				if (pparse_bounds_tok_ends_value(pp)) unary = false;
+			}
+			/* `*&a[i]` cancels the address-of: the `&` never yields an
+			 * address to the program, it is dereferenced right back into a
+			 * read of `a[i]`. Suppressing the wrapper here (the one-past-end
+			 * rule for a genuine `&a[len]`) left the access unchecked, so
+			 * `*&a[idx]` read out of bounds with no wrapper and no
+			 * diagnostic while the identical `a[idx]` trapped. Only a *unary*
+			 * `*` cancels: in `x * &a[i]` the `*` multiplies and the
+			 * address-of is real, so the suppression must stand. */
+			if (unary && pparse_idx(_pc, prev) >= 1) {
+				/* Peel `(` opens so `*(&a[i])` and `*((&a[i]))` cancel the
+				 * same way `*&a[i]` does. Over-peeling cannot cause a
+				 * spurious wrap: the binary-vs-unary test on the `*` below
+				 * still has to pass, so `x * (&a[i])` and `f((&a[i]))` are
+				 * both left alone. */
+				PParseToken *deref = &pparse_token_pool[pparse_idx(_pc, prev) - 1];
+				/* A paren only counts if it wraps the address-of operand
+				 * exactly, i.e. it closes immediately after this subscript's
+				 * `]`. `*(&a[0]+i)` also opens a paren before the `&`, but it
+				 * closes after the `+i`: there the address is a real operand
+				 * of pointer arithmetic and the `*` dereferences the sum, so
+				 * treating it as a cancelled `&` would wrap a subscript that
+				 * must stay bare under -fno-safety. */
+				PParseToken *expect = pparse_next(_pc, pparse_pair(_pc, tok));
+				for (int peel = 0; peel < 8 && pparse_match_ch(deref, '(') &&
+						   (deref->flags & PPARSE_TF_OPEN) && pparse_idx(_pc, deref) >= 1;
+				     peel++) {
+					PParseToken *rp = pparse_pair(_pc, deref);
+					if (rp != expect) break;
+					expect = pparse_next(_pc, rp);
+					deref = &pparse_token_pool[pparse_idx(_pc, deref) - 1];
+				}
+				if (pparse_match_ch(deref, '*') && !(deref->flags & PPARSE_TF_OPEN)) {
+					bool deref_unary = true;
+					if (pparse_idx(_pc, deref) >= 1)
+						deref_unary = !pparse_bounds_tok_ends_value(
+						    &pparse_token_pool[pparse_idx(_pc, deref) - 1]);
+					if (deref_unary) unary = false;
+				}
 			}
 			if (unary) return false;
 		}
@@ -4990,8 +5121,16 @@ static bool pparse_array_size_is_vla_impl(PParseToken *open_bracket, int depth) 
 			continue;
 		}
 
+		/* A C23 'constexpr' object is an integer constant expression at every
+		 * use (C23 6.7.1p6), same as an enum constant: naming one in a
+		 * dimension does not make the array variable-length. Without this,
+		 * `constexpr int N = 4; int arr[N];` was flagged as a VLA -- wrong
+		 * zero-init strategy, and (with `raw`, which does not exempt real
+		 * VLAs) a false "goto would skip over this VLA declaration" reject
+		 * on code the user explicitly opted out of the check for. */
 		if ((tok->tag & PPARSE_TT_MEMBER) ||
-		    (pparse_is_valid_varname(tok) && !pparse_is_known_enum_const(tok) && !pparse_is_type_keyword(tok)))
+		    (pparse_is_valid_varname(tok) && !pparse_is_known_enum_const(tok) &&
+		     !pparse_is_type_keyword(tok) && !pparse_is_constexpr_ident(tok)))
 			return true;
 		tok = pparse_next(_pc, tok);
 	}
@@ -8406,6 +8545,7 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 		}
 		if (last_ident &&
 		    (pparse_is_known_typedef(last_ident) || pparse_is_known_enum_const(last_ident) ||
+		     pparse_is_constexpr_ident(last_ident) ||
 		     (last_ident->tag & (PPARSE_TT_DEFER | PPARSE_TT_ORELSE | PPARSE_TT_NORETURN_FN | PPARSE_TT_SPECIAL_FN)) ||
 		     (last_ident->flags & PPARSE_TF_RAW) ||
 		     pparse_function_symbol(last_ident)))
@@ -8592,7 +8732,8 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 				(type->has_volatile && is_vol ? PPARSE_BIND_VOLATILE : 0) |
 				(type->has_volatile_member && is_vol ? PPARSE_BIND_VOLATILE_MEMBER : 0) |
 				(is_atomic ? PPARSE_BIND_ATOMIC : 0) |
-				(is_aggregate ? PPARSE_BIND_AGGREGATE : 0);
+				(is_aggregate ? PPARSE_BIND_AGGREGATE : 0) |
+				(type->has_constexpr && plain ? PPARSE_BIND_CONSTEXPR : 0);
 		pparse_register_shadow_traits(decl->var_name, brace_depth, bind);
 	}
 	if (pparse_feat(PPARSE_F_BOUNDS_CHECK) && decl->var_name) {
@@ -8903,6 +9044,33 @@ static void p1_try_alloc_defer(PParseToken *tok, uint16_t cur_sid, int func_idx)
 	p1_alloc(P1K_DEFER, cur_sid, tok);
 }
 
+/* `do { ... } while (cond);` is the one C statement whose non-body syntax
+ * trails the body's own `}` instead of preceding its `{` (if/for/while/switch
+ * put everything before the brace). The trivial-chain scanner below treats
+ * "nothing but noise between this scope's close and the next" as proof the
+ * scope is the final statement; for a do-while body, that trailing
+ * `while (cond);` is still part of the SAME statement, not a fresh one, so
+ * without this it reads as non-trivial content and the scanner gives up,
+ * silently missing `({ ...; do { defer f(); } while(0); })` (defer's cleanup
+ * block genuinely is the statement expression's last statement -- GCC gives
+ * the whole expression void type either way, so this was a missed diagnostic
+ * rather than silent corruption, but switch/if/for/while all catch the
+ * equivalent shape and do-while should too). Returns the token after the
+ * tail's `;`, or NULL if `t` is not the `while` of a do-while tail closing
+ * `sid`. */
+static PParseToken *pparse_defer_chain_skip_do_tail(PParseToken *t, uint16_t sid) {
+	PPARSE_CTX();
+	if (!t || !((t->tag & PPARSE_TT_LOOP) && t->ch0 == 'w')) return NULL;
+	uint32_t open_idx = pparse_scope_tree[sid].open_tok_idx;
+	if (open_idx == 0) return NULL;
+	PParseToken *pre = pparse_walk_back(open_idx, PPARSE_WB_PAST_NOISE);
+	if (!pre || !(pre->tag & PPARSE_TT_LOOP) || pre->ch0 != 'd') return NULL;
+	PParseToken *op = pparse_skip_noise(_pc, pparse_next(_pc, t));
+	if (!op || !pparse_match_ch(op, '(') || !pparse_pair(_pc, op)) return NULL;
+	PParseToken *semi = pparse_skip_noise(_pc, pparse_next(_pc, pparse_pair(_pc, op)));
+	if (!semi || !pparse_match_ch(semi, ';')) return NULL;
+	return pparse_next(_pc, semi);
+}
 // Phase 1: check if a defer in scope 'sid' is inside a chain of closing braces
 static void pparse_p1_check_defer_stmt_expr_chain(PParseToken *defer_tok, uint16_t sid) {
 	PPARSE_CTX();
@@ -8921,6 +9089,13 @@ static void pparse_p1_check_defer_stmt_expr_chain(PParseToken *defer_tok, uint16
 			if (pparse_match_ch(t, ';') || pparse_match_ch(t, '}')) {
 				t = pparse_next(_pc, t);
 				continue;
+			}
+			{
+				PParseToken *after_do = pparse_defer_chain_skip_do_tail(t, sid);
+				if (after_do) {
+					t = after_do;
+					continue;
+				}
 			}
 			/* Label: ident [[attr]]...: or ident __attribute__((...)): */
 			if (t->kind == PPARSE_TK_IDENT || t->kind == PPARSE_TK_KEYWORD) {
@@ -9982,6 +10157,7 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 	p1d_reject_orelse_chain_after_ctrl(bare_oe);
 	{
 		PParseToken *prev = bare_oe;
+		PParseToken *prev_oe = bare_oe; /* most recently confirmed chain orelse */
 		int ternary = 0;
 		PPARSE_FOR_TAIL(s, pparse_next(_pc, bare_oe)) {
 			if (s->flags & PPARSE_TF_OPEN) {
@@ -10001,6 +10177,23 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 				continue;
 			}
 			if (ternary == 0 && orelse_kw_at_bare(s, prev)) {
+				/* `s` existing proves the link [prev_oe+1, s) is a mid-chain
+				 * fallback, not the tail: emit_bare_orelse_impl gives every
+				 * non-tail link its own `typeof(...) __prism_oe_N` temp when
+				 * the LHS has indirection (typeof(RHS) substitutes for
+				 * typeof(LHS) there so a VM-typed RHS can't turn typeof(LHS)
+				 * itself into a runtime-evaluated operand), which physically
+				 * duplicates that link's tokens exactly like the first
+				 * link's RHS. Only the first link's range was checked here
+				 * before, so a side effect placed in a middle link of a
+				 * 3+-way chain (e.g. `*p = 0 orelse vla_ptrs[f()] orelse 0;`
+				 * with vla_ptrs an array of pointer-to-VLA) evaluated f()
+				 * twice at runtime with no rejection. */
+				if (lhs_indirect) {
+					PParseToken *mid_start = pparse_next(_pc, prev_oe);
+					if (!pparse_is_strict_bare_function_call(mid_start, s))
+						reject_orelse_side_effects(mid_start, s, PPARSE_OE_SE_BARE_ORELSE_WITH_INDIRECTI_TYPEOF);
+				}
 				pparse_ann(s) |= P1_IS_ORELSE_KW;
 				/* Chain tail with empty fallback: `… orelse;` / `… orelse,`
 				 * would lower to an empty expression. */
@@ -10008,6 +10201,7 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(PParseToken *tok,
 				if (orelse_next_is_empty_action(nx))
 					pparse_error_tok(nx, PPARSE_ERR_ORELSE_EXPECT_STMT);
 				p1d_reject_orelse_chain_after_ctrl(s);
+				prev_oe = s;
 			}
 			prev = s;
 		}
