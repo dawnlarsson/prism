@@ -1805,7 +1805,7 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "= {0}"},
 	{"exact/typeof-unqual-drops-const-binding",
 	 "void f(void){const int source=1;typeof_unqual(source) copy;(void)copy;}", NULL,
-	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "memset", "= {0}"},
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "sizeof(copy)", "= {0}"},
 	{"exact/typeof-sizeof-const-is-not-const",
 	 "void f(void){const int source=1;typeof(sizeof(source)) n;(void)n;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "memset", "= {0}"},
