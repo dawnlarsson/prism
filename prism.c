@@ -580,12 +580,14 @@ static inline void emit_typeof_keyword(void) {
 	out_platform_text(text);
 }
 
-static void out_close(void) {
+static bool out_close(void) {
 	if (out_fp) {
 		out_flush();
-		fclose(out_fp);
+		int status = fclose(out_fp);
 		out_fp = NULL;
+		return status == 0;
 	}
+	return true;
 }
 
 static void out_uint(unsigned long long v) {
@@ -5331,7 +5333,7 @@ static void emit_deferred_range(PParseToken *start, PParseToken *end) {
 
 // --- Pass 2: Main Transpilation Loop ---
 
-static PRISM_HOT void transpile_tokens(PParseToken *tok, FILE *fp) {
+static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 	PRISM_STATE();
 	PPARSE_CTX();
 	out_fp = fp;
@@ -5589,9 +5591,10 @@ static PRISM_HOT void transpile_tokens(PParseToken *tok, FILE *fp) {
 #undef pparse_feat
 #define pparse_feat(f) (_pc->features & (f))
 
-	out_close();
+	bool output_ok = out_close();
 	free_source_defines();
 	pparse_tokenizer_teardown(false);
+	return output_ok;
 }
 
 static PParseToken *preprocess_and_tokenize(char *input_file, double *pp_ms, double *tok_ms) {
@@ -5625,7 +5628,7 @@ static int transpile_to_fp(char *input_file, FILE *fp) {
 	}
 
 	double t1 = prism_now_ms();
-	transpile_tokens(tok, fp);
+	int ok = transpile_tokens(tok, fp);
 	double t2 = prism_now_ms();
 	if (prism_profile) {
 		fprintf(stderr,
@@ -5637,7 +5640,7 @@ static int transpile_to_fp(char *input_file, FILE *fp) {
 			(t2 - t1),
 			(t2 - t0));
 	}
-	return 1;
+	return ok;
 }
 
 static int verify_transpiled_output(char *orig_input, char *out1_path);
@@ -5702,6 +5705,18 @@ PRISM_API void prism_reset(void) {
 		fclose(out_fp);
 		out_fp = NULL;
 	}
+}
+
+/* A public call must not inherit ownership left by an interrupted predecessor.
+ * Normal and longjmp exits clean themselves, but this entry fence also covers
+ * soft allocation failures that return before reaching the common teardown. */
+static void prism_library_call_begin(void) {
+	PRISM_STATE();
+	pparse_ctx_init();
+	prism_reset();
+	free(_ps->active_membuf);
+	_ps->active_membuf = NULL;
+	_ps->active_memlen = 0;
 }
 
 typedef struct { long orelse, defer; } VerifyKwCounts;
@@ -5772,12 +5787,17 @@ static int verify_transpiled_output(char *orig_input, char *out1_path) {
 }
 
 PRISM_API void prism_thread_cleanup(void) {
-	if (!pparse_ctx) return;
+	PRISM_STATE();
 	if (out_fp) {
 		out_flush();
 		fclose(out_fp);
 		out_fp = NULL;
 	}
+	free(_ps->active_membuf);
+	_ps->active_membuf = NULL;
+	_ps->active_memlen = 0;
+	free_source_defines();
+	if (!pparse_ctx) return;
 	out_buf_pos = 0;
 	system_include_list = NULL;
 	system_include_capacity = 0;
@@ -5879,7 +5899,15 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 		prism_reset();
 		return result;
 	}
-	transpile_tokens(tok, fp);
+	if (!transpile_tokens(tok, fp)) {
+		free(_ps->active_membuf);
+		_ps->active_membuf = NULL;
+		_ps->active_memlen = 0;
+		result.status = PRISM_ERR_IO;
+		result.error_msg = strdup("output finalization failed");
+		prism_reset();
+		return result;
+	}
 	result.output = _ps->active_membuf;
 	result.output_len = _ps->active_memlen;
 	result.status = PRISM_OK;
@@ -5889,7 +5917,7 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 }
 
 static void prism_transpile_file_into(PrismResult *result, const char *input_file, PrismFeatures features) {
-	pparse_ctx_init();
+	prism_library_call_begin();
 	if (!input_file) {
 		result->status = PRISM_ERR_IO;
 		result->error_msg = strdup("input_file is NULL");
@@ -5945,7 +5973,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 #ifdef PRISM_LIB_MODE
 static void prism_transpile_source_into(PrismResult *result, const char *source, const char *filename,
 				       PrismFeatures features) {
-	pparse_ctx_init();
+	prism_library_call_begin();
 	PPARSE_CTX();
 	if (!source) {
 		result->status = PRISM_ERR_IO;
@@ -6653,7 +6681,7 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	}
 
 	double t1 = prism_now_ms();
-	transpile_tokens(tok, fp);
+	int output_ok = transpile_tokens(tok, fp);
 	double t2 = prism_now_ms();
 	int rc = wait_for_child(pid);
 	double t3 = prism_now_ms();
@@ -6669,7 +6697,7 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 			(t3 - t2),
 			(t3 - t0));
 	}
-	return rc;
+	return output_ok ? rc : -1;
 }
 
 static noreturn void die(char *message) {

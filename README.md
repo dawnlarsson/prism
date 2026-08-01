@@ -689,27 +689,6 @@ void          prism_reset(void);           // reclaim arenas (automatic on error
 void          prism_thread_cleanup(void);  // free thread-locals before thread exit
 ```
 
-## Architecture
-
-Prism processes C in two passes. Pass 1 performs full semantic analysis, annotates the token stream, and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts, no type table mutations, no speculative token walking. Pass 2's defensive assertions (unreachable when Pass 1 is correct) are compiled only in `PRISM_DEBUG` builds; the debug suite run verifies Pass 1 covers every case.
-
-| Phase | What it does |
-|---|---|
-| **Pass 0:** Tokenizer | Tokenize, delimiter-match, keyword-tag, build setjmp/vfork/asm taint graph per function |
-| **Pass 1A:** Scope Tree | Walk all tokens, assign scope IDs, build parent chain, classify each `{` (loop/switch/conditional/function/struct) |
-| **Pass 1B:** Type Registration | Full-depth `typedef`, `enum`, VLA tag registration at all scopes, symbol table frozen after this point |
-| **Pass 1C:** Shadow Table | Record every variable that shadows a typedef, with scope ID and token index for temporally-correct lookup |
-| **Pass 1D:** CFG Collection | Per-function arrays of labels, gotos, defers, declarations, switch/case entries |
-| **Pass 1E:** Return Type Capture | Record each function's return type range and void/setjmp/vfork/asm flags |
-| **Pass 1F:** Defer Validation | Reject forbidden patterns inside defer bodies (return, goto, break, continue, nested stmt-expr) |
-| **Pass 1G:** Orelse Pre-Classification | Classify orelse in brackets and declaration initializers; reject in enum bodies and at file scope |
-| **Phase 2A:** CFG Verification | O(N) snapshot-and-sweep: verify every goto→label and switch→case pair against defers and declarations |
-| **Pass 2:** Code Generation | Emit transformed C. Reads immutable scope tree, typedef table, shadow table. No type mutations, no safety checks |
-
-**Key invariant:** Every semantic error is raised before Pass 2 emits its first byte. If code generation starts, it runs to completion.
-
-see `.github/SPEC.md` for full breakdown.
-
 ## Get in touch
 
 available for consulting work, (design, branding, engineering / software)

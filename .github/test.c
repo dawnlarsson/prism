@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Test-only allocation fault injection. Including the libc declarations
  * before these macros keeps system prototypes intact; only direct allocation
@@ -24,11 +25,13 @@ static TEST_THREAD_LOCAL long fault_alloc_calls;
 static TEST_THREAD_LOCAL int fault_alloc_fired;
 static TEST_THREAD_LOCAL const char *fault_alloc_file;
 static TEST_THREAD_LOCAL int fault_alloc_line;
+static TEST_THREAD_LOCAL int fault_realloc_must_move;
 #define FAULT_LIVE_CAP 4096
 static TEST_THREAD_LOCAL void *fault_live[FAULT_LIVE_CAP];
 static TEST_THREAD_LOCAL const char *fault_live_file[FAULT_LIVE_CAP];
 static TEST_THREAD_LOCAL int fault_live_line[FAULT_LIVE_CAP];
 static TEST_THREAD_LOCAL uint64_t fault_live_id[FAULT_LIVE_CAP];
+static TEST_THREAD_LOCAL size_t fault_live_size[FAULT_LIVE_CAP];
 static TEST_THREAD_LOCAL size_t fault_live_count;
 static TEST_THREAD_LOCAL int fault_live_overflow;
 static TEST_THREAD_LOCAL uint64_t fault_live_next_id;
@@ -39,7 +42,7 @@ static size_t fault_live_find(void *ptr) {
 	return SIZE_MAX;
 }
 
-static void fault_live_add(void *ptr, const char *file, int line) {
+static void fault_live_add(void *ptr, size_t size, const char *file, int line) {
 	if (!ptr) return;
 	if (fault_live_count == FAULT_LIVE_CAP) {
 		fault_live_overflow = 1;
@@ -49,6 +52,7 @@ static void fault_live_add(void *ptr, const char *file, int line) {
 	fault_live_file[fault_live_count] = file;
 	fault_live_line[fault_live_count] = line;
 	fault_live_id[fault_live_count] = ++fault_live_next_id;
+	fault_live_size[fault_live_count] = size;
 	fault_live_count++;
 }
 
@@ -59,6 +63,7 @@ static void fault_live_remove_at(size_t i) {
 	fault_live_file[i] = fault_live_file[fault_live_count];
 	fault_live_line[i] = fault_live_line[fault_live_count];
 	fault_live_id[i] = fault_live_id[fault_live_count];
+	fault_live_size[i] = fault_live_size[fault_live_count];
 }
 
 static int fault_alloc_should_fail(const char *file, int line) {
@@ -74,30 +79,44 @@ static int fault_alloc_should_fail(const char *file, int line) {
 static void *fault_malloc(size_t size, const char *file, int line) {
 	if (fault_alloc_should_fail(file, line)) return NULL;
 	void *ptr = malloc(size);
-	fault_live_add(ptr, file, line);
+	fault_live_add(ptr, size, file, line);
 	return ptr;
 }
 
 static void *fault_calloc(size_t count, size_t size, const char *file, int line) {
 	if (fault_alloc_should_fail(file, line)) return NULL;
 	void *ptr = calloc(count, size);
-	fault_live_add(ptr, file, line);
+	fault_live_add(ptr, count * size, file, line);
 	return ptr;
 }
 
 static void *fault_realloc(void *ptr, size_t size, const char *file, int line) {
 	if (fault_alloc_should_fail(file, line)) return NULL;
 	size_t tracked = fault_live_find(ptr);
-	void *resized = realloc(ptr, size);
+	void *resized;
+	/* Exercise the legal worst case for ownership: every tracked realloc moves.
+	 * Allocating before freeing also guarantees a distinct address, catching
+	 * code that only works when a platform happens to grow a block in place. */
+	if (fault_realloc_must_move && ptr && size && tracked != SIZE_MAX) {
+		resized = malloc(size);
+		if (resized) {
+			size_t copy = fault_live_size[tracked] < size ? fault_live_size[tracked] : size;
+			memcpy(resized, ptr, copy);
+			free(ptr);
+		}
+	} else {
+		resized = realloc(ptr, size);
+	}
 	if (!resized) {
 		if (size == 0) fault_live_remove_at(tracked);
 		return NULL;
 	}
-	if (tracked == SIZE_MAX) fault_live_add(resized, file, line);
+	if (tracked == SIZE_MAX) fault_live_add(resized, size, file, line);
 	else {
 		fault_live[tracked] = resized;
 		fault_live_file[tracked] = file;
 		fault_live_line[tracked] = line;
+		fault_live_size[tracked] = size;
 	}
 	return resized;
 }
@@ -124,6 +143,12 @@ static void fault_free(void *ptr) {
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+/* Test code allocates outside the Prism wrappers, but it also receives blocks
+ * allocated inside Prism from direct helper calls. Route every deallocation
+ * through the tracker: untracked test allocations pass through unchanged,
+ * while Prism-owned blocks cannot leave stale address/size records behind. */
+#define free(ptr) fault_free(ptr)
 
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -473,6 +498,7 @@ static int run_alloc_failure_sweep(const char *src, int file_api, int expect_ok,
 		return 0;
 	}
 #endif
+	fault_realloc_must_move = 1;
 	fault_alloc_disable();
 	prism_thread_cleanup();
 	pparse_ctx_init();
@@ -567,6 +593,7 @@ done:
 		}
 	}
 	if (path[0]) remove(path);
+	fault_realloc_must_move = 0;
 	return ok;
 }
 
@@ -820,6 +847,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			ConsumedDef *defs = NULL;
 			bool undef_gnu = false;
 			int n = 0, cap = 0;
+			fault_realloc_must_move = 1;
 			emit_consumed_def_upsert(&defs, &n, &cap, "", true, &undef_gnu);
 			for (int i = 0; i < 20; i++) {
 				char spec[32];
@@ -830,6 +858,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			emit_consumed_def_upsert(&defs, &n, &cap, "_GNU_SOURCE", false, &undef_gnu);
 			ok = ok && n == 21 && !defs[3].on && undef_gnu;
 			free_consumed_defs(defs, n);
+			fault_realloc_must_move = 0;
 		} else if (*p == 'A') {
 			/* The stdin preprocessor path must always carry an explicit language.
 			 * A user-provided `-x none` means extension guessing, which is impossible
@@ -1977,6 +2006,12 @@ static const char alloc_fault_long_define_source[] =
 #undef AF_TEXT_128
 #undef AF_TEXT_64
 
+static const char alloc_fault_taint_graph_source[] =
+	"void exit(int);"
+	"void leaf(void){exit(1);}"
+	"void middle(void){leaf();}"
+	"void top(void){middle();}";
+
 static const AxisValue alloc_fault_values[] = {
 	{"basic", "int f(void){int x;return x;}", 0, 0},
 	{"types",
@@ -1989,6 +2024,8 @@ static const AxisValue alloc_fault_values[] = {
 	 "if(n)return a[n&3]+x;return x;}",
 	 0, 0},
 	{"source-defines", "#define V 7\n#if V\nint f(void){int x;return x+V;}\n#endif\n", 0, FB_FLAT},
+	{"line-markers", "# 42 \"virtual-input.c\"\nint f(void){int x;return x;}\n", 0, 0},
+	{"taint-graph", alloc_fault_taint_graph_source, 0, 0},
 	{"token-growth", alloc_fault_large_source, 0, 0},
 };
 static const Axis ax_alloc_fault = {"source", alloc_fault_values, N(alloc_fault_values)};
@@ -2018,6 +2055,7 @@ static const AxisValue alloc_fault_file_values[] = {
 	{"continued-growth", alloc_fault_long_define_source, 0, FB_FLAT},
 	{"comment-splice", "#define V 1 /* open\n*/ + 2\nint f(void){return V;}\n", 0, FB_FLAT},
 	{"conditional-growth", alloc_fault_cond_growth_source, 0, FB_FLAT},
+	{"taint-graph", alloc_fault_taint_graph_source, 0, 0},
 	{.tag="api-include", .text="int f(void){return 0;}", .api_field=AF_INCLUDE,
 	 .api_values=api_include_ok, .api_count=N(api_include_ok)},
 	{.tag="api-defines", .text="#ifdef RECIPE_DEF\nint v=RECIPE_DEF;\n#endif\n",

@@ -1737,8 +1737,7 @@ static char *pparse_scan_line_directive(char *p, int *line_no, bool *in_system_i
 			p++;
 		}
 		int raw_len = p - start;
-		filename = malloc(raw_len + 1);
-		if (!filename) pparse_error("out of memory");
+		filename = pparse_arena_alloc_uninit(&_pc->main_arena, (size_t)raw_len + 1);
 		int len = 0;
 		for (char *s = start; s < start + raw_len; s++) {
 			if (*s == '\\' && s + 1 < start + raw_len && (s[1] == '\\' || s[1] == '"')) {
@@ -1787,7 +1786,6 @@ static char *pparse_scan_line_directive(char *p, int *line_no, bool *in_system_i
 	else if (is_returning && !is_system)
 		*in_system_include = false;
 	if (new_line > (unsigned long)INT_MAX) {
-		free(filename);
 		return NULL;
 	}
 	long long ld = (long long)(int)new_line - ((long long)directive_line + 1);
@@ -1819,13 +1817,12 @@ static char *pparse_scan_line_directive(char *p, int *line_no, bool *in_system_i
 			*in_system_include = false;
 		}
 	}
-	view = pparse_add_input_file((PParseFile){.name = pparse_intern_filename(filename ? filename : _pc->current_file->name),
+	view = pparse_add_input_file((PParseFile){.name = filename ? filename : _pc->current_file->name,
 				 .line_delta = line_delta,
 				 .is_system = is_system,
 				 .is_direct_system_include = direct_system,
 				 .skip_emit = is_system && *in_system_include});
 	_pc->current_file = view;
-	free(filename);
 	while (*p && *p != '\n') p++;
 	if (*p == '\n') {
 		p++;
@@ -2383,7 +2380,8 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 						void *v = pparse_lex_token_map_get(&func_map, b);
 						if (!v) continue;
 						int j = (int)(intptr_t)v - 1;
-						pparse_VEC_ENSURE_REALLOC(edges, edge_count + 1, edge_cap, 64);
+						PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena, edges, edge_count + 1,
+									 edge_cap, 64, PParseTaintEdge);
 						edges[edge_count++] = (PParseTaintEdge){i, j};
 					}
 				}
@@ -2459,7 +2457,6 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 						}
 					}
 				}
-				free(edges);
 			} // has_taint
 		}
 	}
@@ -10545,6 +10542,18 @@ static void p1d_check_multi_decl_constraints(PParseToken *t,
 	if (vm_type) pparse_error_tok(next_t, PPARSE_ERR_MULTIDECL_VM);
 }
 
+static void p1d_reject_bracket_orelse_dims(PParseToken *start,
+					   PParseToken *end,
+					   const char *message) {
+	PPARSE_CTX();
+	PPARSE_FOR_RANGE(b, start, end) {
+		if (!pparse_match_ch(b, '[') || !(pparse_ann(b) & P1_OE_BRACKET)) continue;
+		PParseToken *close = pparse_pair_known(b);
+		PPARSE_FOR_RANGE(s, pparse_next(_pc, b), close)
+			if (pparse_ann(s) & P1_IS_ORELSE_KW) pparse_error_tok(s, message);
+	}
+}
+
 static void p1d_probe_declaration(PParseToken *tok,
 				  PParseToken *decl_start,
 				  uint16_t cur_sid,
@@ -10615,7 +10624,8 @@ static void p1d_probe_declaration(PParseToken *tok,
 	PParseToken *t = type.end;
 	bool vm_type = (type.has_typeof || type.has_atomic) && (type.is_vla || type.type_vm);
 	bool any_would_memset = false;
-	p1d_classify_decl_dims(type_tok, type.end, cur_sid, cur_func, true, false);
+	bool type_has_bracket_orelse =
+	    p1d_classify_decl_dims(type_tok, type.end, cur_sid, cur_func, true, false);
 	while (!pparse_match_ch(t, ';') && !pparse_match_ch(t, '{') && t->kind != PPARSE_TK_EOF) {
 		bool decl_raw = *saw_raw;
 		t = pparse_p1_skip_decl_raw(t, &decl_raw);
@@ -10711,30 +10721,21 @@ static void p1d_probe_declaration(PParseToken *tok,
 		 * C23 constexpr). Bracket orelse lowering inserts a runtime
 		 * temporary, turning even `static int a[0 orelse 1]` / 
 		 * `constexpr int a[0 orelse 1]` into an illegal non-ICE dim. */
-		bool proto_dims = decl.is_func_ptr | decl.is_func_decl;
+		bool proto_dims = decl.has_bracket_orelse & (decl.is_func_ptr | decl.is_func_decl);
 		bool ice_dims = saw_static | type.has_static | type.has_extern |
 				type.has_thread_local | type.has_constexpr;
-		if (decl.has_bracket_orelse && (proto_dims | ice_dims)) {
-			const char *dim_error = proto_dims
-						? PPARSE_ERR_ORELSE_PROTO_DIM
-						: "orelse inside array dimension of a "
-						  "static/extern/_Thread_local/constexpr "
-						  "declaration is not allowed (dimension "
-						  "must be an integer constant expression; "
-						  "orelse lowering introduces a runtime "
-						  "temporary)";
-			PPARSE_FOR_RANGE(b, type_tok, decl.end) {
-				if (pparse_match_ch(b, '[') && (pparse_ann(b) & P1_OE_BRACKET)) {
-					PParseToken *bc = pparse_pair_known(b);
-					PPARSE_FOR_RANGE(s, pparse_next(_pc, b), bc) {
-						if (pparse_ann(s) & P1_IS_ORELSE_KW) {
-							pparse_error_tok(s, dim_error);
-							break;
-						}
-					}
-				}
-			}
-		}
+		if (proto_dims)
+			p1d_reject_bracket_orelse_dims(t, decl.end, PPARSE_ERR_ORELSE_PROTO_DIM);
+		if (ice_dims & (type_has_bracket_orelse | decl.has_bracket_orelse))
+			p1d_reject_bracket_orelse_dims(
+			    type_tok,
+			    decl.end,
+			    "orelse inside array dimension of a "
+			    "static/extern/_Thread_local/constexpr "
+			    "declaration is not allowed (dimension "
+			    "must be an integer constant expression; "
+			    "orelse lowering introduces a runtime "
+			    "temporary)");
 
 		{
 			bool has_init = pparse_match_ch(decl.end, '=');
