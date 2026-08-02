@@ -8371,7 +8371,9 @@ reject_defer_context(PParseToken *tok, bool ctrl_paren, bool ctrl_pending, bool 
 static void reject_defer_unterminated(PParseToken *tok, PParseToken *body, PParseToken *semi) {
 	PPARSE_CTX();
 	if (semi->kind == PPARSE_TK_EOF || !pparse_match_ch(semi, ';')) pparse_error_tok(tok, PPARSE_ERR_DEFER_UNTERMINATED);
-	/* A control keyword before the body's `;` proves the `;` was missing. */
+	/* A control keyword before the body's `;` proves the `;` was missing.
+	 * Leading control statements are handled separately by
+	 * p1d_validate_defer(), which first finds their full statement extent. */
 	for (PParseToken *s = body; s && s != semi && s->kind != PPARSE_TK_EOF; s = pparse_next(_pc, s)) {
 		PPARSE_SKIP_GROUP_LENIENT(s)
 		if (s->kind == PPARSE_TK_KEYWORD && (s->tag & (PPARSE_TT_NON_EXPR_STMT | PPARSE_TT_DEFER)))
@@ -9366,16 +9368,37 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 		if (body_end) {
 			pparse_ann(tok) |= P1_DEFER_BODY_RECIPE;
 			tok->pair_idx = pparse_idx(_pc, body_end);
+			/* Braced bodies do not take the braceless control-statement path
+			 * below, but they still need the recursive validator to reject a
+			 * break/continue/return that would become illegal once emitted at
+			 * the defer site. */
+			pparse_validate_defer_statement(body, false, false, 0);
 		}
 		if (body && !pparse_match_ch(body, '{')) {
-			PParseToken *semi = pparse_skip_to_semicolon(body, NULL);
-			reject_defer_unterminated(tok, body, semi);
+			/* `if` / loop / switch bodies are full C statements, not merely
+			 * tokens through their first semicolon.  Capturing only the then
+			 * arm strands an `else` at the declaration site and produces invalid
+			 * C.  The recursive defer validator already knows each control
+			 * statement's extent, including a trailing else or do-while tail. */
+			bool is_control_body = body->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH);
+			PParseToken *after_body = pparse_validate_defer_statement(body, false, false, 0);
+			if (is_control_body) {
+				/* Store the exclusive end.  A control statement may finish at a
+				 * closing brace (or carry a do-while tail), so an inclusive
+				 * terminal-token recipe cannot safely describe every form. */
+				body_end = after_body;
+				if (!body_end)
+					pparse_error_tok(tok, PPARSE_ERR_DEFER_UNTERMINATED);
+			} else {
+				body_end = pparse_skip_to_semicolon(body, NULL);
+				reject_defer_unterminated(tok, body, body_end);
+			}
 			pparse_ann(tok) |= P1_DEFER_BODY_RECIPE;
-			tok->pair_idx = pparse_idx(_pc, semi);
+			tok->pair_idx = pparse_idx(_pc, body_end);
 			/* Braceless defer bodies are erased as a unit; any `orelse` in
 			 * them leaks as a soft keyword into the backend. Require braces. */
 			if (pparse_feat(PPARSE_F_ORELSE)) {
-				PPARSE_FOR_RANGE(s, body, semi) {
+				PPARSE_FOR_RANGE(s, body, body_end) {
 					PPARSE_SKIP_GROUP_ON_CLOSE(s)
 					if (pparse_is_orelse_kw_shadow(s))
 						pparse_error_tok(s,
@@ -9401,7 +9424,7 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 							  "`defer { ... }`");
 			}
 			/* A braceless defer body cannot escape its enclosing group. */
-			PPARSE_FOR_RANGE(s, body, semi) {
+			PPARSE_FOR_RANGE(s, body, body_end) {
 				PPARSE_SKIP_GROUP_ON_CLOSE(s)
 				if (s->flags & PPARSE_TF_CLOSE)
 					pparse_error_tok(tok,
@@ -9420,11 +9443,9 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 			}
 		}
 	}
-	pparse_validate_defer_statement(pparse_next(_pc, tok), false, false, 0);
 	if (defer_entry) {
-		PParseToken *body = pparse_next(_pc, tok);
-		PParseToken *body_end = body && pparse_match_ch(body, '{') ? pparse_pair_known(body) : NULL;
-		if (body && !body_end) body_end = pparse_skip_to_semicolon(body, NULL);
+		PParseToken *body = pparse_skip_noise(_pc, pparse_next(_pc, tok));
+		PParseToken *body_end = pparse_defer_body_end(tok);
 		if (body_end)
 			defer_body_populate_captures(body,
 						     body_end,

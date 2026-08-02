@@ -198,6 +198,11 @@ enum {
 	O_TRAP = 1u << 19,
 	O_REFERENCE_RUN = 1u << 20,
 	O_ALLOC_FAIL = 1u << 21,
+	/* A generated 2^5 power set.  Unlike the broad trichotomy grammar
+	 * product, every cell here has a concrete parse, emission, fixed-point,
+	 * and (where a host compiler is available) execution contract for the
+	 * five user-facing transformations. */
+	O_FEATURE_MATRIX = 1u << 22,
 };
 
 typedef struct {
@@ -2286,6 +2291,42 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 		 * diagnostic, not merely the same numeric status. */
 		if (expected_status_plus_one && x.status != PRISM_OK)
 			ok = ok && x.error_msg && x.error_msg[0];
+	} else if (oracle & O_FEATURE_MATRIX) {
+		/* The matrix source is purposefully valid C for every feature
+		 * configuration.  Check the transformation contracts by name, so a
+		 * successful parse without the requested rewrite cannot count as
+		 * coverage.  The defer/orelse snippets occur only in their enabled
+		 * cells; both must be completely eliminated from emitted C. */
+		unsigned bits = feature_bits(f);
+		ok = x.status == PRISM_OK && x.output;
+		if (ok && (bits & FB_DEFER)) ok = count_kw(x.output, "defer") == 0;
+		if (ok && (bits & FB_ORELSE)) ok = count_kw(x.output, "orelse") == 0;
+		if (ok)
+			ok = terms_present(x.output, "__prism_matrix_zero = 0", (bits & FB_ZERO) != 0);
+		if (ok)
+			ok = terms_present(x.output, "__prism_bchk", (bits & FB_BOUNDS) != 0);
+		if (ok)
+			ok = terms_present(x.output, "static \nconst int __prism_matrix_static",
+					   (bits & FB_AS) != 0);
+		/* Every configuration must also reparse its generated C with every
+		 * transformation disabled.  The feature-specific runtime products
+		 * cover execution; keeping this 32-cell parser product in-process
+		 * makes it cheap enough to run on every edit. */
+		if (ok) {
+			PrismFeatures fp = f;
+			fp.defer = fp.orelse = fp.zeroinit = fp.bounds_check = false;
+			fp.auto_static = fp.auto_unreachable = false;
+			fp.warn_safety = true;
+			PrismResult y = prism_transpile_source(x.output, "matrix-fixed.c", fp);
+			ok = y.status == PRISM_OK && y.output && normalized_equal(x.output, y.output);
+			prism_free(&y);
+		}
+#ifndef _WIN32
+		/* The matrix's main function checks the deferred marker, fallback,
+		 * bounds access, and promoted table result.  Run it after checking the
+		 * emitted spelling so every POSIX configuration has a semantic oracle. */
+		if (ok) ok = compile_output(x.output, 1) == 0;
+#endif
 	} else if (oracle & O_TRICHOTOMY) {
 		if (x.status != PRISM_OK) {
 			ok = x.error_msg && x.error_msg[0];
@@ -2565,6 +2606,76 @@ static const AxisValue feature_values[] = {
 };
 static const Axis ax_features = {"features", feature_values, N(feature_values)};
 
+/* The ordinary feature axis deliberately focuses on useful public profiles.
+ * This one is different: it enumerates the complete 2^5 state space for the
+ * five language transformations.  Its source remains ISO-C when `defer` or
+ * `orelse` are disabled, and opts into those constructs only in cells where
+ * the corresponding transformation is enabled.  That lets every state have
+ * a strict success/emission/fixed-point oracle—and, on POSIX, a runtime
+ * oracle—rather than accepting an expected syntax error as coverage. */
+#define FM_DEFER_0 ""
+#define FM_DEFER_1 "defer __prism_matrix_mark();"
+#define FM_ORELSE_0 "int __prism_matrix_value=9;"
+#define FM_ORELSE_1 "int __prism_matrix_value=__prism_matrix_source() orelse 9;"
+#define FM_LOG_0 "0"
+#define FM_LOG_1 "1"
+#define FM_HEAD \
+	"static int __prism_matrix_log;" \
+	"static int __prism_matrix_source(void){return 0;}" \
+	"static void __prism_matrix_mark(void){__prism_matrix_log++;}" \
+	"static int __prism_matrix_worker(void){" \
+	"int __prism_matrix_zero;" \
+	"int __prism_matrix_bounds[2]={4,5};" \
+	"const int __prism_matrix_static[2]={7,8};" \
+	"volatile int __prism_matrix_index=1;"
+#define FM_TAIL \
+	"return __prism_matrix_bounds[__prism_matrix_index]+" \
+	"__prism_matrix_static[0]+__prism_matrix_value;}" \
+	"int main(void){return __prism_matrix_worker()==21&&__prism_matrix_log=="
+#define FM_SOURCE(d, o) FM_HEAD FM_DEFER_ ## d FM_ORELSE_ ## o FM_TAIL FM_LOG_ ## d "?0:1;}"
+#define FM_SET(d, o, z, b, s) \
+	((d) ? FB_DEFER : 0) | ((o) ? FB_ORELSE : 0) | ((z) ? FB_ZERO : 0) | \
+	((b) ? FB_BOUNDS : 0) | ((s) ? FB_AS : 0)
+#define FM_CLEAR(d, o, z, b, s) \
+	((d) ? 0 : FB_DEFER) | ((o) ? 0 : FB_ORELSE) | ((z) ? 0 : FB_ZERO) | \
+	((b) ? 0 : FB_BOUNDS) | ((s) ? 0 : FB_AS)
+#define FM_CELL(d, o, z, b, s) \
+	{.tag="d" #d "-o" #o "-z" #z "-b" #b "-s" #s, .text=FM_SOURCE(d, o), \
+	 .set_features=FM_SET(d, o, z, b, s), .clear_features=FM_CLEAR(d, o, z, b, s)}
+static const AxisValue feature_matrix_values[] = {
+	FM_CELL(0, 0, 0, 0, 0), FM_CELL(0, 0, 0, 0, 1),
+	FM_CELL(0, 0, 0, 1, 0), FM_CELL(0, 0, 0, 1, 1),
+	FM_CELL(0, 0, 1, 0, 0), FM_CELL(0, 0, 1, 0, 1),
+	FM_CELL(0, 0, 1, 1, 0), FM_CELL(0, 0, 1, 1, 1),
+	FM_CELL(0, 1, 0, 0, 0), FM_CELL(0, 1, 0, 0, 1),
+	FM_CELL(0, 1, 0, 1, 0), FM_CELL(0, 1, 0, 1, 1),
+	FM_CELL(0, 1, 1, 0, 0), FM_CELL(0, 1, 1, 0, 1),
+	FM_CELL(0, 1, 1, 1, 0), FM_CELL(0, 1, 1, 1, 1),
+	FM_CELL(1, 0, 0, 0, 0), FM_CELL(1, 0, 0, 0, 1),
+	FM_CELL(1, 0, 0, 1, 0), FM_CELL(1, 0, 0, 1, 1),
+	FM_CELL(1, 0, 1, 0, 0), FM_CELL(1, 0, 1, 0, 1),
+	FM_CELL(1, 0, 1, 1, 0), FM_CELL(1, 0, 1, 1, 1),
+	FM_CELL(1, 1, 0, 0, 0), FM_CELL(1, 1, 0, 0, 1),
+	FM_CELL(1, 1, 0, 1, 0), FM_CELL(1, 1, 0, 1, 1),
+	FM_CELL(1, 1, 1, 0, 0), FM_CELL(1, 1, 1, 0, 1),
+	FM_CELL(1, 1, 1, 1, 0), FM_CELL(1, 1, 1, 1, 1),
+};
+static const Axis ax_feature_matrix = {
+	"configuration", feature_matrix_values, N(feature_matrix_values)
+};
+#undef FM_CELL
+#undef FM_CLEAR
+#undef FM_SET
+#undef FM_SOURCE
+#undef FM_TAIL
+#undef FM_HEAD
+#undef FM_LOG_1
+#undef FM_LOG_0
+#undef FM_ORELSE_1
+#undef FM_ORELSE_0
+#undef FM_DEFER_1
+#undef FM_DEFER_0
+
 /* Library-facing count/pointer states and preprocessor argv shapes.  The
  * generic feature patcher above applies these directly to PrismFeatures. */
 static const char *api_include_ok[] = {"."};
@@ -2840,6 +2951,107 @@ static const Axis ax_runtime_orelse_defer = {
 	"action", runtime_orelse_defer_values, N(runtime_orelse_defer_values)
 };
 
+/* Bare-assignment orelse has a separate lowering from declarations.  Keep the
+ * lvalue shapes runtime-checked: the generated branches must assign exactly
+ * once, including an lvalue whose evaluation has a side effect.  The member
+ * RHS cases also cover the bit-field typeof promotion path. */
+static const AxisValue runtime_bare_orelse_lvalue_values[] = {
+	{"ident",
+	 "int main(void){int x=0;x=src() orelse fb();return x==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"deref",
+	 "int main(void){int x=0,*p=&x;*p=src() orelse fb();return x==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"subscript",
+	 "int main(void){int a[2]={0};a[1]=src() orelse fb();return a[1]==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"subscript-side-effect",
+	 "int main(void){int a[2]={0},i=0;a[i++]=src() orelse fb();return a[0]+i;}",
+	 0, 0, O_REJECT | O_DIAG},
+	{"member",
+	 "struct S{int v;};int main(void){struct S s={0};s.v=src() orelse fb();return s.v==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"pointer-member",
+	 "struct S{int v;};int main(void){struct S s={0},*p=&s;p->v=src() orelse fb();return s.v==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"bitfield-lhs",
+	 "struct B{unsigned v:4;};int main(void){struct B b={0};b.v=src() orelse fb();return b.v==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+	{"bitfield-rhs",
+	 "struct B{unsigned v:4;};int main(void){struct B b={0};int x=0;b.v=src();x=b.v orelse fb();return x==(@0@?@0@:9)&&gc==1&&fc==((!@0@)?1:0)?0:1;}",
+	 0, 0},
+};
+static const Axis ax_runtime_bare_orelse_lvalue = {
+	"lvalue", runtime_bare_orelse_lvalue_values, N(runtime_bare_orelse_lvalue_values)
+};
+
+/* The declaration action matrix above exercises the same exits, but not the
+ * bare-assignment lowering that owns temporary types, fallback chains, and
+ * the action handoff.  Verify each action preserves exact defer unwinding. */
+static const AxisValue runtime_bare_orelse_defer_values[] = {
+	{"return",
+	 "static int run(void){defer ev('A');{defer ev('a');ev('p');int x=0;x=src() orelse return 9;(void)x;ev('q');}ev('z');return 3;}"
+	 "int main(void){int r=run();return @0@?(r==3&&same(\"pqazA\")?0:1):(r==9&&same(\"paA\")?0:2);}",
+	 0, 0},
+	{"goto",
+	 "static int run(void){defer ev('A');{defer ev('a');ev('p');int x=0;x=src() orelse goto L;(void)x;ev('q');}ev('z');L:ev('l');return 3;}"
+	 "int main(void){int r=run();return @0@?(r==3&&same(\"pqazlA\")?0:1):(r==3&&same(\"palA\")?0:2);}",
+	 0, 0},
+	{"break",
+	 "static int run(void){defer ev('A');for(int i=0;i<1;i++){defer ev('a');ev('p');int x=0;x=src() orelse break;(void)x;ev('q');}ev('z');return 3;}"
+	 "int main(void){int r=run();return r==3&&(@0@?same(\"pqazA\"):same(\"pazA\"))?0:1;}",
+	 0, 0},
+	{"continue",
+	 "static int run(void){defer ev('A');for(int i=0;i<1;i++){defer ev('a');ev('p');int x=0;x=src() orelse continue;(void)x;ev('q');}ev('z');return 3;}"
+	 "int main(void){int r=run();return r==3&&(@0@?same(\"pqazA\"):same(\"pazA\"))?0:1;}",
+	 0, 0},
+	{"block-return",
+	 "static int run(void){defer ev('A');{defer ev('a');ev('p');int x=0;x=src() orelse {ev('f');return 9;};(void)x;ev('q');}ev('z');return 3;}"
+	 "int main(void){int r=run();return @0@?(r==3&&same(\"pqazA\")?0:1):(r==9&&same(\"pfaA\")?0:2);}",
+	 0, 0},
+};
+static const Axis ax_runtime_bare_orelse_defer = {
+	"action", runtime_bare_orelse_defer_values, N(runtime_bare_orelse_defer_values)
+};
+
+/* A braceless defer can hold any complete control statement.  These shapes
+ * make Phase 1 record through an else arm, a final brace, or a do-while tail
+ * instead of stopping at the first semicolon in the nested statement. */
+static const AxisValue runtime_defer_control_body_values[] = {
+	{"if-else",
+	 "static int calls;static int src(void){return @0@;}"
+	 "static int run(void){defer if(src())calls++;else calls+=2;return 0;}"
+	 "int main(void){run();return calls==(@0@?1:2)?0:1;}",
+	 0, 0},
+	{"if-else-braced",
+	 "static int calls;static int src(void){return @0@;}"
+	 "static int run(void){defer if(src()){calls++;}else{calls+=2;}return 0;}"
+	 "int main(void){run();return calls==(@0@?1:2)?0:1;}",
+	 0, 0},
+	{"while-braced",
+	 "static int calls,n;static int run(void){defer while(n--){calls++;}return 0;}"
+	 "int main(void){n=@0@?1:2;run();return calls==(@0@?1:2)?0:1;}",
+	 0, 0},
+	{"for-braced",
+	 "static int calls;static int src(void){return @0@;}"
+	 "static int run(void){defer for(int i=0;i<(src()?1:2);i++){calls++;}return 0;}"
+	 "int main(void){run();return calls==(@0@?1:2)?0:1;}",
+	 0, 0},
+	{"do-while",
+	 "static int calls,probes;static int src(void){probes++;return @0@;}"
+	 "static int run(void){defer do{calls++;}while(src()&&0);return 0;}"
+	 "int main(void){run();return calls==1&&probes==1?0:1;}",
+	 0, 0},
+	{"switch",
+	 "static int calls;static int src(void){return @0@;}"
+	 "static int run(void){defer switch(src()){case 0:{calls+=2;break;}default:{calls++;break;}}return 0;}"
+	 "int main(void){run();return calls==(@0@?1:2)?0:1;}",
+	 0, 0},
+};
+static const Axis ax_runtime_defer_control_body = {
+	"control", runtime_defer_control_body_values, N(runtime_defer_control_body_values)
+};
+
 static const AxisValue runtime_zero_values[] = {
 	{"scalar", "int main(void){dirty();int v;return nz(&v,sizeof v);}", 0, 0},
 	{"pointer", "int main(void){dirty();char *v;return nz(&v,sizeof v);}", 0, 0},
@@ -2882,6 +3094,51 @@ static const AxisValue runtime_zero_values[] = {
 	{"typeof-vla", "int main(int n,char**v){(void)v;dirty();n+=3;int a[n];typeof(a)b;return nz(&b,sizeof b);}", 0, 0},
 };
 static const Axis ax_runtime_zero = {"shape", runtime_zero_values, N(runtime_zero_values)};
+
+/* The broad zero-init product above focuses on object representations.  These
+ * axes cross the lowering strategies with every block form that owns a local
+ * declaration, so a state-machine regression cannot hide behind a happy-path
+ * function body.  All declarations use `v`, allowing the scope wrapper to
+ * apply the same byte-level runtime oracle. */
+static const AxisValue runtime_zero_fixed_values[] = {
+	{"array", "int v[3][4];", 0, 0},
+	{"struct", "struct { char a; int b; char c; } v;", 0, 0},
+	{"union", "union { char c[7]; long n; double d; } v;", 0, 0},
+	{"array-struct", "struct { char a; int b; } v[3];", 0, 0},
+};
+static const Axis ax_runtime_zero_fixed = {
+	"shape", runtime_zero_fixed_values, N(runtime_zero_fixed_values)
+};
+
+static const AxisValue runtime_zero_scalar_values[] = {
+	{"int", "int v;", 0, 0},
+	{"pointer", "void *v;", 0, 0},
+	{"volatile", "volatile int v;", 0, 0},
+};
+static const Axis ax_runtime_zero_scalar = {
+	"shape", runtime_zero_scalar_values, N(runtime_zero_scalar_values)
+};
+
+static const AxisValue runtime_zero_vla_values[] = {
+	{"vla", "int v[n][3];", 0, 0},
+	{"typeof-vla", "typeof(int[n][3]) v;", 0, 0},
+};
+static const Axis ax_runtime_zero_vla = {
+	"shape", runtime_zero_vla_values, N(runtime_zero_vla_values)
+};
+
+static const AxisValue runtime_zero_scope_values[] = {
+	{"function", "int main(void){int n=3;dirty();@0@return nz(&v,sizeof v);}", 0, 0},
+	{"nested", "int main(void){int n=3;dirty();{@0@return nz(&v,sizeof v);}}", 0, 0},
+	{"if-body", "int main(void){int n=3;if(1){dirty();@0@return nz(&v,sizeof v);}return 1;}", 0, 0},
+	{"while-body", "int main(void){int n=3;int once=1;while(once--){dirty();@0@return nz(&v,sizeof v);}return 1;}", 0, 0},
+	{"for-body", "int main(void){int n=3;for(int once=0;once==0;once++){dirty();@0@return nz(&v,sizeof v);}return 1;}", 0, 0},
+	{"switch-case", "int main(void){int n=3;switch(0){case 0:{dirty();@0@return nz(&v,sizeof v);}default:return 1;}}", 0, 0},
+	{"stmt-expr", "int main(void){int n=3;return ({dirty();@0@nz(&v,sizeof v);});}", 0, 0},
+};
+static const Axis ax_runtime_zero_scope = {
+	"scope", runtime_zero_scope_values, N(runtime_zero_scope_values)
+};
 
 static const AxisValue defer_ident_next_op_values[] = {
 	{"lt", "<", 0, 0}, {"gt", ">", 0, 0}, {"mod", "%", 0, 0},
@@ -2978,6 +3235,56 @@ static const AxisValue runtime_bounds_ok_values[] = {
 };
 static const Axis ax_runtime_bounds_ok = {
 	"access", runtime_bounds_ok_values, N(runtime_bounds_ok_values)
+};
+
+/* Runtime trap cells must reach every tracked binding kind, not merely the
+ * ordinary automatic local in runtime_bounds_oob_values.  Keep the indexed
+ * expression and its spelling independent: the odometer then tests each
+ * parser path (plain, parens, address cancellation, orelse, stmt-expr) for
+ * automatic, block-static, file-static and typedef-hidden arrays. */
+static const AxisValue runtime_bounds_base_values[] = {
+	{"local", "a", 0, 0},
+	{"block-static", "s", 0, 0},
+	{"file-static", "g", 0, 0},
+	{"typedef", "r", 0, 0},
+};
+static const Axis ax_runtime_bounds_base = {
+	"binding", runtime_bounds_base_values, N(runtime_bounds_base_values)
+};
+
+static const AxisValue runtime_bounds_access_values[] = {
+	{"read", "return @0@[idx];", 0, 0},
+	{"write", "@0@[idx]=1;return 0;", 0, 0},
+	{"paren", "return (@0@)[idx];", 0, 0},
+	{"cancel-address", "return *&@0@[idx];", 0, 0},
+	{"orelse-index", "return @0@[0 orelse idx];", 0, 0},
+	{"stmt-expr", "return ({@0@[idx];});", 0, 0},
+};
+static const Axis ax_runtime_bounds_access = {
+	"access", runtime_bounds_access_values, N(runtime_bounds_access_values)
+};
+
+static const AxisValue runtime_bounds_matrix_base_values[] = {
+	{"local", "m", 0, 0},
+	{"block-static", "sm", 0, 0},
+	{"file-static", "gm", 0, 0},
+	{"typedef", "tm", 0, 0},
+};
+static const Axis ax_runtime_bounds_matrix_base = {
+	"binding", runtime_bounds_matrix_base_values, N(runtime_bounds_matrix_base_values)
+};
+
+static const AxisValue runtime_bounds_matrix_access_values[] = {
+	{"row-read", "return @0@[idx][0];", 0, 0},
+	{"column-read", "return @0@[0][idx];", 0, 0},
+	{"row-write", "@0@[idx][0]=1;return 0;", 0, 0},
+	{"column-write", "@0@[0][idx]=1;return 0;", 0, 0},
+	{"row-orelse", "return @0@[0 orelse idx][0];", 0, 0},
+	{"column-orelse", "return @0@[0][0 orelse idx];", 0, 0},
+	{"cancel-address", "return *&@0@[0][idx];", 0, 0},
+};
+static const Axis ax_runtime_bounds_matrix_access = {
+	"access", runtime_bounds_matrix_access_values, N(runtime_bounds_matrix_access_values)
 };
 
 static const AxisValue runtime_autostatic_values[] = {
@@ -3188,8 +3495,10 @@ static const Recipe recipes[] = {
 	{"contexts/expression", "@2@", PRE, {&ax_expr, &ax_expr_wrap, &ax_expr_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"contexts/statement", "@1@", NULL, {&ax_stmt, &ax_stmt_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"declarations/product", "@1@", NULL, {&ax_decl, &ax_decl_ctx, &ax_features}, O_OK | O_FIXED, 0, FB_LINE, 0},
-	{"features/product", "int g(void);void c(void);int f(int i){int a[8];defer c();int x=g() orelse 2;raw int y;return a[i]+x+y;}",
+	{"features/product", "int g(void);void c(void);int f(int i){int a[8];const int table[2]={1,2};defer c();int x=g() orelse 2;raw int y;return a[i]+table[0]+x+y;}",
 	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0},
+	{"features/power-set", "@0@", NULL, {&ax_feature_matrix}, O_FEATURE_MATRIX,
+	 0, FB_LINE | FB_AUR, 0},
 	{"api/feature-struct", "#ifdef RECIPE_DEF\nint v=RECIPE_DEF;\n#else\nint v;\n#endif\n",
 	 NULL, {&ax_api_features}, O_FILE | O_ANY_STATUS, 0, FB_LINE, CAP_POSIX},
 	{"api/define-last-wins", "@0@int f(void){return RECIPE_ORDER;}", NULL,
@@ -3225,6 +3534,16 @@ static const Recipe recipes[] = {
 	 "static int same(const char*s){int i=0;while(s[i]&&logv[i]==s[i])i++;return !s[i]&&!logv[i];}"
 	 "static int src(void){return @0@;}",
 	 {&ax_runtime_truth, &ax_runtime_orelse_defer}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/bare-orelse-lvalue-product", "@1@",
+	 "static int gc,fc;static int src(void){gc++;return @0@;}static int fb(void){fc++;return 9;}",
+	 {&ax_runtime_truth, &ax_runtime_bare_orelse_lvalue}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/bare-orelse-defer-product", "@1@",
+	 "static char logv[32];static int logn;static void ev(char c){logv[logn++]=c;}"
+	 "static int same(const char*s){int i=0;while(s[i]&&logv[i]==s[i])i++;return !s[i]&&!logv[i];}"
+	 "static int src(void){return @0@;}",
+	 {&ax_runtime_truth, &ax_runtime_bare_orelse_defer}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-control-body-product", "@1@", NULL,
+	 {&ax_runtime_truth, &ax_runtime_defer_control_body}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
 	{"runtime/orelse-chain-matrix", "@0@",
 	 "static int gc,fc;static int g(int v){gc++;return v;}static int fb(int v){fc++;return v;}",
 	 {&ax_runtime_chain}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
@@ -3253,6 +3572,27 @@ static const Recipe recipes[] = {
 	 "static int nz(const void*p,unsigned long n){const unsigned char*b=p;int k=0;"
 	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
 	 {&ax_runtime_zero}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX | CAP_VLA},
+	{"runtime/zeroinit-fixed-scope-matrix", "@1@",
+	 "__attribute__((noinline))static void dirty(void){volatile unsigned char j[512];"
+	 "for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}"
+	 "static int nz(const void*p,unsigned long n){const unsigned char*b=p;int k=0;"
+	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
+	 {&ax_runtime_zero_fixed, &ax_runtime_zero_scope}, O_OK | O_RUN | O_FIXED,
+	 0, FB_LINE, CAP_POSIX, "= {0}"},
+	{"runtime/zeroinit-scalar-scope-matrix", "@1@",
+	 "__attribute__((noinline))static void dirty(void){volatile unsigned char j[512];"
+	 "for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}"
+	 "static int nz(const void*p,unsigned long n){const unsigned char*b=p;int k=0;"
+	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
+	 {&ax_runtime_zero_scalar, &ax_runtime_zero_scope}, O_OK | O_RUN | O_FIXED,
+	 0, FB_LINE, CAP_POSIX, "v = 0"},
+	{"runtime/zeroinit-vla-scope-matrix", "@1@",
+	 "__attribute__((noinline))static void dirty(void){volatile unsigned char j[512];"
+	 "for(int k=0;k<512;k++)j[k]=0xAA;(void)j;}"
+	 "static int nz(const void*p,unsigned long n){const unsigned char*b=p;int k=0;"
+	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
+	 {&ax_runtime_zero_vla, &ax_runtime_zero_scope}, O_OK | O_RUN | O_FIXED,
+	 0, FB_LINE, CAP_POSIX | CAP_VLA, "__builtin_memset"},
 	{"differential/defer-identifier-next-operator", "int f(int defer){return defer @0@ 1;}", NULL,
 	 {&ax_defer_ident_next_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"differential/defer-identifier-prev-operator", "int f(int defer){return 1 @0@ defer;}", NULL,
@@ -3272,11 +3612,93 @@ static const Recipe recipes[] = {
 	 NULL, {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA},
 	{"runtime/bounds-inbounds-product", "@0@", NULL, {&ax_runtime_bounds_ok}, O_OK | O_RUN,
 	 FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA},
+	{"runtime/bounds-binding-trap-matrix",
+	 "static int g[4]={0};typedef int Row[4];int main(void){int a[4]={0};"
+	 "static int s[4]={0};Row r={0};volatile unsigned long idx=4;@1@}",
+	 NULL, {&ax_runtime_bounds_base, &ax_runtime_bounds_access}, O_OK | O_TRAP | O_FIXED,
+	 FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"runtime/bounds-rank-trap-matrix",
+	 "static int gm[4][3]={{0}};typedef int Matrix[4][3];int main(void){"
+	 "int m[4][3]={{0}};static int sm[4][3]={{0}};Matrix tm={{0}};"
+	 "volatile unsigned long idx=4;@1@}",
+	 NULL, {&ax_runtime_bounds_matrix_base, &ax_runtime_bounds_matrix_access},
+	 O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
 	{"runtime/auto-static-product", "@0@", NULL, {&ax_runtime_autostatic}, O_OK | O_RUN,
 	 FB_AS, FB_LINE, CAP_POSIX},
 
+	/* Auto-static has a semantic runtime product above; these rows lock down
+	 * the actual injection and its conservative eligibility boundary. */
+	{"exact/auto-static-literal-without-zero",
+	 "void f(void){const int values[2]={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_ZERO | FB_LINE, CAP_POSIX,
+	 "static const int values[2]", NULL},
+	{"exact/auto-static-string",
+	 "void f(void){const char message[]=\"ok\";(void)message;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 "static const char message[]", NULL},
+	{"exact/auto-static-enum-designator",
+	 "enum{A=1};void f(void){const int table[3]={[A]=7,[2]=9};(void)table;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 "static const int table[3]", NULL},
+	{"exact/auto-static-declarator-const-pointer-array",
+	 "void f(void){int * const ptrs[2]={0,0};(void)ptrs;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 "static int * const ptrs[2]", NULL},
+	{"exact/auto-static-disabled",
+	 "void f(void){const int values[2]={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, 0, FB_AS | FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"exact/auto-static-skip-multiple-declarators",
+	 "void f(void){const int left[2]={1,2},right[2]={3,4};(void)left;(void)right;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int left[2]|static const int right[2]"},
+	{"exact/auto-static-skip-pointer-to-const",
+	 "void f(void){const int *values[2]={0,0};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int *values[2]"},
+	{"exact/auto-static-skip-raw",
+	 "void f(void){raw const int values[2]={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"exact/auto-static-skip-auto-storage",
+	 "void f(void){auto const int values[2]={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static auto const int values[2]"},
+	{"exact/auto-static-skip-vla",
+	 "void f(int n){const int values[n];(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_ZERO | FB_BOUNDS | FB_LINE, CAP_POSIX | CAP_VLA,
+	 NULL, "static const int values[n]"},
+	{"exact/auto-static-skip-volatile-typedef",
+	 "typedef volatile int VI;void f(void){const VI values[2]={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const VI values[2]"},
+	{"exact/auto-static-skip-runtime-initializer",
+	 "int value(void);void f(void){const int values[2]={value(),2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"exact/auto-static-skip-declarator-attribute",
+	 "void f(void){const int values[2] __attribute__((unused))={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"exact/auto-static-skip-control-init",
+	 "void f(void){for(const int values[2]={1,2};;){(void)values;break;}}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"exact/auto-static-skip-mutable-typeof-array",
+	 "void f(void){typeof(int[2]) values={1,2};(void)values;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static typeof(int[2]) values"},
+
 	{"exact/defer-lifo", "void p(char);int main(void){defer p('A');{defer p('B');p('x');}return 0;}", NULL,
 	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0, "p('A')|p('B')", NULL},
+	{"reject/orelse-in-braceless-defer", "void cleanv(int);int g(void);void f(void){defer cleanv(g() orelse 1);}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0},
+	{"reject/declaration-in-braceless-defer", "void f(void){defer int x=1;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "declaration as a braceless defer body"},
+	{"reject/break-in-braced-defer", "void f(void){for(;;){defer {break;}break;}}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "break"},
+	{"reject/continue-in-braced-defer", "void f(void){for(;;){defer {continue;}break;}}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "continue"},
 	{"exact/zeroinit-scalar", "void f(void){int x;(void)x;}", NULL, {0}, O_OK, 0, FB_LINE, 0,
 	 "x = 0", NULL},
 	{"exact/zeroinit-array", "void f(void){int a[8];(void)a;}", NULL, {0}, O_OK, 0, FB_LINE, 0,

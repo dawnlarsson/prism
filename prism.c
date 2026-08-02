@@ -2919,8 +2919,15 @@ static PParseToken *handle_defer_keyword(PParseToken *tok) {
 	}
 
 	PParseToken *stmt_end = body_end;
-	defer_add(defer_keyword, stmt_start, stmt_end);
-	tok = (stmt_end->kind != PPARSE_TK_EOF) ? pparse_next(_pc, stmt_end) : stmt_end;
+	if (stmt_start->tag & (PPARSE_TT_IF | PPARSE_TT_LOOP | PPARSE_TT_SWITCH)) {
+		/* Phase 1 records a full control statement with an exclusive end;
+		 * keep its final `}` / do-while semicolon inside the copied body. */
+		defer_add(defer_keyword, stmt_start, stmt_end);
+		tok = stmt_end;
+	} else {
+		defer_add(defer_keyword, stmt_start, stmt_end);
+		tok = (stmt_end->kind != PPARSE_TK_EOF) ? pparse_next(_pc, stmt_end) : stmt_end;
+	}
 	end_statement_after_semicolon();
 	return tok;
 }
