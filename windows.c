@@ -53,9 +53,6 @@ typedef int mode_t;
 	(InterlockedCompareExchange((volatile LONG *)&signal_temps_count,                                    \
 				    (LONG)(desired),                                                         \
 				    (LONG)(*(expected))) == (LONG)(*(expected)))
-// MSVC volatile has acquire/release on x86/x64 — sufficient for cached_clean_env init-once.
-#define cached_env_load() (cached_clean_env)
-#define cached_env_store(val) (cached_clean_env = (val))
 #define signal_temps_ready_store(idx, val) (signal_temps_ready[(idx)] = (val))
 #define signal_temps_ready_load(idx) (signal_temps_ready[(idx)])
 #define signal_temps_ready_cas(idx, expected, desired)                                                       \
@@ -811,21 +808,22 @@ static wchar_t *win32_build_env_block(char **envp) {
 	// First pass: compute total wide-char length needed.
 	size_t total_wchars = 0;
 	for (char **e = envp; *e; e++) {
-		int wlen = MultiByteToWideChar(CP_UTF8, 0, *e, -1, NULL, 0);
-		if (wlen <= 0) wlen = 1;
+		int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, *e, -1, NULL, 0);
+		if (wlen <= 0 || (size_t)wlen > SIZE_MAX - total_wchars) return NULL;
 		total_wchars += (size_t)wlen; // includes NUL terminator (serves as separator)
 	}
+	if (total_wchars > SIZE_MAX - 1 || total_wchars + 1 > (size_t)INT_MAX) return NULL;
 	total_wchars++;				// final double-NUL
 	if (total_wchars < 2) total_wchars = 2; // empty env needs double-NUL
 	wchar_t *block = (wchar_t *)calloc(total_wchars, sizeof(wchar_t));
 	if (!block) return NULL;
 	wchar_t *p = block;
 	for (char **e = envp; *e; e++) {
-		int wlen =
-		    MultiByteToWideChar(CP_UTF8, 0, *e, -1, p, (int)(total_wchars - (size_t)(p - block)));
+		int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, *e, -1, p,
+					       (int)(total_wchars - (size_t)(p - block)));
 		if (wlen <= 0) {
-			*p++ = L'\0';
-			continue;
+			free(block);
+			return NULL;
 		}
 		p += wlen; // wlen includes the NUL separator
 	}
@@ -945,7 +943,7 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	wchar_t *env_block = win32_build_env_block(envp);
 	DWORD create_flags = env_block ? CREATE_UNICODE_ENVIRONMENT : 0;
 	BOOL ok = FALSE;
-	if (!cmdline) goto cleanup;
+	if (!cmdline || (envp && !env_block)) goto cleanup;
 
 	// Use CreateProcessW so UTF-8 paths (converted by win32_utf8_argv) work.
 	// When file actions redirect handles, use STARTUPINFOEX with an explicit
@@ -1155,7 +1153,9 @@ static char **build_clean_environ(void);
 // recursive compiler loops.
 static int run_command(char **argv) {
 	char **env = build_clean_environ();
+	if (!env) return -1;
 	HANDLE hp = win32_spawn_with_actions(argv, NULL, env);
+	free(env);
 	if (hp == INVALID_HANDLE_VALUE) return -1;
 	WaitForSingleObject(hp, INFINITE);
 	DWORD exit_code = 1;
@@ -1169,11 +1169,13 @@ static int run_command(char **argv) {
 // avoiding process-global fd mutation (thread-safe for PRISM_LIB_MODE).
 static int run_command_quiet(char **argv) {
 	char **env = build_clean_environ();
+	if (!env) return -1;
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
 	HANDLE hp = win32_spawn_with_actions(argv, &fa, env);
+	free(env);
 	posix_spawn_file_actions_destroy(&fa);
 	if (hp == INVALID_HANDLE_VALUE) return -1;
 

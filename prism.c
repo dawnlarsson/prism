@@ -47,6 +47,17 @@ static void signal_temps_register(const char *path);
 static int run_command(char **argv);
 static int run_command_quiet(char **argv);
 
+/* Windows CRT getenv is tied to the active ANSI code page, while compiler
+ * spawning uses the Unicode process environment. Keep cache inputs on the
+ * same UTF-8 view so two distinct Unicode paths cannot share a cache key. */
+static const char *prism_getenv(const char *name) {
+#ifdef _WIN32
+	return get_env_utf8(name);
+#else
+	return getenv(name);
+#endif
+}
+
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -159,6 +170,23 @@ typedef struct {
 	PrismStatus status;
 } PrismResult;
 
+/* Public errors must remain explainable even if the allocation used to copy a
+ * diagnostic is the allocation that failed. prism_free recognizes this static
+ * fallback and never attempts to release it. */
+static const char prism_oom_error[] = "Out of memory";
+
+static char *prism_error_copy(const char *message) {
+	size_t len = strlen(message);
+	if (len == SIZE_MAX) return (char *)prism_oom_error;
+	char *copy = malloc(len + 1);
+	if (copy) memcpy(copy, message, len + 1);
+	return copy ? copy : (char *)prism_oom_error;
+}
+
+static void prism_result_io_error(PrismResult *result, const char *message) {
+	*result = (PrismResult){.status = PRISM_ERR_IO, .error_msg = prism_error_copy(message)};
+}
+
 typedef enum {
 	DEFER_SCOPE,	// DEFER_SCOPE=current only
 	DEFER_ALL,	// DEFER_ALL=all scopes
@@ -223,6 +251,11 @@ typedef struct {
 	const char **prog_args; // args passed to the compiled binary in `run` mode
 				// (after `--`)
 	const char *output;
+	/* MSVC permits /Fe (link output) and /Fo (object output) together. Keep
+	 * them distinct until the final compile plan instead of treating /Fo as a
+	 * GNU-style -o or accidentally turning it into /c. */
+	const char *msvc_exe_output;
+	const char *msvc_obj_output;
 	const char *cc;
 	char **rsp_owned; // heap tokens from @file expansion (freed by cli_free)
 	char **rsp_argv;  // expanded argv array; elements point into rsp_owned
@@ -252,7 +285,6 @@ typedef struct {
 } Cli;
 
 extern char **environ;
-static char **cached_clean_env = NULL;
 #ifndef PRISM_LIB_MODE
 static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
@@ -271,8 +303,6 @@ static volatile sig_atomic_t signal_temps_count = 0;
 #define signal_temps_cas(expected, desired)                                                                  \
 	__atomic_compare_exchange_n(                                                                         \
 	    &signal_temps_count, (expected), (desired), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-#define cached_env_load() __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
-#define cached_env_store(val) __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
 #define signal_temps_ready_store(idx, val)                                                                   \
 	__atomic_store_n(&signal_temps_ready[(idx)], (val), __ATOMIC_RELEASE)
 #define signal_temps_ready_load(idx) __atomic_load_n(&signal_temps_ready[(idx)], __ATOMIC_ACQUIRE)
@@ -603,9 +633,13 @@ static inline void emit_typeof_keyword(void) {
 static bool out_close(void) {
 	if (out_fp) {
 		out_flush();
+		/* fwrite can fail before fclose.  Some streams report that failure only
+		 * through ferror() and still close successfully, so preserve it before
+		 * releasing the FILE. */
+		bool ok = !ferror(out_fp);
 		int status = fclose(out_fp);
 		out_fp = NULL;
-		return status == 0;
+		return ok && status == 0;
 	}
 	return true;
 }
@@ -620,10 +654,33 @@ static void out_uint(unsigned long long v) {
 
 static void out_quoted_path(const char *file) {
 	for (const char *p = file; *p; p++) {
-		char c = *p;
-		if (c == '\\') c = '/'; // normalize backslashes (MSVC C4129, harmless on POSIX)
-		if (c == '"') out_char('\\');
-		out_char(c);
+		unsigned char c = (unsigned char)*p;
+		if (c == '\\') {
+			/* Normalize backslashes (MSVC C4129, harmless on POSIX). */
+			out_char('/');
+		} else if (c == '?') {
+			/* Translation phase 1 recognizes trigraphs before it sees the
+			 * surrounding string literal.  Escape every question mark so a
+			 * filename cannot turn ??/ into a backslash and consume the quote. */
+			OUT_LIT("\\?");
+		} else if (c == '"') {
+			OUT_LIT("\\\"");
+		} else if (c == '\n') {
+			OUT_LIT("\\n");
+		} else if (c == '\r') {
+			OUT_LIT("\\r");
+		} else if (c == '\t') {
+			OUT_LIT("\\t");
+		} else if (c < 0x20 || c == 0x7f) {
+			/* A physical control character can terminate a #line directive.
+			 * Keep it inside the C string literal as a fixed-width octal escape. */
+			out_char('\\');
+			out_char((char)('0' + (c >> 6)));
+			out_char((char)('0' + ((c >> 3) & 7)));
+			out_char((char)('0' + (c & 7)));
+		} else {
+			out_char((char)c);
+		}
 	}
 }
 
@@ -832,6 +889,9 @@ consumed_defs_oom:
 
 static void emit_system_includes(void) {
 	PRISM_STATE();
+	/* Compiler/API definitions are part of the translated TU even when no
+	 * system header was collected.  Returning before this call drops structured
+	 * `-D` values in non-flatten mode. */
 	emit_consumed_defines();
 	if (_ps->system_include_count == 0) return;
 	emit_system_header_diag_push();
@@ -2117,6 +2177,7 @@ static void emit_declarator(PParseToken *tok, PParseToken *end) {
 }
 
 static void emit_noise_between_raws(PParseToken *first_raw, PParseToken *last_raw) {
+	PRISM_STATE();
 	PPARSE_CTX();
 	if (first_raw == last_raw) return;
 	PPARSE_FOR_RANGE(t, pparse_next(_pc, first_raw), last_raw) {
@@ -2133,8 +2194,16 @@ static void emit_noise_between_raws(PParseToken *first_raw, PParseToken *last_ra
 				u = pparse_next(_pc, u);
 			}
 			t = m;
-		} else
+		} else {
 			emit_tok(t);
+			/* The next token can be another stripped `raw` at beginning of
+			 * line, so it may never reach emit_tok's BOL separator. Directives
+			 * need an explicit terminator before that happens. */
+			if (t->kind == PPARSE_TK_PREP_DIR) {
+				out_char('\n');
+				_ps->last_line_no++;
+			}
+		}
 	}
 }
 
@@ -3150,7 +3219,10 @@ static PParseToken *handle_close_brace(PParseToken *tok) {
 	while (emit_scope_depth > 0 && !is_brace_scope(scope_stack[emit_scope_depth - 1].kind)) scope_pop();
 	if ((pparse_ann(tok) & P1_RAW_BLOCK) && _ps->raw_block_depth > 0)
 		_ps->raw_block_depth--;
-	if (pparse_feat(PPARSE_F_DEFER)) {
+	/* Malformed input may reach a stray closing brace after every emit scope has
+	 * been consumed.  It still needs a normal parser diagnostic, never a stack
+	 * underflow in the recovery path. */
+	if (pparse_feat(PPARSE_F_DEFER) && emit_scope_depth > 0) {
 		ScopeNode *s = &scope_stack[emit_scope_depth - 1];
 		if (defer_count > s->defer_start_idx) {
 			emit_defers(DEFER_SCOPE);
@@ -3170,24 +3242,80 @@ static PParseToken *handle_close_brace(PParseToken *tok) {
 }
 
 static char **build_clean_environ(void) {
-	char **env = cached_env_load();
-	if (env) return env;
-	int n = 0;
-	for (char **e = environ; *e; e++) n++;
-	env = malloc((n + 1) * sizeof(char *));
-	if (!env) return NULL;
-	int j = 0;
-	for (char **e = environ; *e; e++) {
+	/* Each spawn snapshots the host environment.  Do not cache runtime-owned
+	 * pointers: a caller may replace an environment value between Prism calls. */
 #ifdef _WIN32
-		if (_strnicmp(*e, "CC=", 3) != 0 && _strnicmp(*e, "PRISM_CC=", 9) != 0)
-			env[j++] = *e;
+	/* The narrow CRT environment is encoded in the active ANSI code page, while
+	 * CreateProcessW receives UTF-16. Snapshot the native Unicode environment so
+	 * non-ASCII PATH/CPATH values survive the child boundary. Keep UTF-8 strings
+	 * contiguous with the vector so all callers retain their simple free(env). */
+	LPWCH block = GetEnvironmentStringsW();
+	if (!block) return NULL;
+	size_t n = 0, char_bytes = 0;
+	for (wchar_t *e = block; *e;) {
+		wchar_t *next = e;
+		while (*next) next++;
+		if (_wcsnicmp(e, L"CC=", 3) != 0 && _wcsnicmp(e, L"PRISM_CC=", 9) != 0) {
+			int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, e, -1, NULL, 0, NULL, NULL);
+			if (len <= 0 || (size_t)len > SIZE_MAX - char_bytes ||
+			    n == SIZE_MAX / sizeof(char *) - 1) {
+				FreeEnvironmentStringsW(block);
+				return NULL;
+			}
+			char_bytes += (size_t)len;
+			n++;
+		}
+		e = next + 1;
+	}
+	size_t ptr_bytes = (n + 1) * sizeof(char *);
+	if (char_bytes > SIZE_MAX - ptr_bytes) {
+		FreeEnvironmentStringsW(block);
+		return NULL;
+	}
+	char **env = malloc(ptr_bytes + char_bytes);
+	if (!env) {
+		FreeEnvironmentStringsW(block);
+		return NULL;
+	}
+	char *text = (char *)env + ptr_bytes;
+	char *end = text + char_bytes;
+	size_t j = 0;
+	for (wchar_t *e = block; *e;) {
+		wchar_t *next = e;
+		while (*next) next++;
+		if (_wcsnicmp(e, L"CC=", 3) != 0 && _wcsnicmp(e, L"PRISM_CC=", 9) != 0) {
+			int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, e, -1, NULL, 0, NULL, NULL);
+			if (len <= 0 || j == n || (size_t)(end - text) < (size_t)len ||
+			    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, e, -1, text, len, NULL, NULL) != len) {
+				free(env);
+				FreeEnvironmentStringsW(block);
+				return NULL;
+			}
+			env[j++] = text;
+			text += len;
+		}
+		e = next + 1;
+	}
+	FreeEnvironmentStringsW(block);
+	env[j] = NULL;
+	return env;
 #else
+	size_t n = 0;
+	if (environ) {
+		for (char **e = environ; *e; e++) {
+			if (n == SIZE_MAX / sizeof(char *) - 1) return NULL;
+			n++;
+		}
+	}
+	char **env = malloc((n + 1) * sizeof(*env));
+	if (!env) return NULL;
+	size_t j = 0;
+	for (char **e = environ; e && *e; e++) {
 		if (strncmp(*e, "CC=", 3) != 0 && strncmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
-#endif
 	}
 	env[j] = NULL;
-	cached_env_store(env);
 	return env;
+#endif
 }
 
 static int wait_for_child(pid_t pid) {
@@ -3215,6 +3343,7 @@ static int spawn_command(char **argv, posix_spawn_file_actions_t *actions) {
 		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
 		nanosleep(&nap, NULL);
 	}
+	free(env);
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
 		return -1;
@@ -3290,10 +3419,17 @@ static const char *path_basename(const char *path) {
 	return base;
 }
 
-static const char **alloc_argv(int count) {
-	const char **args = calloc((size_t)count, sizeof(*args));
+static const char **alloc_argv(size_t count) {
+	if (count == 0 || count > SIZE_MAX / sizeof(const char *)) pparse_error("argv allocation overflow");
+	const char **args = calloc(count, sizeof(*args));
 	if (!args) pparse_error("out of memory");
 	return args;
+}
+
+static bool prism_size_add_mul(size_t *total, size_t count, size_t factor) {
+	if (count > (SIZE_MAX - *total) / factor) return false;
+	*total += count * factor;
+	return true;
 }
 
 static const char *cc_next_token(const char *p, const char **start, int *len) {
@@ -3349,6 +3485,25 @@ static const char *cc_executable(const char *cc) {
 	return buf;
 }
 
+static bool cc_backslash_escapes(char next) {
+#ifdef _WIN32
+	/* A Windows path separator is ordinary data. Only quote/whitespace escapes
+	 * participate in this command-string parser. */
+	return next == '"' || ascii_hspace(next);
+#else
+	(void)next;
+	return true;
+#endif
+}
+
+static bool cc_quote_opens(char c) {
+#ifdef _WIN32
+	return c == '"';
+#else
+	return c == '"' || c == '\'';
+#endif
+}
+
 static void cc_split_into_argv(const char **args, int *argc, const char *cc, char **out_dup) {
 	*out_dup = NULL;
 	if (!*cc) return;
@@ -3370,13 +3525,43 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 			return;
 		}
 	}
-	const char *p = dup;
-	while (*p) {
-		const char *start;
-		int len;
-		p = cc_next_token(p, &start, &len);
-		if (len > 0) {
-			((char *)start)[len] = '\0';
+	/* Split the command as a small, deliberately non-shell parser. Quotes can
+	 * occur inside an argument (`-DNAME="two words"`), and backslash quotes the
+	 * next byte. This is enough for CC/PRISM_CC command strings without giving
+	 * them shell expansion semantics. Compact tokens in place so one strdup
+	 * remains the sole ownership unit. */
+	char *read = dup, *write = dup;
+	while (*read) {
+		while (ascii_hspace(*read)) read++;
+		if (!*read) break;
+		char *start = write;
+		char quote = '\0';
+		bool present = false;
+		while (*read) {
+			char c = *read++;
+			if (quote) {
+				if (c == quote) {
+					quote = '\0';
+					present = true;
+					continue;
+				}
+				if (c == '\\' && *read && cc_backslash_escapes(*read)) c = *read++;
+				*write++ = c;
+				present = true;
+				continue;
+			}
+			if (cc_quote_opens(c)) {
+				quote = c;
+				present = true;
+				continue;
+			}
+			if (ascii_hspace(c)) break;
+			if (c == '\\' && *read && cc_backslash_escapes(*read)) c = *read++;
+			*write++ = c;
+			present = true;
+		}
+		if (present) {
+			*write++ = '\0';
 			args[(*argc)++] = start;
 		}
 	}
@@ -3395,6 +3580,7 @@ static bool cc_is_msvc(const char *cc) {
 static bool is_pp_skip_input_arg(const char *f);
 static bool cc_flag_takes_arg(const char *a);
 static bool cc_flag_takes_arg_nonnull(const char *a);
+static int msvc_output_flag_kind(const char *a);
 #ifndef PRISM_LIB_MODE
 static bool cli_has_cxx_passthrough(const Cli *cli);
 static const char *cxx_driver_for_cc(const char *cc);
@@ -3482,8 +3668,9 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		/* Compile-only flags and MSVC output paths never affect preprocessing.
 		 * Strip them once before the platform-specific cases. */
 		if (strcmp(f, "-c") == 0 || strcmp(f, "/c") == 0) continue;
-		if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) {
-			if (!f[3] && i + 1 < _ps->extra_compiler_flags_count)
+		if (msvc_output_flag_kind(f)) {
+			if ((!f[3] || (f[3] == ':' && !f[4])) &&
+			    i + 1 < _ps->extra_compiler_flags_count)
 				i++;
 			continue;
 		}
@@ -4188,21 +4375,49 @@ static FileBytes read_file_bytes(const char *path) {
 
 static bool input_is_dot_i(const char *path) {
 	size_t n = strlen(path);
+#ifdef _WIN32
 	return n >= 2 && path[n - 2] == '.' && ((path[n - 1] | 0x20) == 'i');
+#else
+	return n >= 2 && path[n - 2] == '.' && path[n - 1] == 'i';
+#endif
+}
+
+static bool input_is_dot_c(const char *path) {
+	size_t n = strlen(path);
+#ifdef _WIN32
+	return n >= 2 && path[n - 2] == '.' && ((path[n - 1] | 0x20) == 'c');
+#else
+	return n >= 2 && path[n - 2] == '.' && path[n - 1] == 'c';
+#endif
+}
+
+/* The file API owns a C translation unit, not an arbitrary compiler input.
+ * Compilers commonly accept directories or unknown extensions as ignored
+ * linker inputs and still exit successfully, which used to yield an empty
+ * helper-only Prism output. Stdin remains an intentional special case. */
+static const char *prism_file_input_error(const char *path) {
+	struct stat st;
+	if (!strcmp(path, "-")) return NULL;
+	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+		return "input_file must name a regular .c or .i file";
+	if (!input_is_dot_c(path) && !input_is_dot_i(path))
+		return "input_file must have a .c or .i extension";
+	return NULL;
 }
 
 /* Preprocessed-output cache: every validation uncertainty is a miss. */
-#define PP_CACHE_MAGIC "PRISMPPC2\n"
+#define PP_CACHE_MAGIC "PRISMPPC3\n"
 
 /* Zero means unavailable; recent second-resolution files are not cached. */
 #if defined(_WIN32)
 #define PP_MTIME_NSEC(st) 0LL
+#define PP_CTIME_NSEC(st) 0LL
 #elif defined(__APPLE__)
 #define PP_MTIME_NSEC(st) ((long long)(st).st_mtimespec.tv_nsec)
-#elif defined(st_mtime)
-#define PP_MTIME_NSEC(st) ((long long)(st).st_mtim.tv_nsec)
+#define PP_CTIME_NSEC(st) ((long long)(st).st_ctimespec.tv_nsec)
 #else
-#define PP_MTIME_NSEC(st) 0LL
+#define PP_MTIME_NSEC(st) ((long long)(st).st_mtim.tv_nsec)
+#define PP_CTIME_NSEC(st) ((long long)(st).st_ctim.tv_nsec)
 #endif
 
 #ifdef _WIN32
@@ -4215,10 +4430,11 @@ typedef struct {
 	uint64_t a, b;
 } PPKey;
 
-/* Identity of one dependency. ctime catches metadata-only replacements
- * (`cp -p`, checkout of a same-size file) that leave size and mtime intact. */
+/* Identity of one dependency. ctime and filesystem identity catch
+ * metadata-preserving same-size replacements that leave mtime intact. */
 typedef struct {
-	long long size, mtime_sec, mtime_nsec, ctime_sec;
+	long long size, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+	unsigned long long device, inode;
 } PPStat;
 
 static bool pp_stat_id(const char *path, PPStat *o) {
@@ -4228,6 +4444,9 @@ static bool pp_stat_id(const char *path, PPStat *o) {
 	o->mtime_sec = (long long)st.st_mtime;
 	o->mtime_nsec = PP_MTIME_NSEC(st);
 	o->ctime_sec = (long long)st.st_ctime;
+	o->ctime_nsec = PP_CTIME_NSEC(st);
+	o->device = (unsigned long long)st.st_dev;
+	o->inode = (unsigned long long)st.st_ino;
 	return true;
 }
 
@@ -4247,11 +4466,32 @@ static void ppk_feed_str(PPKey *k, const char *s) {
 	ppk_feed(k, s, strlen(s));
 }
 
+/* Feed fields, never raw struct bytes: padding is not part of an identity and
+ * may be uninitialized on a supported ABI. */
+static void ppk_feed_stat(PPKey *k, const PPStat *id) {
+	ppk_feed(k, &id->size, sizeof id->size);
+	ppk_feed(k, &id->mtime_sec, sizeof id->mtime_sec);
+	ppk_feed(k, &id->mtime_nsec, sizeof id->mtime_nsec);
+	ppk_feed(k, &id->ctime_sec, sizeof id->ctime_sec);
+	ppk_feed(k, &id->ctime_nsec, sizeof id->ctime_nsec);
+	ppk_feed(k, &id->device, sizeof id->device);
+	ppk_feed(k, &id->inode, sizeof id->inode);
+}
+
+static PPKey pp_payload_checksum(const char *payload, size_t len) {
+	PPKey sum = {0x6a09e667f3bcc909ULL, 0xbb67ae8584caa73bULL};
+	ppk_feed_str(&sum, "prism-pp-payload");
+	ppk_feed(&sum, payload, len);
+	return sum;
+}
+
 /* Environment variables the preprocessor consults for header search. A change
  * here changes the output without changing any file prism can stat. */
 static const char *const pp_cache_env_keys[] = {
     "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
     "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "SOURCE_DATE_EPOCH", "PRISM_CC",
+    /* MSVC's implicit header search and driver-injected flags. */
+    "INCLUDE", "CL", "_CL_",
 };
 
 static bool pp_is_dir_sep(char c) {
@@ -4272,10 +4512,10 @@ static void ppk_feed_compiler(PPKey *k, const char *name) {
 	const char *sep_in_name = strchr(name, '/');
 #endif
 	if (sep_in_name) {
-		if (pp_stat_id(name, &id)) ppk_feed(k, &id, sizeof id);
+		if (pp_stat_id(name, &id)) ppk_feed_stat(k, &id);
 		return;
 	}
-	const char *path = getenv("PATH");
+	const char *path = prism_getenv("PATH");
 	if (!path) return;
 	size_t nlen = strlen(name);
 	for (const char *p = path; *p;) {
@@ -4288,7 +4528,7 @@ static void ppk_feed_compiler(PPKey *k, const char *name) {
 			memcpy(buf + dlen + 1, name, nlen + 1);
 			if (pp_stat_id(buf, &id)) {
 				ppk_feed_str(k, buf);
-				ppk_feed(k, &id, sizeof id);
+				ppk_feed_stat(k, &id);
 				return;
 			}
 #ifdef _WIN32
@@ -4296,7 +4536,7 @@ static void ppk_feed_compiler(PPKey *k, const char *name) {
 			memcpy(buf + dlen + 1 + nlen, ".exe", 5);
 			if (pp_stat_id(buf, &id)) {
 				ppk_feed_str(k, buf);
-				ppk_feed(k, &id, sizeof id);
+				ppk_feed_stat(k, &id);
 				return;
 			}
 #endif
@@ -4332,14 +4572,14 @@ static const char *pp_cache_dir(void) {
 	if (state) return state > 0 ? dir : NULL;
 	state = -1;
 
-	base = getenv("PRISM_PP_CACHE_DIR");
+	base = prism_getenv("PRISM_PP_CACHE_DIR");
 	if (base && *base) {
 		ok = pp_pathf(dir, sizeof dir, "%s", base);
 	} else {
-		xdg = getenv("XDG_CACHE_HOME");
-		home = getenv("HOME");
+		xdg = prism_getenv("XDG_CACHE_HOME");
+		home = prism_getenv("HOME");
 #ifdef _WIN32
-		if (!home || !*home) home = getenv("LOCALAPPDATA");
+		if (!home || !*home) home = prism_getenv("LOCALAPPDATA");
 #endif
 		if (xdg && *xdg)
 			ok = pp_pathf(dir, sizeof dir, "%s/prism-pp", xdg);
@@ -4362,6 +4602,13 @@ static const char *pp_cache_dir(void) {
 		*s = save;
 	}
 	mkdir(dir, 0700);
+	{
+		struct stat st;
+		if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			dir[0] = '\0';
+			return NULL;
+		}
+	}
 	state = 1;
 	return dir;
 }
@@ -4412,17 +4659,78 @@ static size_t pp_marker_path(const char *l, const char *end, char *out, size_t o
 	return (n && out[0] != '<') ? n : 0;
 }
 
-static void pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file) {
-	char abs[PATH_MAX];
+static bool pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file) {
+	char abs[PATH_MAX], cwd[PATH_MAX];
+	/* Relative -I/-include/compiler flags are interpreted from the caller's
+	 * working directory, even when input_file itself is absolute. */
+#ifdef _WIN32
+	if (!_getcwd(cwd, (int)sizeof cwd)) return false;
+#else
+	if (!getcwd(cwd, sizeof cwd)) return false;
+#endif
 	*k = (PPKey){0xcbf29ce484222325ULL, 0x9e3779b97f4a7c15ULL};
 	ppk_feed_str(k, PP_CACHE_MAGIC);
+	ppk_feed_str(k, cwd);
 	for (int i = 0; i < argc; i++) ppk_feed_str(k, argv[i]);
 	ppk_feed_compiler(k, argv[0]);
 	for (size_t i = 0; i < sizeof pp_cache_env_keys / sizeof *pp_cache_env_keys; i++) {
 		ppk_feed_str(k, pp_cache_env_keys[i]);
-		ppk_feed_str(k, getenv(pp_cache_env_keys[i]));
+		ppk_feed_str(k, prism_getenv(pp_cache_env_keys[i]));
 	}
 	if (realpath(input_file, abs)) ppk_feed_str(k, abs);
+	return true;
+}
+
+/* The cache learns dependencies from preprocessor line markers. If a user
+ * suppresses them, caching only the main source would make header changes
+ * invisible, so fail closed for every spelling passed through common drivers. */
+static int dep_flag_kind(const char *a);
+
+static bool pp_argv_disables_cache(char **argv, int argc) {
+	PRISM_STATE();
+	/* A cache hit only reproduces stdout. Dependency-generation flags also
+	 * promise side-effect files, so they must run the compiler every time. */
+	if (_ps->dep_flags_count > 0) return true;
+	const char *dep_out = prism_getenv("DEPENDENCIES_OUTPUT");
+	const char *sun_dep_out = prism_getenv("SUNPRO_DEPENDENCIES");
+	if ((dep_out && *dep_out) || (sun_dep_out && *sun_dep_out)) return true;
+	for (int i = 0; i < argc; i++) {
+		const char *arg = argv[i];
+		if (!arg) continue;
+		if (dep_flag_kind(arg)) return true;
+		if (pp_text_has_time_macro(arg, strlen(arg))) return true;
+		/* Public compiler flags may contain a driver response file. Its contents
+		 * are not represented in argv or in emitted linemarkers. */
+		if (arg[0] == '@') return true;
+		/* GCC specs can inject arbitrary preprocessor options from a mutable
+		 * external file. The driver does not report that file in line markers. */
+		if (!strcmp(arg, "-specs") || !strncmp(arg, "-specs=", 7)) return true;
+		if (!strcmp(arg, "-P") || !strcmp(arg, "/P") || !strcmp(arg, "/p") ||
+		    !strcmp(arg, "/EP") || !strcmp(arg, "/Ep") || !strcmp(arg, "/eP") ||
+		    !strcmp(arg, "/ep"))
+			return true;
+		if (!strcmp(arg, "-Xpreprocessor") && i + 1 < argc && argv[i + 1] &&
+		    !strcmp(argv[i + 1], "-P"))
+			return true;
+		if (strncmp(arg, "-Wp,", 4) == 0) {
+			for (const char *p = arg + 4; *p;) {
+				const char *end = strchr(p, ',');
+				size_t len = end ? (size_t)(end - p) : strlen(p);
+				if (len == 2 && p[0] == '-' && p[1] == 'P') return true;
+				if (!end) break;
+				p = end + 1;
+			}
+		}
+	}
+#ifdef _WIN32
+	/* cl.exe appends these environment options after our explicit argv. */
+	const char *cl = prism_getenv("CL");
+	const char *cl_tail = prism_getenv("_CL_");
+	if ((cl && (strstr(cl, "/P") || pp_text_has_time_macro(cl, strlen(cl)))) ||
+	    (cl_tail && (strstr(cl_tail, "/P") || pp_text_has_time_macro(cl_tail, strlen(cl_tail)))))
+		return true;
+#endif
+	return false;
 }
 
 static bool pp_cache_path(const PPKey *k, char *out, size_t cap) {
@@ -4441,6 +4749,15 @@ static bool pp_replace_file(const char *tmp, const char *dst) {
 #endif
 }
 
+/* One process can compile the same file concurrently through the library. A
+ * pid-only name makes those stores overwrite each other's temporary output. */
+static int pp_cache_open_temp(const char *path, char *tmp, size_t cap) {
+	if (!pp_pathf(tmp, cap, "%s.XXXXXX", path)) return -1;
+	return mkstemp(tmp);
+}
+
+static bool pp_file_is_time_stable(const char *path);
+
 /* Return the cached payload if every recorded dependency is unchanged.
  *
  * All declarations precede the first `goto`: prism rejects a jump that skips an
@@ -4450,17 +4767,25 @@ static char *pp_cache_load(const PPKey *k) {
 	char line[PATH_MAX + 128];
 	char *out = NULL;
 	FILE *f = NULL;
+	PPStat file_id;
 	long ndeps = 0;
-	long long plen = 0;
+	unsigned long long plen = 0, sum_a = 0, sum_b = 0;
+	size_t payload_len = 0;
 	long i = 0;
 
 	if (!pp_cache_path(k, path, sizeof path)) return NULL;
+	if (!pp_stat_id(path, &file_id) || file_id.size < 0) return NULL;
 	f = fopen(path, "rb");
 	if (!f) return NULL;
 
 	if (!fgets(line, sizeof line, f) || strcmp(line, PP_CACHE_MAGIC) != 0) goto done;
 	if (!fgets(line, sizeof line, f) || sscanf(line, "deps %ld", &ndeps) != 1) goto done;
 	if ((ndeps < 0) | (ndeps > 65536)) goto done;
+	/* A selected header alone is not a full model of header-search resolution:
+	 * a new earlier -I candidate or a retargeted symlink can change the next
+	 * preprocess without touching the recorded target. Persist only standalone
+	 * main-source output until cache entries can carry search-path snapshots. */
+	if (ndeps > 1) goto done;
 
 	for (i = 0; i < ndeps; i++) {
 		PPStat rec, now;
@@ -4468,8 +4793,8 @@ static char *pp_cache_load(const PPKey *k) {
 		char *p = NULL;
 		size_t pl = 0;
 		if (!fgets(line, sizeof line, f)) goto done;
-		if ((sscanf(line, "%lld %lld %lld %lld %n", &rec.size, &rec.mtime_sec, &rec.mtime_nsec,
-			    &rec.ctime_sec, &off) < 4) |
+		if ((sscanf(line, "%lld %lld %lld %lld %lld %llu %llu %n", &rec.size, &rec.mtime_sec,
+			    &rec.mtime_nsec, &rec.ctime_sec, &rec.ctime_nsec, &rec.device, &rec.inode, &off) < 7) |
 		    (off <= 0))
 			goto done;
 		p = line + off;
@@ -4477,20 +4802,37 @@ static char *pp_cache_load(const PPKey *k) {
 		while (pl && (p[pl - 1] == '\n' || p[pl - 1] == '\r')) p[--pl] = '\0';
 		if ((pl == 0) | !pp_stat_id(p, &now)) goto done;
 		if ((now.size != rec.size) | (now.mtime_sec != rec.mtime_sec) |
-		    (now.mtime_nsec != rec.mtime_nsec) | (now.ctime_sec != rec.ctime_sec))
+		    (now.mtime_nsec != rec.mtime_nsec) | (now.ctime_sec != rec.ctime_sec) |
+		    (now.ctime_nsec != rec.ctime_nsec) | (now.device != rec.device) |
+		    (now.inode != rec.inode))
 			goto done;
 	}
 
-	if (!fgets(line, sizeof line, f) || sscanf(line, "payload %lld", &plen) != 1) goto done;
-	if (plen < 0) goto done;
-	out = malloc((size_t)plen + 8);
+	if (!fgets(line, sizeof line, f) ||
+	    sscanf(line, "payload %llu %llx %llx", &plen, &sum_a, &sum_b) != 3)
+		goto done;
+	/* Do not allocate from an untrusted length field. Besides preventing
+	 * size_t wraparound, requiring the whole file to be at least this large
+	 * turns truncated/corrupt entries into a cheap cache miss. */
+	if (plen > SIZE_MAX - 8 || plen > (unsigned long long)file_id.size)
+		goto done;
+	payload_len = (size_t)plen;
+	out = malloc(payload_len + 8);
 	if (!out) goto done;
-	if (fread(out, 1, (size_t)plen, f) != (size_t)plen) {
+	if (fread(out, 1, payload_len, f) != payload_len) {
 		free(out);
 		out = NULL;
 		goto done;
 	}
-	memset(out + plen, 0, 8);
+	{
+		PPKey sum = pp_payload_checksum(out, payload_len);
+		if (sum.a != sum_a || sum.b != sum_b || fgetc(f) != EOF || ferror(f)) {
+			free(out);
+			out = NULL;
+			goto done;
+		}
+	}
+	memset(out + payload_len, 0, 8);
 done:
 	fclose(f);
 	return out;
@@ -4508,11 +4850,18 @@ typedef struct {
 } PPEntry;
 
 static long long pp_env_ll(const char *name, long long dflt) {
-	const char *v = getenv(name);
+	const char *v = prism_getenv(name);
+	char *end = NULL;
 	long long r = 0;
 	if (!v || !*v) return dflt;
-	r = strtoll(v, NULL, 10);
-	return r > 0 ? r : dflt;
+	errno = 0;
+	r = strtoll(v, &end, 10);
+	return errno == 0 && end && !*end && r > 0 ? r : dflt;
+}
+
+static long long pp_env_scaled(const char *name, long long dflt, long long scale) {
+	long long value = pp_env_ll(name, dflt);
+	return value > LLONG_MAX / scale ? LLONG_MAX : value * scale;
 }
 
 static int pp_entry_cmp(const void *a, const void *b) {
@@ -4577,8 +4926,8 @@ static void pp_collect_cb(const char *dir, const char *name, void *ud) {
 static void pp_cache_prune(void) {
 	const char *dir = pp_cache_dir();
 	char marker[PATH_MAX], full[PATH_MAX];
-	long long max_bytes = pp_env_ll("PRISM_PP_CACHE_MAX_MB", 1024) * 1024 * 1024;
-	long long max_age = pp_env_ll("PRISM_PP_CACHE_MAX_DAYS", 14) * 24 * 3600;
+	long long max_bytes = pp_env_scaled("PRISM_PP_CACHE_MAX_MB", 1024, 1024 * 1024);
+	long long max_age = pp_env_scaled("PRISM_PP_CACHE_MAX_DAYS", 14, 24 * 3600);
 	long long now = (long long)time(NULL);
 	PPStat mst;
 	PPScan s;
@@ -4606,7 +4955,8 @@ static void pp_cache_prune(void) {
 	if (s.total > max_bytes) {
 		/* Oldest first, down to 80% of the cap so this does not run every hour. */
 		qsort(s.v, (size_t)s.n, sizeof *s.v, pp_entry_cmp);
-		for (i = 0; (i < s.n) & (s.total > max_bytes * 4 / 5); i++) {
+		long long keep_bytes = max_bytes - max_bytes / 5;
+		for (i = 0; (i < s.n) & (s.total > keep_bytes); i++) {
 			if (s.v[i].size < 0) continue;
 			if (!pp_pathf(full, sizeof full, "%s/%s", dir, s.v[i].name)) continue;
 			if (remove(full) == 0) s.total -= s.v[i].size;
@@ -4657,10 +5007,25 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 		if (!nl) break;
 		l = nl + 1;
 	}
+	/* The preprocessor's clock macros are volatile wherever they occur. The
+	 * main source was checked before spawning; check every discovered header
+	 * before publishing an entry as well. */
+	for (i = 0; i < ndeps; i++)
+		if (!pp_file_is_time_stable(deps[i])) goto out;
+	/* See pp_cache_load: header-bearing entries need search-path and link-chain
+	 * identities, not just the file selected for this particular invocation. */
+	if (ndeps != 1) goto out;
 	if (!pp_cache_path(k, path, sizeof path)) goto out;
-	if (!pp_pathf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid())) goto out;
-	f = fopen(tmp, "wb");
-	if (!f) goto out;
+	{
+		int fd = pp_cache_open_temp(path, tmp, sizeof tmp);
+		if (fd < 0) goto out;
+		f = fdopen(fd, "wb");
+		if (!f) {
+			close(fd);
+			remove(tmp);
+			goto out;
+		}
+	}
 	ok = fputs(PP_CACHE_MAGIC, f) >= 0 && fprintf(f, "deps %d\n", ndeps) > 0;
 	for (i = 0; ok && i < ndeps; i++) {
 		PPStat id;
@@ -4675,10 +5040,14 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 			ok = false;
 			break;
 		}
-		ok = fprintf(f, "%lld %lld %lld %lld %s\n", id.size, id.mtime_sec, id.mtime_nsec,
-			     id.ctime_sec, deps[i]) > 0;
+		ok = fprintf(f, "%lld %lld %lld %lld %lld %llu %llu %s\n", id.size, id.mtime_sec,
+			     id.mtime_nsec, id.ctime_sec, id.ctime_nsec, id.device, id.inode, deps[i]) > 0;
 	}
-	if (ok) ok = fprintf(f, "payload %llu\n", (unsigned long long)len) > 0;
+	if (ok) {
+		PPKey sum = pp_payload_checksum(payload, len);
+		ok = fprintf(f, "payload %llu %016llx %016llx\n", (unsigned long long)len,
+			     (unsigned long long)sum.a, (unsigned long long)sum.b) > 0;
+	}
 	if (ok) ok = fwrite(payload, 1, len, f) == len;
 	if (fclose(f) != 0) ok = false;
 	if (!ok || !pp_replace_file(tmp, path)) remove(tmp);
@@ -4689,23 +5058,24 @@ out:
 }
 
 static bool pp_cache_enabled(void) {
-	const char *v = getenv("PRISM_NO_PP_CACHE");
+	const char *v = prism_getenv("PRISM_NO_PP_CACHE");
 	return !(v && *v && strcmp(v, "0") != 0);
 }
 
-/* Conservatively reject volatile time macros before preprocessing. */
-static bool pp_source_is_cacheable(const char *input_file) {
+/* Conservatively reject volatile time macros before or after preprocessing.
+ * A short read is uncertainty, never permission to cache the partial scan. */
+static bool pp_file_is_time_stable(const char *path) {
 	struct stat st;
 	FILE *f = NULL;
 	char *b = NULL;
 	size_t got = 0;
-	bool ok = false;
+	bool complete = false;
 
-	if (stat(input_file, &st) != 0) return false;
+	if (stat(path, &st) != 0) return false;
 	/* Not off_t: that name is POSIX and MSVC only exposes it under
 	 * _CRT_DECLARE_NONSTDC_NAMES. st_size is an integer type on every target. */
 	if ((st.st_size <= 0) | ((long long)st.st_size > (long long)(64 << 20))) return false;
-	f = fopen(input_file, "rb");
+	f = fopen(path, "rb");
 	if (!f) return false;
 	b = malloc((size_t)st.st_size);
 	if (!b) {
@@ -4713,10 +5083,19 @@ static bool pp_source_is_cacheable(const char *input_file) {
 		return false;
 	}
 	got = fread(b, 1, (size_t)st.st_size, f);
-	fclose(f);
-	ok = !pp_text_has_time_macro(b, got);
+	complete = got == (size_t)st.st_size && !ferror(f);
+	if (fclose(f) != 0) complete = false;
+	bool ok = complete && !pp_text_has_time_macro(b, got);
 	free(b);
 	return ok;
+}
+
+/* A custom compiler command can be a wrapper that consults arbitrary state
+ * outside argv, headers, and the process environment. Default drivers remain
+ * cacheable; explicit alternatives fail closed instead of returning stale C. */
+static bool pp_cache_uses_default_compiler(void) {
+	PRISM_STATE();
+	return !_ps->extra_compiler || strcmp(_ps->extra_compiler, PRISM_DEFAULT_CC) == 0;
 }
 
 /* `--prism-cache-clear` / `--prism-cache-info` support. */
@@ -4739,22 +5118,33 @@ static void pp_info_cb(const char *dir, const char *name, void *ud) {
 
 static int pp_cache_clear(void) {
 	long n = 0;
+	const char *dir = pp_cache_dir();
+	if (!dir) {
+		fprintf(stderr, "prism: preprocessor cache is unavailable\n");
+		return 1;
+	}
 	pp_each_entry(pp_clear_cb, &n);
 	printf("prism: cleared %ld cached preprocessor %s from %s\n", n, n == 1 ? "entry" : "entries",
-	       pp_cache_dir());
-	return 0;
+	       dir);
+	return fflush(stdout) == 0 ? 0 : 1;
 }
 
 static int pp_cache_info(void) {
 	PPScan s;
+	const char *dir = pp_cache_dir();
+	if (!dir) {
+		fprintf(stderr, "prism: preprocessor cache is unavailable\n");
+		return 1;
+	}
 	memset(&s, 0, sizeof s);
 	pp_each_entry(pp_info_cb, &s);
-	printf("prism preprocessor cache\n  dir      %s\n  entries  %d\n  size     %.1f MB\n"
-	       "  limits   %lld MB / %lld days  (PRISM_PP_CACHE_MAX_MB, PRISM_PP_CACHE_MAX_DAYS)\n"
-	       "  status   %s\n",
-	       pp_cache_dir(), s.n, s.total / (1024.0 * 1024.0), pp_env_ll("PRISM_PP_CACHE_MAX_MB", 1024),
-	       pp_env_ll("PRISM_PP_CACHE_MAX_DAYS", 14), pp_cache_enabled() ? "enabled" : "disabled (PRISM_NO_PP_CACHE)");
-	return 0;
+	int wrote = printf("prism preprocessor cache\n  dir      %s\n  entries  %d\n  size     %.1f MB\n"
+			   "  limits   %lld MB / %lld days  (PRISM_PP_CACHE_MAX_MB, PRISM_PP_CACHE_MAX_DAYS)\n"
+			   "  status   %s\n",
+			   dir, s.n, s.total / (1024.0 * 1024.0), pp_env_ll("PRISM_PP_CACHE_MAX_MB", 1024),
+			   pp_env_ll("PRISM_PP_CACHE_MAX_DAYS", 14),
+			   pp_cache_enabled() ? "enabled" : "disabled (PRISM_NO_PP_CACHE)");
+	return wrote < 0 || fflush(stdout) != 0 ? 1 : 0;
 }
 
 static char *preprocess_with_cc(const char *input_file) {
@@ -4790,22 +5180,28 @@ static char *preprocess_with_cc(const char *input_file) {
 		return buf;
 	}
 	const char *pp_cc = _ps->extra_compiler ? _ps->extra_compiler : PRISM_DEFAULT_CC;
-	int argcap = 16 + (int)strlen(pp_cc) + _ps->extra_compiler_flags_count + _ps->dep_flags_count +
-		     _ps->extra_include_count * 2 + _ps->extra_define_count * 2 +
-		     _ps->extra_force_include_count * 2;
+	size_t argcap = 16;
+	bool cap_ok = prism_size_add_mul(&argcap, strlen(pp_cc), 1) &&
+		      prism_size_add_mul(&argcap, (size_t)_ps->extra_compiler_flags_count, 1) &&
+		      prism_size_add_mul(&argcap, (size_t)_ps->dep_flags_count, 1) &&
+		      prism_size_add_mul(&argcap, (size_t)_ps->extra_include_count, 2) &&
+		      prism_size_add_mul(&argcap, (size_t)_ps->extra_define_count, 2) &&
+		      prism_size_add_mul(&argcap, (size_t)_ps->extra_force_include_count, 2);
+	if (!cap_ok || argcap > INT_MAX) pparse_error("too many preprocessor arguments");
 	const char **args = alloc_argv(argcap);
 	int argc = 0;
 	char *cc_dup = NULL;
 	build_pp_argv(args, &argc, input_file, &cc_dup);
 	char **argv = (char **)args;
 
-	/* Cache probe. The key covers argv, the compiler binary and the include
-	 * environment; validity is checked against every file the cached output
-	 * was built from. A hit skips the spawn entirely. */
-	PPKey key;
-	bool cacheable = pp_cache_enabled() && pp_source_is_cacheable(input_file);
-	if (cacheable) {
-		pp_cache_key(&key, argv, argc, input_file);
+		/* Cache probe. The key covers argv, compiler, environment, and cwd because
+		 * relative flags are cwd-sensitive; validity is checked against every file
+		 * the cached output was built from. A hit skips the spawn entirely. */
+		PPKey key;
+		bool cacheable = pp_cache_enabled() && pp_file_is_time_stable(input_file) &&
+				 pp_cache_uses_default_compiler() && !pp_argv_disables_cache(argv, argc);
+		if (cacheable && !pp_cache_key(&key, argv, argc, input_file)) cacheable = false;
+		if (cacheable) {
 		char *hit = pp_cache_load(&key);
 		if (hit) {
 			if (prism_profile) fprintf(stderr, "[prism-prof] pp-cache=hit\n");
@@ -4835,7 +5231,8 @@ static char *preprocess_with_cc(const char *input_file) {
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
 	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 	char **env = build_clean_environ();
-	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
+	int err = env ? posix_spawnp(&pid, argv[0], &fa, NULL, argv, env) : ENOMEM;
+	free(env);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pipefd[1]);
 	if (err) {
@@ -4904,7 +5301,8 @@ cleanup:
 		    &fa2, STDOUT_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 		char **env2 = build_clean_environ();
 		pid_t pid2 = 0;
-		int err2 = env2 ? posix_spawnp(&pid2, argv[0], &fa2, NULL, argv, env2) : -1;
+		int err2 = env2 ? posix_spawnp(&pid2, argv[0], &fa2, NULL, argv, env2) : ENOMEM;
+		free(env2);
 		posix_spawn_file_actions_destroy(&fa2);
 		if (err2)
 			fprintf(stderr, "posix_spawnp: %s\n", strerror(err2));
@@ -5287,8 +5685,11 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 	 * GCC push, then closes it with an MSVC pop after the cache is updated. */
 	const char *cc = _ps->extra_compiler ? _ps->extra_compiler : PRISM_DEFAULT_CC;
 	is_msvc_cached = cc_is_msvc(cc);
-	const uint32_t feat = _pc->features;
-	const bool flatten = (feat & PPARSE_F_FLATTEN) != 0;
+	/* A direct-system-header fallback is per translation unit. Keep the caller's
+	 * requested feature set intact for the next source in a multi-source run. */
+	const uint32_t input_feat = _pc->features;
+	uint32_t feat = input_feat;
+	bool flatten = (feat & PPARSE_F_FLATTEN) != 0;
 	const bool has_orelse = (feat & PPARSE_F_ORELSE) != 0;
 	const bool has_defer = (feat & PPARSE_F_DEFER) != 0;
 	const bool quiet = (feat & PPARSE_F_QUIET) != 0;
@@ -5302,7 +5703,19 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 	bool already_has_bchk = pparse_analyze(tok);
 	if (!flatten) {
 		collect_system_includes();
-		emit_system_includes();
+		/* Re-emitting only selected system headers cannot faithfully preserve
+		 * macro state, pragmas, include ordering, or deliberate reinclusion:
+		 * Prism itself also injects preprocessing-only feature macros. When a
+		 * direct system header is present, retain the real preprocessor stream
+		 * rather than silently compiling a different translation unit. */
+		if (_ps->system_include_count > 0) {
+			feat |= PPARSE_F_FLATTEN;
+			_pc->features = feat;
+			flatten = true;
+			emit_system_header_diag_push();
+			out_char('\n');
+		} else
+			emit_system_includes();
 	}
 
 	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __debugbreak +
@@ -5533,6 +5946,7 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 #define pparse_feat(f) (_pc->features & (f))
 
 	bool output_ok = out_close();
+	_pc->features = input_feat;
 	free_source_defines();
 	pparse_tokenizer_teardown(false);
 	return output_ok;
@@ -5582,13 +5996,94 @@ static int transpile_to_fp(char *input_file, FILE *fp) {
 
 static int verify_transpiled_output(char *orig_input, char *out1_path);
 
+/* Reject writing an emitted translation over its input.  stat-based identity
+ * catches aliases and hard links on POSIX; Windows needs file IDs because
+ * normalized spellings alone do not identify hard links. */
+static bool paths_are_same_file(const char *a, const char *b) {
+	if (!a || !b) return false;
+#ifdef _WIN32
+	wchar_t wa[PATH_MAX], wb[PATH_MAX];
+	HANDLE ha = INVALID_HANDLE_VALUE, hb = INVALID_HANDLE_VALUE;
+	BY_HANDLE_FILE_INFORMATION ia, ib;
+	int an = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, a, -1, wa, PATH_MAX);
+	int bn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b, -1, wb, PATH_MAX);
+	if (an > 0 && bn > 0) {
+		ha = CreateFileW(wa, FILE_READ_ATTRIBUTES,
+					 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+					 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+			hb = CreateFileW(wb, FILE_READ_ATTRIBUTES,
+					 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+					 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		if (ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE &&
+		    GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib)) {
+			bool same = ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+				ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+			CloseHandle(ha);
+			CloseHandle(hb);
+			return same;
+		}
+	}
+	if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+	if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+	char ra[PATH_MAX], rb[PATH_MAX];
+	if (!_fullpath(ra, a, sizeof(ra)) || !_fullpath(rb, b, sizeof(rb)))
+		return strcmp(a, b) == 0;
+	for (char *p = ra; *p; p++)
+		if (*p == '/') *p = '\\';
+	for (char *p = rb; *p; p++)
+		if (*p == '/') *p = '\\';
+	return _stricmp(ra, rb) == 0;
+#else
+	struct stat sa, sb;
+	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return strcmp(a, b) == 0;
+	return (sa.st_dev == sb.st_dev) & (sa.st_ino == sb.st_ino);
+#endif
+}
+
+static bool output_path_is_stdout(const char *path) {
+	return path && (!strcmp(path, "-") || !strcmp(path, "/dev/stdout") ||
+				!strcmp(path, "/dev/fd/1"));
+}
+
+static int transpile_to_stdout(char *input_file);
+
 static int transpile(char *input_file, char *output_file) {
-	FILE *fp = fopen(output_file, "w");
-	if (!fp) return 0;
+	if (output_path_is_stdout(output_file)) return transpile_to_stdout(input_file);
+	if (paths_are_same_file(input_file, output_file)) {
+		errno = EINVAL;
+		return 0;
+	}
+	/* Never open the published destination before preprocessing. It may itself
+	 * be an included/forced file, and truncating it would change the input we
+	 * are translating. A sibling temporary also leaves an old output intact on
+	 * preprocess, parse, write, or verification failure. */
+	char temp[PATH_MAX];
+	int fd = make_temp_file_registered(temp, output_file);
+	if (fd < 0) return 0;
+	FILE *fp = fdopen(fd, "w");
+	if (!fp) {
+		close(fd);
+		if (remove(temp) == 0) signal_temps_unregister(temp);
+		return 0;
+	}
 	int ok = transpile_to_fp(input_file, fp);
-	if (ok && prism_verify_mode && !prism_in_verify && strcmp(output_file, "/dev/stdout") != 0)
-		ok = verify_transpiled_output(input_file, output_file);
+	if (ok && prism_verify_mode && !prism_in_verify)
+		ok = verify_transpiled_output(input_file, temp);
+	if (ok) {
+#ifdef _WIN32
+		ok = MoveFileExA(temp, output_file, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+		ok = rename(temp, output_file) == 0;
+#endif
+	}
+	if (ok) signal_temps_unregister(temp);
+	else if (remove(temp) == 0)
+		signal_temps_unregister(temp);
 	return ok;
+}
+
+static bool cli_emit_output_has_one_source(const Cli *cli) {
+	return !cli->output || cli->source_count == 1;
 }
 
 static int transpile_to_stdout(char *input_file) {
@@ -5599,34 +6094,55 @@ static int transpile_to_stdout(char *input_file) {
 	FILE *wfp = fdopen(fd, "w");
 	if (!wfp) {
 		close(fd);
+		if (remove(temp) == 0) signal_temps_unregister(temp);
 		return 0;
 	}
 	if (!transpile_to_fp(input_file, wfp)) {
-		remove(temp);
+		if (remove(temp) == 0) signal_temps_unregister(temp);
 		return 0;
 	}
 	FILE *f = fopen(temp, "r");
+	int ok = f != NULL;
 	if (f) {
 		char buf[4096];
 		size_t n;
-		while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
-		fclose(f);
+		while (ok && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+			if (fwrite(buf, 1, n, stdout) != n) ok = 0;
+		if (ferror(f)) ok = 0;
+		if (fclose(f) != 0) ok = 0;
 	}
-	remove(temp);
-	return 1;
+	if (ok && fflush(stdout) != 0) ok = 0;
+	if (remove(temp) == 0) signal_temps_unregister(temp);
+	return ok;
 #else
-	return transpile(input_file, "/dev/stdout");
+	/* Opening /dev/stdout with "w" asks some libc/devfs combinations to
+	 * truncate the descriptor and can fail outright when stdout is a pipe or
+	 * an already-open temporary file.  Duplicate the caller's descriptor
+	 * instead: transpile_to_fp owns and closes the duplicate, never stdout. */
+	int fd = dup(STDOUT_FILENO);
+	if (fd < 0) return 0;
+	FILE *fp = fdopen(fd, "w");
+	if (!fp) {
+		close(fd);
+		return 0;
+	}
+	return transpile_to_fp(input_file, fp);
 #endif
 }
 
 PRISM_API void prism_free(PrismResult *r) {
+	if (!r) return;
 	free(r->output);
-	free(r->error_msg);
+	if (r->error_msg != prism_oom_error) free(r->error_msg);
 	r->output = r->error_msg = NULL;
+	r->output_len = 0;
 }
 
 PRISM_API void prism_reset(void) {
 	PRISM_STATE();
+	/* reset is a public lifecycle operation, so it must also be safe before
+	 * the first source/file call and after prism_thread_cleanup(). */
+	if (!pparse_ctx) return;
 	pparse_reset();
 	free_source_defines();
 	pparse_tokenizer_teardown(false);
@@ -5647,13 +6163,14 @@ PRISM_API void prism_reset(void) {
 /* A public call must not inherit ownership left by an interrupted predecessor.
  * Normal and longjmp exits clean themselves, but this entry fence also covers
  * soft allocation failures that return before reaching the common teardown. */
-static void prism_library_call_begin(void) {
+static bool prism_library_call_begin(void) {
 	PRISM_STATE();
-	pparse_ctx_init();
+	if (!pparse_ctx_init()) return false;
 	prism_reset();
 	free(_ps->active_membuf);
 	_ps->active_membuf = NULL;
 	_ps->active_memlen = 0;
+	return true;
 }
 
 typedef struct { long orelse, defer; } VerifyKwCounts;
@@ -5769,6 +6286,28 @@ static inline int prism_feature_array_count(const void *items, int count) {
 	return ((items != NULL) & (count > 0)) * count;
 }
 
+/* A public count cannot prove the backing array's true allocation, but an
+ * absurd count is never useful and previously overflowed argv sizing or read
+ * past a caller's small array. Keep ordinary generated build configurations
+ * well within this bound and reject malformed API input before any loop. */
+enum { PRISM_FEATURE_ARRAY_MAX = 4096 };
+
+static bool prism_feature_array_count_is_valid(const void *items, int count) {
+	return !items || count <= PRISM_FEATURE_ARRAY_MAX;
+}
+
+static const char *prism_features_error(PrismFeatures features) {
+	if (!prism_feature_array_count_is_valid(features.include_paths, features.include_count))
+		return "include_count exceeds the Prism API limit";
+	if (!prism_feature_array_count_is_valid(features.defines, features.define_count))
+		return "define_count exceeds the Prism API limit";
+	if (!prism_feature_array_count_is_valid(features.compiler_flags, features.compiler_flags_count))
+		return "compiler_flags_count exceeds the Prism API limit";
+	if (!prism_feature_array_count_is_valid(features.force_includes, features.force_include_count))
+		return "force_include_count exceeds the Prism API limit";
+	return NULL;
+}
+
 static void apply_features(PrismFeatures features) {
 	PRISM_STATE();
 	PPARSE_CTX();
@@ -5804,7 +6343,7 @@ static void error_recovery_result(PrismResult *r) {
 	PPARSE_CTX();
 	_pc->error_jmp_set = false;
 	*r = (PrismResult){.status = PRISM_ERR_SYNTAX,
-			   .error_msg = strdup(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
+			   .error_msg = prism_error_copy(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
 			   .error_line = _pc->error_line};
 	/* fclose publishes the final memstream pointer; it must precede free. */
 	if (out_fp) {
@@ -5828,8 +6367,7 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 	_ps->active_memlen = 0;
 	FILE *fp = open_memstream(&_ps->active_membuf, &_ps->active_memlen);
 	if (!fp) {
-		result.status = PRISM_ERR_IO;
-		result.error_msg = strdup("open_memstream failed");
+		prism_result_io_error(&result, "open_memstream failed");
 		prism_reset();
 		return result;
 	}
@@ -5837,8 +6375,7 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 		free(_ps->active_membuf);
 		_ps->active_membuf = NULL;
 		_ps->active_memlen = 0;
-		result.status = PRISM_ERR_IO;
-		result.error_msg = strdup("output finalization failed");
+		prism_result_io_error(&result, "output finalization failed");
 		prism_reset();
 		return result;
 	}
@@ -5851,10 +6388,22 @@ static PrismResult transpile_to_result(PParseToken *tok) {
 }
 
 static void prism_transpile_file_into(PrismResult *result, const char *input_file, PrismFeatures features) {
-	prism_library_call_begin();
 	if (!input_file) {
-		result->status = PRISM_ERR_IO;
-		result->error_msg = strdup("input_file is NULL");
+		prism_result_io_error(result, "input_file is NULL");
+		return;
+	}
+	const char *input_error = prism_file_input_error(input_file);
+	if (input_error) {
+		prism_result_io_error(result, input_error);
+		return;
+	}
+	const char *feature_error = prism_features_error(features);
+	if (feature_error) {
+		prism_result_io_error(result, feature_error);
+		return;
+	}
+	if (!prism_library_call_begin()) {
+		prism_result_io_error(result, "Out of memory initializing Prism");
 		return;
 	}
 
@@ -5872,8 +6421,7 @@ static void prism_transpile_file_into(PrismResult *result, const char *input_fil
 	PParseToken *tok;
 	char *pp_buf = preprocess_with_cc((char *)input_file);
 	if (!pp_buf) {
-		result->status = PRISM_ERR_IO;
-		result->error_msg = strdup("Preprocessing failed");
+		prism_result_io_error(result, "Preprocessing failed");
 		goto cleanup;
 	}
 
@@ -5890,6 +6438,7 @@ cleanup:
 #ifdef PRISM_LIB_MODE
 	_pc->error_jmp_set = false;
 #endif
+	prism_reset();
 }
 
 PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features) {
@@ -5901,13 +6450,20 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 #ifdef PRISM_LIB_MODE
 static void prism_transpile_source_into(PrismResult *result, const char *source, const char *filename,
 				       PrismFeatures features) {
-	prism_library_call_begin();
-	PPARSE_CTX();
 	if (!source) {
-		result->status = PRISM_ERR_IO;
-		result->error_msg = strdup("source is NULL");
+		prism_result_io_error(result, "source is NULL");
 		return;
 	}
+	const char *feature_error = prism_features_error(features);
+	if (feature_error) {
+		prism_result_io_error(result, feature_error);
+		return;
+	}
+	if (!prism_library_call_begin()) {
+		prism_result_io_error(result, "Out of memory initializing Prism");
+		return;
+	}
+	PPARSE_CTX();
 
 	const char *fname = filename ? filename : "<source>";
 	error_recovery_init();
@@ -5922,8 +6478,7 @@ static void prism_transpile_source_into(PrismResult *result, const char *source,
 	size_t src_len = strlen(source);
 	buf = malloc(src_len + 8);
 	if (!buf) {
-		result->status = PRISM_ERR_IO;
-		result->error_msg = strdup("Out of memory");
+		prism_result_io_error(result, "Out of memory");
 		goto src_cleanup;
 	}
 	memcpy(buf, source, src_len);
@@ -5938,6 +6493,7 @@ static void prism_transpile_source_into(PrismResult *result, const char *source,
 
 src_cleanup:
 	_pc->error_jmp_set = false;
+	prism_reset();
 }
 
 PRISM_API
@@ -5966,8 +6522,7 @@ static bool has_any_ext(const char *path, const char *const *exts, size_t count)
 }
 
 static bool is_c_input_ext(const char *path) {
-	static const char *const exts[] = {".c", ".i"};
-	return has_any_ext(path, exts, sizeof(exts) / sizeof(*exts));
+	return input_is_dot_c(path) || input_is_dot_i(path);
 }
 
 #ifndef PRISM_LIB_MODE
@@ -6032,7 +6587,45 @@ static bool str_contains_any(const char *s, const char *const *needles, size_t c
 	return false;
 }
 
+static unsigned char msvc_ascii_lower(char c) {
+	unsigned char u = (unsigned char)c;
+	return u >= 'A' && u <= 'Z' ? (unsigned char)(u + ('a' - 'A')) : u;
+}
+
+/* Exact MSVC options whose following argv item is an operand. Attached forms
+ * (for example /Ipath and /FIfile) stay one argument. Keeping this shared
+ * with build_pp_argv prevents an operand such as force.c from being mistaken
+ * for a second translation unit or dropped from cl's preprocessing command. */
+static bool msvc_flag_takes_arg(const char *a) {
+	if (!a || (a[0] != '/' && a[0] != '-')) return false;
+	if (!a[1]) return false;
+	unsigned char one = msvc_ascii_lower(a[1]);
+	if (!a[2]) return one == 'd' || one == 'u' || one == 'i';
+	unsigned char two = msvc_ascii_lower(a[2]);
+	if (a[3]) return false;
+	if (one == 'f') return two == 'i' || two == 'p' || two == 'd' || two == 'a' || two == 'r' || two == 'u';
+	if (one == 'y') return two == 'c' || two == 'u';
+	if (one == 't') return two == 'c' || two == 'p';
+	return false;
+}
+
+/* /Fe and /Fo accept /Fex, /Fe:x, /Fe: x, and their dash spellings. */
+static int msvc_output_flag_kind(const char *a) {
+	if (!a || (a[0] != '/' && a[0] != '-')) return 0;
+	/* On POSIX, `-f…` is the GNU compiler namespace.  Accept the documented
+	 * dash spelling only as `-Fe`/`-Fo` with an uppercase F, so flags such as
+	 * `-fexceptions` never turn into a fictitious MSVC output path. Windows
+	 * keeps its normal case-insensitive spelling rules. */
+#ifndef _WIN32
+	if (a[0] == '-' && a[1] != 'F') return 0;
+#endif
+	if (!a[1] || msvc_ascii_lower(a[1]) != 'f' || !a[2]) return 0;
+	unsigned char kind = msvc_ascii_lower(a[2]);
+	return kind == 'e' ? 1 : kind == 'o' ? 2 : 0;
+}
+
 static bool cc_flag_takes_arg_nonnull(const char *a) {
+	if (msvc_flag_takes_arg(a)) return true;
 	if (a[0] != '-' || !a[1]) return false;
 	if (!a[2]) return strchr("cESvwsgHPprChQOWMd", a[1]) == NULL;
 	return str_in_list(a,
@@ -6046,6 +6639,10 @@ static __attribute__((noinline)) bool cc_flag_takes_arg(const char *a) {
 }
 
 static int dep_flag_kind(const char *a) {
+	/* This helper is also used by the cache scanner, which sees every compiler
+	 * argv entry, including valid empty arguments produced by quoted response
+	 * files. Keep its old option-only callers safe without reading past "". */
+	if (!a || a[0] != '-' || !a[1]) return 0;
 	if (a[1] == 'M') {
 		static const char *const generate[] = {"-MD", "-MMD", "-MP"};
 		static const char *const target[] = {"-MF", "-MT", "-MQ"};
@@ -6076,174 +6673,331 @@ static bool rsp_push_dup(char ***out, int *count, int *cap, char ***owned, int *
 	return true;
 }
 
-static int rsp_expand_file(const char *path,
-			   char ***out,
-			   int *count,
-			   int *cap,
-			   char ***owned,
-			   int *owned_count,
-			   int *owned_cap,
-			   int depth);
+static bool rsp_token_append(char **buf, size_t *len, size_t *cap, char c) {
+	if (*len + 1 >= *cap) {
+		if (*cap > SIZE_MAX / 2) return false;
+		size_t new_cap = *cap * 2;
+		char *grown = realloc(*buf, new_cap);
+		if (!grown) return false;
+		*buf = grown;
+		*cap = new_cap;
+	}
+	(*buf)[(*len)++] = c;
+	return true;
+}
 
 static int rsp_tokenize_buf(const char *text,
+			    size_t text_len,
 			    char ***out,
 			    int *count,
 			    int *cap,
 			    char ***owned,
 			    int *owned_count,
-			    int *owned_cap,
-			    int depth) {
+			    int *owned_cap) {
 	const char *p = text;
+	/* UTF-8 BOMs are common in response files written by Windows editors and
+	 * are ignored by GCC/Clang's response-file readers. */
+	if (text_len >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb &&
+	    (unsigned char)p[2] == 0xbf)
+		p += 3;
 	while (*p) {
 		while (ascii_space(*p)) p++;
 		if (!*p) break;
 		size_t n = 0, tcap = 64;
 		char *tokbuf = malloc(tcap);
 		if (!tokbuf) return -1;
+		/* Keep declarations before the OOM jumps below.  Prism deliberately
+		 * rejects jumps that enter a declaration scope, even when plain C would
+		 * allow a scalar initializer to be skipped. */
+		bool ok;
 		/* libiberty buildargv semantics: backslash escapes the next char in
 		 * every state; single/double quotes toggle anywhere in the token
 		 * (`-DMSG="a b"` is ONE arg); a trailing lone backslash is dropped.
-		 * On Windows a backslash is a PATH SEPARATOR, not an escape — only a
-		 * backslash immediately before `"` is special (MS convention), so
-		 * paths like C:\dir\app survive verbatim in a response file. */
+		 * Windows uses its command-line backslash-run rule instead: path
+		 * separators stay literal, and N backslashes before `"` produce N/2
+		 * slashes plus a literal quote for odd N or a quote toggle for even N. */
+#ifdef _WIN32
+		bool dquote = false;
+		while (*p) {
+			if (!dquote && ascii_space(*p)) break;
+			if (*p == '\\') {
+				size_t slashes = 0;
+				do {
+					slashes++;
+					p++;
+				} while (*p == '\\');
+				if (*p == '"') {
+					for (size_t i = 0; i < slashes / 2; i++)
+						if (!rsp_token_append(&tokbuf, &n, &tcap, '\\')) goto token_oom;
+					if (slashes & 1) {
+						if (!rsp_token_append(&tokbuf, &n, &tcap, '"')) goto token_oom;
+					} else
+						dquote = !dquote;
+					p++;
+					continue;
+				}
+				for (size_t i = 0; i < slashes; i++)
+					if (!rsp_token_append(&tokbuf, &n, &tcap, '\\')) goto token_oom;
+				continue;
+			}
+			if (*p == '"') {
+				if (dquote && p[1] == '"') {
+					if (!rsp_token_append(&tokbuf, &n, &tcap, '"')) goto token_oom;
+					p += 2;
+				} else {
+					dquote = !dquote;
+					p++;
+				}
+				continue;
+			}
+			if (!rsp_token_append(&tokbuf, &n, &tcap, *p++)) goto token_oom;
+		}
+#else
 		bool squote = false, dquote = false, bsquote = false;
 		while (*p) {
 			char c = *p;
-			if (!bsquote & !squote & !dquote & ascii_space(c))
+			bool quoted = dquote;
+			quoted |= squote;
+			if (!bsquote & !quoted & ascii_space(c))
 				break;
 			bool emit = false;
 			bool is_escape = c == '\\';
-#ifdef _WIN32
-			is_escape &= p[1] == '"';
-#endif
 			if (bsquote) {
 				bsquote = false;
 				emit = true;
 			} else if (is_escape) {
 				bsquote = true;
-			} else if (squote) {
+			}
+			else if (squote) {
 				if (c == '\'') squote = false;
 				else
 					emit = true;
-			} else if (dquote) {
+			}
+			else if (dquote) {
 				if (c == '"') dquote = false;
 				else
 					emit = true;
-			} else if (c == '\'') {
+			}
+			else if (c == '\'') {
 				squote = true;
-			} else if (c == '"') {
+			}
+			else if (c == '"') {
 				dquote = true;
 			} else {
 				emit = true;
 			}
 			if (emit) {
-				if (n + 1 >= tcap) {
-					tcap *= 2;
-					char *nt = realloc(tokbuf, tcap);
-					if (!nt) {
-						free(tokbuf);
-						return -1;
-					}
-					tokbuf = nt;
-				}
-				tokbuf[n++] = c;
+				if (!rsp_token_append(&tokbuf, &n, &tcap, c)) goto token_oom;
 			}
 			p++;
 		}
+#endif
 		tokbuf[n] = '\0';
-		if (tokbuf[0] == '@' && tokbuf[1]) {
-			int nested_rc = rsp_expand_file(
-			    tokbuf + 1, out, count, cap, owned, owned_count, owned_cap, depth + 1);
-			/* Unreadable nested @file: GCC keeps the arg literally. */
-			if (nested_rc > 0)
-				nested_rc =
-				    rsp_push_dup(out, count, cap, owned, owned_count, owned_cap, tokbuf)
-					? 0
-					: -1;
-			free(tokbuf);
-			if (nested_rc < 0) return -1;
-		} else {
-			bool ok = rsp_push_dup(out, count, cap, owned, owned_count, owned_cap, tokbuf);
-			free(tokbuf);
-			if (!ok) return -1;
-		}
+		ok = rsp_push_dup(out, count, cap, owned, owned_count, owned_cap, tokbuf);
+		free(tokbuf);
+		if (!ok) return -1;
+		continue;
+	token_oom:
+		free(tokbuf);
+		return -1;
 	}
 	return 0;
 }
 
-static int rsp_expand_file(const char *path,
-			   char ***out,
-			   int *count,
-			   int *cap,
-			   char ***owned,
-			   int *owned_count,
-			   int *owned_cap,
-			   int depth) {
-	if (depth > RSP_MAX_DEPTH) {
-		fprintf(stderr, "pparse_error: response file nesting too deep: %s\n", path);
-		return -1;
+#ifdef _WIN32
+/* cl.exe accepts UTF-16 response files. Decode a BOM-marked file before the
+ * byte-oriented tokenizer so its interleaved NULs cannot truncate argv. */
+static bool rsp_decode_utf16_bom(char **bufp, size_t *lenp) {
+	unsigned char *bytes = (unsigned char *)*bufp;
+	size_t len = *lenp;
+	if (len < 2 || !((bytes[0] == 0xff && bytes[1] == 0xfe) ||
+			 (bytes[0] == 0xfe && bytes[1] == 0xff)))
+		return true;
+	bool little_endian = bytes[0] == 0xff;
+	size_t payload = len - 2;
+	if ((payload & 1) || payload / 2 > INT_MAX ||
+	    payload / 2 > (SIZE_MAX / sizeof(wchar_t)) - 1)
+		return false;
+	int units = (int)(payload / 2);
+	wchar_t *wide = malloc(((size_t)units + 1) * sizeof(*wide));
+	if (!wide) return false;
+	for (int i = 0; i < units; i++) {
+		unsigned char lo = bytes[2 + (size_t)i * 2];
+		unsigned char hi = bytes[3 + (size_t)i * 2];
+		wide[i] = (wchar_t)(little_endian ? ((unsigned)lo | ((unsigned)hi << 8))
+						 : ((unsigned)hi | ((unsigned)lo << 8)));
 	}
+	wide[units] = L'\0';
+	int out_len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, units, NULL, 0, NULL, NULL);
+	if (out_len < 0 || (out_len == 0 && units != 0)) {
+		free(wide);
+		return false;
+	}
+	char *utf8 = malloc((size_t)out_len + 1);
+	if (!utf8) {
+		free(wide);
+		return false;
+	}
+	if (out_len && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, units, utf8, out_len,
+					      NULL, NULL) != out_len) {
+		free(wide);
+		free(utf8);
+		return false;
+	}
+	free(wide);
+	utf8[out_len] = '\0';
+	free(*bufp);
+	*bufp = utf8;
+	*lenp = (size_t)out_len;
+	return true;
+}
+#endif
+
+/* Tokenize one response file, leaving nested @file handling to cli_parse so
+ * mode transitions (`check`) and `--` can stop expansion at the right point.
+ * Read incrementally: GCC accepts a response file supplied through a FIFO or
+ * /dev/fd/N, neither of which has a meaningful seekable size. */
+static int rsp_read_file(const char *path,
+			 char ***out,
+			 int *count,
+			 int *cap,
+			 char ***owned,
+			 int *owned_count,
+			 int *owned_cap) {
 	/* GCC: an @file that does not exist or cannot be read is treated
 	 * literally, not removed — return 1 so the caller keeps the raw arg. */
 	FILE *f = fopen(path, "rb");
 	if (!f) return 1;
-	if (fseek(f, 0, SEEK_END) != 0) {
-		fclose(f);
+	char *buf = NULL;
+	size_t len = 0, buf_cap = 0;
+	for (;;) {
+		int ch = fgetc(f);
+		if (ch == EOF) break;
+		if (len == buf_cap) {
+			if (buf_cap > (SIZE_MAX - 1) / 2) {
+				free(buf);
+				fclose(f);
+				return -1;
+			}
+			size_t new_cap = buf_cap ? buf_cap * 2 : 4096;
+			char *grown = realloc(buf, new_cap + 1);
+			if (!grown) {
+				free(buf);
+				fclose(f);
+				return -1;
+			}
+			buf = grown;
+			buf_cap = new_cap;
+		}
+		buf[len++] = (char)ch;
+	}
+	/* A read/close error must not turn a truncated argument list into a command.
+	 * Retain the raw @path, just as we do for an unreadable response file. */
+	bool read_error = ferror(f);
+	int close_status = fclose(f);
+	if (read_error || close_status != 0) {
+		free(buf);
 		return 1;
 	}
-	long sz = ftell(f);
-	if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
-		fclose(f);
-		return 1;
-	}
-	char *buf = malloc((size_t)sz + 1);
-	if (!buf) {
-		fclose(f);
+	if (buf) buf[len] = '\0';
+#ifdef _WIN32
+	if (!rsp_decode_utf16_bom(&buf, &len)) {
+		free(buf);
 		return -1;
 	}
-	size_t got = fread(buf, 1, (size_t)sz, f);
-	fclose(f);
-	buf[got] = '\0';
-	int rc = rsp_tokenize_buf(buf, out, count, cap, owned, owned_count, owned_cap, depth);
+#endif
+	int rc = rsp_tokenize_buf(buf ? buf : "", len, out, count, cap, owned, owned_count, owned_cap);
 	free(buf);
 	return rc;
 }
 
-/* Expand @file args into a flat argv. Caller owns *owned_out (each string + array).
- * *out_argv holds pointers into *owned_out (and must not outlive it). */
-static char **cli_expand_response_files(int argc,
-					char **argv,
-					int *out_argc,
-					char ***owned_out,
-					int *owned_count_out) {
-	char **out = NULL;
-	char **owned = NULL;
-	int count = 0, cap = 0, owned_count = 0, owned_cap = 0;
-	for (int i = 0; i < argc; i++) {
-		const char *a = argv[i];
-		if (a[0] == '@' && a[1] && i > 0) {
-			int rc = rsp_expand_file(a + 1, &out, &count, &cap, &owned, &owned_count, &owned_cap, 0);
-			/* rc > 0: unreadable @file — GCC keeps the arg literally. */
-			if (rc > 0)
-				rc = rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a) ? 0
-											    : -1;
-			if (rc < 0) goto fail;
-		} else if (!rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a)) {
-			goto fail;
+static bool cli_rsp_splice(char ***argvp, int **depthp, int *argc, int *cap,
+			   int at, char **items, int item_count, int item_depth) {
+	int old_count = *argc;
+	if (old_count <= 0 || at < 0 || at >= old_count) return false;
+	if (item_count < 0 || item_count > INT_MAX - (old_count - 1)) return false;
+	int new_count = old_count - 1 + item_count;
+	if (new_count < 0) return false;
+	if (new_count + 1 > *cap) {
+		size_t grown = pparse_vec_grow_cap((size_t)*cap, (size_t)new_count + 1, 16);
+		if (grown > INT_MAX || grown > SIZE_MAX / sizeof(**argvp) ||
+		    grown > SIZE_MAX / sizeof(**depthp))
+			return false;
+		char **new_argv = malloc(grown * sizeof(*new_argv));
+		int *new_depth = malloc(grown * sizeof(*new_depth));
+		if (!new_argv || !new_depth) {
+			free(new_argv);
+			free(new_depth);
+			return false;
 		}
+		memcpy(new_argv, *argvp, (size_t)old_count * sizeof(*new_argv));
+		memcpy(new_depth, *depthp, (size_t)old_count * sizeof(*new_depth));
+		free(*argvp);
+		free(*depthp);
+		*argvp = new_argv;
+		*depthp = new_depth;
+		*cap = (int)grown;
 	}
-	pparse_VEC_ENSURE_REALLOC(out, count + 1, cap, 16);
-	out[count] = NULL;
-	*out_argc = count;
-	*owned_out = owned;
-	*owned_count_out = owned_count;
-	return out;
+	int tail = old_count - at - 1;
+	memmove(*argvp + at + item_count, *argvp + at + 1, (size_t)tail * sizeof(**argvp));
+	memmove(*depthp + at + item_count, *depthp + at + 1, (size_t)tail * sizeof(**depthp));
+	if (item_count) {
+		memcpy(*argvp + at, items, (size_t)item_count * sizeof(**argvp));
+		for (int i = 0; i < item_count; i++) (*depthp)[at + i] = item_depth;
+	}
+	*argc = new_count;
+	return true;
+}
 
-fail:
-	for (int j = 0; j < owned_count; j++) free(owned[j]);
-	free(owned);
-	free(out);
-	return NULL;
+/* Expand one queued response token. This deliberately happens while parsing,
+ * rather than before it: `check` owns its arguments and `--` owns everything
+ * after it, so an @file in either region must remain literal. Return one when
+ * a readable response file was spliced, zero when `arg` is ordinary/literal,
+ * and minus one on an allocation or nesting failure. */
+static int cli_rsp_expand_at(char ***argvp,
+			     int **depthp,
+			     int *argc,
+			     int *cap,
+			     int at,
+			     char ***owned,
+			     int *owned_count,
+			     int *owned_cap) {
+	char *a = (*argvp)[at];
+	if (a[0] != '@' || !a[1]) return 0;
+	if ((*depthp)[at] > RSP_MAX_DEPTH) {
+		fprintf(stderr, "pparse_error: response file nesting too deep: %s\n", a + 1);
+		return -1;
+	}
+	int item_depth = (*depthp)[at] + 1;
+	char **items = NULL;
+	int item_count = 0, item_cap = 0;
+	int rc = rsp_read_file(a + 1, &items, &item_count, &item_cap, owned, owned_count, owned_cap);
+	if (rc < 0 ||
+	    (rc == 0 && !cli_rsp_splice(argvp, depthp, argc, cap, at, items, item_count, item_depth))) {
+		free(items);
+		fprintf(stderr, "pparse_error: failed to expand response files\n");
+		return -1;
+	}
+	free(items);
+	return rc == 0;
+}
+
+/* A response file used as an option operand is expanded before that operand
+ * is consumed, matching GCC's stream expansion. Empty and nested response
+ * files are collapsed until a literal token (or end of stream) remains. */
+static int cli_rsp_expand_following(char ***argvp,
+				    int **depthp,
+				    int *argc,
+				    int *cap,
+				    int at,
+				    char ***owned,
+				    int *owned_count,
+				    int *owned_cap) {
+	while (at < *argc) {
+		int rc = cli_rsp_expand_at(argvp, depthp, argc, cap, at, owned, owned_count, owned_cap);
+		if (rc <= 0) return rc;
+	}
+	return 0;
 }
 
 static bool prism_handles_x_lang(const char *lang) {
@@ -6312,18 +7066,22 @@ static inline bool cli_short_flag(const char *arg, char flag) {
 static Cli cli_parse(int argc, char **argv) {
 	Cli cli = {.features = prism_defaults(), .source_x_arg_idx = -1};
 	char **owned = NULL;
-	int owned_count = 0;
-	int eargc = 0;
-	char **eargv = cli_expand_response_files(argc, argv, &eargc, &owned, &owned_count);
-	if (!eargv) {
-		fprintf(stderr, "pparse_error: failed to expand response files\n");
+	int owned_count = 0, owned_cap = 0;
+	if (argc < 0 || argc > INT_MAX - 16) {
+		fprintf(stderr, "pparse_error: too many command-line arguments\n");
 		exit(1);
 	}
-	cli.rsp_owned = owned;
-	cli.rsp_owned_count = owned_count;
-	cli.rsp_argv = eargv;
-	argc = eargc;
-	argv = eargv;
+	int argv_cap = argc + 16;
+	char **queued_argv = calloc((size_t)argv_cap, sizeof(*queued_argv));
+	int *queued_depth = calloc((size_t)argv_cap, sizeof(*queued_depth));
+	if (!queued_argv || !queued_depth) {
+		free(queued_argv);
+		free(queued_depth);
+		fprintf(stderr, "pparse_error: failed to initialize response-file queue\n");
+		exit(1);
+	}
+	for (int i = 0; i < argc; i++) queued_argv[i] = argv[i];
+	argv = queued_argv;
 	/* GCC: `-x LANG` applies to subsequent inputs until the next `-x`. */
 	const char *cur_x_lang = NULL;
 	int last_x_arg_idx = -1;
@@ -6349,6 +7107,68 @@ static Cli cli_parse(int argc, char **argv) {
 				CLI_PUSH(cli.prog_args, cli.prog_arg_count, cli.prog_arg_cap, argv[j]);
 			break;
 		}
+		/* Expand only while Prism owns the argument stream. In particular,
+		 * check-tool arguments and everything after -- stay byte-for-byte
+		 * literal, including nested response files that introduce either mode. */
+		int rsp = cli_rsp_expand_at(&argv, &queued_depth, &argc, &argv_cap, i, &owned,
+					    &owned_count, &owned_cap);
+		if (rsp < 0) goto rsp_fail;
+		if (rsp > 0) {
+			i--;
+			continue;
+		}
+		/* A lone dash is a source on every supported host, including when the
+		 * backend is cl.exe. Handle it before Windows' slash-option split. */
+		if (!strcmp(a, "-")) {
+			cli_add_source(&cli, a, cur_x_lang, last_x_arg_idx);
+			continue;
+		}
+		/* MSVC output switches have two independent meanings: /Fe selects the
+		 * linked executable and /Fo selects an object file. Do not forward them
+		 * directly because Prism replaces the source with a temporary. */
+		int msvc_output_kind = msvc_output_flag_kind(a);
+		if (msvc_output_kind) {
+			const char *output = NULL;
+			if (a[3] == ':') {
+				if (a[4]) output = a + 4;
+			} else if (a[3]) {
+				output = a + 3;
+			}
+			if (!output && i + 1 < argc) {
+				int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc, &argv_cap,
+								      i + 1, &owned, &owned_count, &owned_cap);
+				if (rr < 0) goto rsp_fail;
+				if (i + 1 < argc) output = argv[++i];
+			}
+			if (output) {
+				if (msvc_output_kind == 1) cli.msvc_exe_output = output;
+				else
+					cli.msvc_obj_output = output;
+				continue;
+			}
+		}
+		if (a[0] == '/' && !a[2] && msvc_ascii_lower(a[1]) == 'c') {
+			cli.compile_only = true;
+			continue;
+		}
+		if (a[0] == '/' &&
+		    ((!a[2] && msvc_ascii_lower(a[1]) == 'e') ||
+		     (msvc_ascii_lower(a[1]) == 'e' && msvc_ascii_lower(a[2]) == 'p' && !a[3]) ||
+		     (!a[2] && msvc_ascii_lower(a[1]) == 'p'))) {
+			cli.passthrough = true;
+			continue;
+		}
+		if (msvc_flag_takes_arg(a)) {
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			if (i + 1 < argc) {
+				int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc, &argv_cap,
+								      i + 1, &owned, &owned_count, &owned_cap);
+				if (rr < 0) goto rsp_fail;
+				if (i + 1 < argc)
+					CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
+			}
+			continue;
+		}
 
 #ifdef _WIN32
 		if (a[0] != '-' && a[0] != '/') {
@@ -6356,29 +7176,6 @@ static Cli cli_parse(int argc, char **argv) {
 		if (a[0] != '-' || !a[1]) {
 #endif
 			if (cli_apply_mode_word(&cli, a)) continue;
-			/* GCC/Clang: lone `-` means read the TU from stdin. */
-			if (!strcmp(a, "-")) {
-				cli_add_source(&cli, a, cur_x_lang, last_x_arg_idx);
-				continue;
-			}
-			/* MSVC-style /c /Fe /Fo — honor on all hosts so they are
-			 * not mistaken for input paths (`cc -E /c` → no such file). */
-			if (a[0] == '/') {
-				if (strcmp(a, "/c") == 0) {
-					cli.compile_only = true;
-					continue;
-				}
-				if (a[1] == 'F' && ((a[2] == 'e') | (a[2] == 'o'))) {
-					const char *output = a[3] == ':' ? a + 4
-							   : a[3] ? a + 3
-								  : (i + 1 < argc ? argv[++i] : NULL);
-					if (output) {
-						cli.output = output;
-						cli.compile_only |= a[2] == 'o';
-						continue;
-					}
-				}
-			}
 			/* `.c`/`.i`, or extensionless under `-x c` / `cpp-output`. */
 			if (!cli.passthrough &&
 			    (is_c_input_ext(a) || prism_handles_x_lang(cur_x_lang))) {
@@ -6398,18 +7195,24 @@ static Cli cli_parse(int argc, char **argv) {
 #endif
 
 		if (a[1] == 'o') {
-			cli.output = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : NULL);
+			if (a[2]) cli.output = a + 2;
+			else if (i + 1 < argc) {
+				int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc, &argv_cap,
+								      i + 1, &owned, &owned_count, &owned_cap);
+				if (rr < 0) goto rsp_fail;
+				if (i + 1 < argc) cli.output = argv[++i];
+			}
 			continue;
 		}
 
 		if (a[1] == '-') {
 			if (!strcmp(a, "--help")) {
 				cli.action = CLI_ACT_HELP;
-				return cli;
+				goto rsp_done;
 			}
 			if (!strcmp(a, "--version")) {
 				cli.action = CLI_ACT_VERSION;
-				return cli;
+				goto rsp_done;
 			}
 			if (str_startswith(a, "--prism-cc=")) {
 				cli.cc = a + 11;
@@ -6442,7 +7245,7 @@ static Cli cli_parse(int argc, char **argv) {
 			}
 		} else if (cli_short_flag(a, 'h')) {
 			cli.action = CLI_ACT_HELP;
-			return cli;
+			goto rsp_done;
 		} else if (cli_short_flag(a, 'c')) {
 			cli.compile_only = true;
 		} else if (cli_short_flag(a, 'S')) {
@@ -6467,14 +7270,24 @@ static Cli cli_parse(int argc, char **argv) {
 			int dk = dep_flag_kind(a);
 			if (dk) {
 				CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
-				if (dk == 2 && i + 1 < argc)
-					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
+				if (dk == 2 && i + 1 < argc) {
+					int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc,
+									      &argv_cap, i + 1, &owned, &owned_count,
+									      &owned_cap);
+					if (rr < 0) goto rsp_fail;
+					if (i + 1 < argc)
+						CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
+				}
 				continue;
 			}
 		}
 
 		/* Track `-x LANG` / `-xLANG` for source classification + pipe lang. */
 		if (!strcmp(a, "-x") && i + 1 < argc) {
+			int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc, &argv_cap,
+							      i + 1, &owned, &owned_count, &owned_cap);
+			if (rr < 0) goto rsp_fail;
+			if (i + 1 >= argc) continue;
 			last_x_arg_idx = cli.cc_arg_count;
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
@@ -6494,12 +7307,34 @@ static Cli cli_parse(int argc, char **argv) {
 		}
 
 		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-		if (i + 1 < argc && cc_flag_takes_arg_nonnull(a))
-			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
+		if (i + 1 < argc && cc_flag_takes_arg_nonnull(a)) {
+			int rr = cli_rsp_expand_following(&argv, &queued_depth, &argc, &argv_cap,
+							      i + 1, &owned, &owned_count, &owned_cap);
+			if (rr < 0) goto rsp_fail;
+			if (i + 1 < argc)
+				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
+		}
 	}
 
-	/* eargv / rsp_owned stay owned by Cli until cli_free — do not free here. */
+rsp_done:
+	/* The response-file tokens and expanded argv array stay owned by Cli until
+	 * cli_free. `queued_depth` is parser-only bookkeeping. */
+	if (cli.compile_only && cli.msvc_obj_output)
+		cli.output = cli.msvc_obj_output;
+	else if (cli.msvc_exe_output)
+		cli.output = cli.msvc_exe_output;
+	cli.rsp_owned = owned;
+	cli.rsp_owned_count = owned_count;
+	cli.rsp_argv = argv;
+	free(queued_depth);
 	return cli;
+
+rsp_fail:
+	for (int i = 0; i < owned_count; i++) free(owned[i]);
+	free(owned);
+	free(argv);
+	free(queued_depth);
+	exit(1);
 }
 
 static void cli_free(Cli *cli) {
@@ -6555,7 +7390,8 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		posix_spawn_file_actions_addclose(&vfa, in_fd);
 		char **venv = build_clean_environ();
 		pid_t vpid;
-		int verr = posix_spawnp(&vpid, compile_argv[0], &vfa, NULL, compile_argv, venv);
+		int verr = venv ? posix_spawnp(&vpid, compile_argv[0], &vfa, NULL, compile_argv, venv) : ENOMEM;
+		free(venv);
 		posix_spawn_file_actions_destroy(&vfa);
 		close(in_fd);
 		if (verr) {
@@ -6586,7 +7422,8 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	posix_spawn_file_actions_addclose(&fa, pipefd[0]);
 	char **env = build_clean_environ();
 	pid_t pid;
-	int err = posix_spawnp(&pid, compile_argv[0], &fa, NULL, compile_argv, env);
+	int err = env ? posix_spawnp(&pid, compile_argv[0], &fa, NULL, compile_argv, env) : ENOMEM;
+	free(env);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pipefd[0]);
 	if (err) {
@@ -6767,24 +7604,6 @@ static void check_path_shadow(const char *install_path) {
 			install_path,
 			first_hit);
 	}
-}
-
-/* Compare path identity, including hard links. */
-static bool paths_are_same_file(const char *a, const char *b) {
-#ifdef _WIN32
-	char ra[PATH_MAX], rb[PATH_MAX];
-	if (!_fullpath(ra, a, sizeof(ra)) || !_fullpath(rb, b, sizeof(rb)))
-		return strcmp(a, b) == 0;
-	for (char *p = ra; *p; p++)
-		if (*p == '/') *p = '\\';
-	for (char *p = rb; *p; p++)
-		if (*p == '/') *p = '\\';
-	return _stricmp(ra, rb) == 0;
-#else
-	struct stat sa, sb;
-	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return strcmp(a, b) == 0;
-	return (sa.st_dev == sb.st_dev) & (sa.st_ino == sb.st_ino);
-#endif
 }
 
 static int install(char *self_path) {
@@ -7003,6 +7822,7 @@ static ssize_t spawn_capture_stdout(char **argv, char *buf, size_t bufsize) {
 	}
 	pid_t pid;
 	int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, env);
+	free(env);
 	posix_spawn_file_actions_destroy(&actions);
 	close(pipefd[1]);
 	if (devnull >= 0) close(devnull);
@@ -7140,6 +7960,7 @@ typedef struct {
 	bool clang;
 	bool msvc;
 	const char *output;
+	const char *msvc_object_output;
 	bool compile_only;
 	bool optimize;
 	bool use_preprocessed;
@@ -7290,7 +8111,10 @@ static int passthrough_cc(const Cli *cli) {
 	cc_split_into_argv(args, &argc, compiler, &cc_dup);
 	for (int i = 0; i < cli->dep_arg_count; i++) args[argc++] = cli->dep_args[i];
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
-	argv_add_output(args, &argc, cli->output, msvc, false);
+	if (msvc && cli->compile_only) args[argc++] = "/c";
+	argv_add_output(args, &argc, cli->output, msvc, cli->compile_only);
+	if (msvc && !cli->compile_only && cli->msvc_obj_output)
+		argv_add_output(args, &argc, cli->msvc_obj_output, true, true);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
 	int st = run_command((char **)args);
@@ -7373,7 +8197,10 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 	/* Skip user's /std: flags on MSVC; /std:clatest is already present. */
 	argv_add_filtered_cc_args(cli, args, &argc, plan->msvc, -1);
 	add_warn_suppress(args, &argc, plan->clang, plan->msvc);
+	if (plan->msvc && plan->compile_only) args[argc++] = "/c";
 	argv_add_output(args, &argc, plan->output, plan->msvc, plan->compile_only);
+	if (plan->msvc && !plan->compile_only && plan->msvc_object_output)
+		argv_add_output(args, &argc, plan->msvc_object_output, true, true);
 	if (force_c_temps & !plan->compile_only)
 		argv_add_cxx_stdlib(args, &argc, plan->compiler, plan->clang);
 	args[argc] = NULL;
@@ -7413,11 +8240,16 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			if (!f) {
 				prism_free(&result);
 				close(fd);
-				die("Failed to create temp file");
+				cleanup_temp_range(temps, i + 1);
+				return NULL;
 			}
-			fwrite(result.output, 1, result.output_len, f);
-			fclose(f);
+			bool wrote = fwrite(result.output, 1, result.output_len, f) == result.output_len;
+			if (fclose(f) != 0) wrote = false;
 			prism_free(&result);
+			if (!wrote) {
+				cleanup_temp_range(temps, i + 1);
+				return NULL;
+			}
 		} else {
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
@@ -7743,6 +8575,7 @@ static int compile_sources(Cli *cli) {
 			    .clang = clang,
 			    .msvc = msvc,
 			    .output = cli_output_path(cli, temp_exe, msvc),
+			    .msvc_object_output = cli->msvc_obj_output,
 			    .compile_only = cli->compile_only,
 			    .use_preprocessed = use_linemarkers,
 			};
@@ -7808,7 +8641,10 @@ PRISM_STATE();
 	signal(SIGPIPE,
 	       SIG_IGN); // no-op on Windows (SIGPIPE defined but never raised)
 	int status = 0;
-	pparse_ctx_init();
+	if (!pparse_ctx_init()) {
+		fprintf(stderr, "prism: out of memory\n");
+		return 1;
+	}
 	PPARSE_CTX();
 	if (argc < 2) {
 		print_help();
@@ -7901,6 +8737,8 @@ PRISM_STATE();
 		status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);
 	else if (cli.mode == CLI_EMIT) {
 		if (cli.source_count == 0) die("No source files specified");
+		if (!cli_emit_output_has_one_source(&cli))
+			die("--prism-emit=<file> requires exactly one source file");
 		for (int i = 0; i < cli.source_count; i++) {
 			if (cli.output) {
 				if (cli.verbose)

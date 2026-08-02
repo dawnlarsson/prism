@@ -140,6 +140,7 @@ static void fault_free(void *ptr) {
 #include <stdarg.h>
 
 #ifndef _WIN32
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -169,6 +170,7 @@ enum {
 	CAP_POSIX = 1u << 0,
 	CAP_VLA = 1u << 1,
 	CAP_GNU = 1u << 2,
+	CAP_WINDOWS = 1u << 3,
 };
 
 enum { AF_NONE, AF_INCLUDE, AF_DEFINE, AF_CFLAG, AF_FORCE, AF_COMPILER };
@@ -303,6 +305,8 @@ static unsigned capabilities(void) {
 	unsigned c = 0;
 #ifndef _WIN32
 	c |= CAP_POSIX | CAP_VLA;
+#else
+	c |= CAP_WINDOWS;
 #endif
 #if defined(__GNUC__) || defined(__clang__)
 	c |= CAP_GNU;
@@ -655,6 +659,54 @@ static int compile_output(const char *out, int run) {
 	return WEXITSTATUS(rc);
 }
 
+/* `transpile()` preprocesses with the backend's selected dialect.  A direct
+ * system-header fallback can therefore contain dialect-specific declarations
+ * from that backend (GCC 16's C23 `nullptr_t`, for example).  Keep the broad
+ * corpus on its explicit GNU11 baseline, but validate driver output using the
+ * same default dialect that produced the preprocessor stream. */
+static int compile_output_backend_default(const char *out) {
+	static unsigned serial;
+	char src[256], cmd[1024];
+	unsigned id = ++serial;
+	snprintf(src, sizeof(src), "/tmp/prism_recipe_default_%ld_%u.c", (long)getpid(), id);
+	FILE *fp = fopen(src, "w");
+	if (!fp) return -1000;
+	int wrote = fwrite(out, 1, strlen(out), fp) == strlen(out);
+	if (fclose(fp) != 0) wrote = 0;
+	if (!wrote) {
+		unlink(src);
+		return -1000;
+	}
+	snprintf(cmd, sizeof(cmd), "%s -w -fsyntax-only %s >/dev/null 2>&1", backend_cc(), src);
+	int rc = system(cmd);
+	unlink(src);
+	if (rc == -1 || !WIFEXITED(rc)) return -1001;
+	return WEXITSTATUS(rc);
+}
+
+/* A #line filename is still tokenized in translation phase 1. Exercise that
+ * path explicitly because normal compiles usually leave trigraphs disabled. */
+static int compile_output_trigraphs(const char *out) {
+	static unsigned serial;
+	char src[256], cmd[1024];
+	unsigned id = ++serial;
+	snprintf(src, sizeof(src), "/tmp/prism_recipe_trigraph_%ld_%u.c", (long)getpid(), id);
+	FILE *fp = fopen(src, "w");
+	if (!fp) return -1000;
+	int wrote = fwrite(out, 1, strlen(out), fp) == strlen(out);
+	if (fclose(fp) != 0) wrote = 0;
+	if (!wrote) {
+		unlink(src);
+		return -1000;
+	}
+	snprintf(cmd, sizeof(cmd), "%s -w -std=gnu11 -trigraphs -fsyntax-only %s >/dev/null 2>&1",
+		 backend_cc(), src);
+	int rc = system(cmd);
+	unlink(src);
+	if (rc == -1 || !WIFEXITED(rc)) return -1001;
+	return WEXITSTATUS(rc);
+}
+
 static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures f) {
 	static unsigned serial;
 	char in[256], out[256];
@@ -694,7 +746,8 @@ static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures 
 		}
 		ok = emitted && terms_present(emitted, r->must_have, 1) &&
 		     terms_present(emitted, r->must_not_have, 0);
-		if (ok && (r->oracle & O_COMPILE)) ok = compile_output(emitted, 0) == 0;
+		if (ok && (r->oracle & O_COMPILE))
+			ok = compile_output_backend_default(emitted) == 0;
 	}
 	free(emitted);
 	if (!(r->oracle & O_INPUT_PATH)) unlink(in);
@@ -712,6 +765,14 @@ static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures 
 static PRISM_COLD void exercise_out_str_dispatch(const char *s, int len) {
 	volatile int opaque_len = len;
 	out_str(s, opaque_len);
+}
+
+static int write_text_file(const char *path, const char *text) {
+	FILE *fp = fopen(path, "wb");
+	if (!fp) return 0;
+	int ok = fputs(text, fp) >= 0;
+	if (fclose(fp) != 0) ok = 0;
+	return ok;
 }
 
 static int run_internal(const Recipe *r, char *failed_action) {
@@ -843,6 +904,21 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			free(wide);
 			out_close();
 			ok = ok && out_total_flushed > 0;
+		} else if (*p == 'W') {
+			/* fclose can succeed after an unbuffered fwrite has already set the
+			 * stream error indicator. Verify out_close preserves that earlier error. */
+#if defined(__linux__)
+			FILE *full = fopen("/dev/full", "w");
+			if (!full || setvbuf(full, NULL, _IONBF, 0) != 0) {
+				if (full) fclose(full);
+				ok = 0;
+			} else {
+				out_fp = full;
+				out_buf_pos = 0;
+				out_str("x", 1);
+				ok = ok && !out_close();
+			}
+#endif
 		} else if (*p == 'D') {
 			ConsumedDef *defs = NULL;
 			bool undef_gnu = false;
@@ -1026,6 +1102,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			unlink(out);
 		} else if (*p == 'T') {
 			char in[256];
+			char stdout_path[] = "/dev/stdout";
 			snprintf(in, sizeof in, "/tmp/prism_recipe_stdout_%ld.c", (long)getpid());
 			FILE *fp = fopen(in, "wb");
 			const char source[] = "int g(void);int f(void){int x=g() orelse 3;return x;}\n";
@@ -1039,7 +1116,8 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			} else {
 				pparse_ctx_init();
 				apply_features(prism_defaults());
-				ok = ok && transpile_to_stdout(in);
+				ok = ok && output_path_is_stdout("-") && output_path_is_stdout("/dev/fd/1") &&
+				     transpile(in, stdout_path);
 				prism_reset();
 				fflush(stdout);
 				/* transpile_to_stdout writes through a separately opened
@@ -1062,15 +1140,985 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			if (saved >= 0) close(saved);
 			if (sink) fclose(sink);
 			unlink(in);
+		} else if (*p == 'R') {
+			/* Shrinking an arena allocation is a legal no-op: callers may retain
+			 * the original capacity, but the helper must never copy past the new
+			 * size or underflow its zero-fill length. */
+			PParseArena arena = {0};
+			unsigned char *old = pparse_arena_alloc(&arena, 16);
+			for (unsigned i = 0; i < 16; i++) old[i] = (unsigned char)(i + 1);
+			unsigned char *shrunk = pparse_arena_realloc(&arena, old, 16, 7);
+			unsigned char *fresh = pparse_arena_realloc(&arena, NULL, 16, 7);
+			ok = ok && shrunk == old && !memcmp(shrunk, "\1\2\3\4\5\6\7", 7) && fresh != NULL;
+			for (PParseArenaBlock *block = arena.head; block;) {
+				PParseArenaBlock *next = block->next;
+				free(block);
+				block = next;
+			}
+		} else if (*p == 'Q') {
+			/* Public reset is valid both before initialization and after an
+			 * explicit thread cleanup; the following API call must reinitialize
+			 * normally. */
+			prism_thread_cleanup();
+			prism_reset();
+			PrismResult again = prism_transpile_source("int main(void){return 0;}",
+								    "reset.c", prism_defaults());
+			ok = ok && again.status == PRISM_OK && again.output && again.output_len > 0;
+			prism_free(&again);
+		} else if (*p == 'E') {
+			/* A first library call must report an allocation failure instead of
+			 * terminating the embedding process when its TLS parser context cannot
+			 * be created. Even diagnostic allocation failure must return a freeable
+			 * static fallback, and the next call must recover. */
+			fault_alloc_enable(1);
+			PrismResult fallback = prism_transpile_source(NULL, "oom-message.c", prism_defaults());
+			int fallback_fired = fault_alloc_fired;
+			fault_alloc_disable();
+			ok = ok && fallback_fired && prism_result_shape_ok(&fallback) &&
+			     fallback.status == PRISM_ERR_IO && fallback.error_msg == prism_oom_error;
+			prism_free(&fallback);
+			prism_thread_cleanup();
+			fault_alloc_enable(1);
+			PrismResult oom = prism_transpile_source("int x;", "first-oom.c", prism_defaults());
+			int fired = fault_alloc_fired;
+			fault_alloc_disable();
+			ok = ok && fired && prism_result_shape_ok(&oom) && oom.status == PRISM_ERR_IO;
+			prism_free(&oom);
+			PrismResult recovery = prism_transpile_source("int x;", "first-oom.c", prism_defaults());
+			ok = ok && recovery.status == PRISM_OK && recovery.output;
+			prism_free(&recovery);
+		} else if (*p == 'V') {
+			/* File/API validation: reject ignored compiler inputs, bound public
+			 * feature arrays, clean soft errors, and safely quote line markers. */
+			PrismFeatures f = prism_defaults();
+			prism_free(NULL);
+			PrismResult dir = prism_transpile_file(get_tmp_dir(), f);
+			ok = ok && prism_result_shape_ok(&dir) && dir.status == PRISM_ERR_IO;
+			prism_free(&dir);
+
+			char txt[256], lower_i[256], upper_i[256], bad[256];
+			snprintf(txt, sizeof txt, "/tmp/prism_recipe_%ld.txt", (long)getpid());
+			FILE *fp = fopen(txt, "wb");
+			if (!fp) ok = 0;
+			else {
+				fputs("int txt_input;\n", fp);
+				fclose(fp);
+				PrismResult text = prism_transpile_file(txt, f);
+				ok = ok && prism_result_shape_ok(&text) && text.status == PRISM_ERR_IO;
+				prism_free(&text);
+			}
+			unlink(txt);
+			snprintf(lower_i, sizeof lower_i, "/tmp/prism_recipe_%ld.i", (long)getpid());
+			fp = fopen(lower_i, "wb");
+			if (!fp) ok = 0;
+			else {
+				fputs("int lower_i_input;\n", fp);
+				fclose(fp);
+				PrismResult lower = prism_transpile_file(lower_i, f);
+				ok = ok && prism_result_shape_ok(&lower) && lower.status == PRISM_OK && lower.output;
+				prism_free(&lower);
+			}
+			unlink(lower_i);
+			snprintf(upper_i, sizeof upper_i, "/tmp/prism_recipe_%ld.I", (long)getpid());
+			fp = fopen(upper_i, "wb");
+			if (!fp) ok = 0;
+			else {
+				fputs("int upper_i_input;\n", fp);
+				fclose(fp);
+				PrismResult upper = prism_transpile_file(upper_i, f);
+				ok = ok && prism_result_shape_ok(&upper) && upper.status == PRISM_ERR_IO;
+				prism_free(&upper);
+			}
+			unlink(upper_i);
+
+			PrismResult marker = prism_transpile_source(
+			    "int value;\n", "safe.c\"\n#error injected\r\t\001\177\"tail", f);
+			ok = ok && prism_result_shape_ok(&marker) && marker.status == PRISM_OK &&
+			     strstr(marker.output, "\\\"") && strstr(marker.output, "\\n") &&
+			     strstr(marker.output, "\\r") && strstr(marker.output, "\\t") &&
+			     strstr(marker.output, "\\001") && strstr(marker.output, "\\177") &&
+			     compile_output(marker.output, 0) == 0;
+			prism_free(&marker);
+			/* Build the filename bytewise so this test remains safe if the test
+			 * driver itself enables trigraphs. The emitted marker must not contain
+			 * a raw trigraph before its closing quote. */
+			char tri_name[] = {'s','a','f','e','?','?','/','"','t','a','i','l','.','c',0};
+			char tri_escaped[] = {'\\','?','\\','?','/',0};
+			PrismResult trigraph = prism_transpile_source("int trigraph_value;\n", tri_name, f);
+			ok = ok && prism_result_shape_ok(&trigraph) && trigraph.status == PRISM_OK &&
+			     strstr(trigraph.output, tri_escaped) && compile_output_trigraphs(trigraph.output) == 0;
+			prism_free(&trigraph);
+
+			const char *one_value[] = {"-w"};
+			f = prism_defaults();
+			f.flatten_headers = false;
+			f.compiler_flags = one_value;
+			f.compiler_flags_count = INT_MAX;
+			PrismResult count = prism_transpile_source("int count_input;", "count.c", f);
+			ok = ok && prism_result_shape_ok(&count) && count.status == PRISM_ERR_IO;
+			prism_free(&count);
+			f = prism_defaults();
+			f.include_paths = one_value;
+			f.include_count = INT_MAX;
+			PrismResult include_count = prism_transpile_source("int count_input;", "count.c", f);
+			ok = ok && prism_result_shape_ok(&include_count) && include_count.status == PRISM_ERR_IO;
+			prism_free(&include_count);
+			f = prism_defaults();
+			f.defines = one_value;
+			f.define_count = INT_MAX;
+			PrismResult define_count = prism_transpile_source("int count_input;", "count.c", f);
+			ok = ok && prism_result_shape_ok(&define_count) && define_count.status == PRISM_ERR_IO;
+			prism_free(&define_count);
+			f = prism_defaults();
+			f.force_includes = one_value;
+			f.force_include_count = INT_MAX;
+			PrismResult force_count = prism_transpile_source("int count_input;", "count.c", f);
+			ok = ok && prism_result_shape_ok(&force_count) && force_count.status == PRISM_ERR_IO;
+			prism_free(&force_count);
+
+			snprintf(bad, sizeof bad, "/tmp/prism_recipe_%ld.c", (long)getpid());
+			fp = fopen(bad, "wb");
+			if (!fp) ok = 0;
+			else {
+				fputs("#define KEPT 1\n#error intentional\n", fp);
+				fclose(fp);
+				f = prism_defaults();
+				f.flatten_headers = false;
+				int saved_err = dup(STDERR_FILENO);
+				FILE *err_sink = tmpfile();
+				if (saved_err < 0 || !err_sink || fflush(stderr) != 0 ||
+				    dup2(fileno(err_sink), STDERR_FILENO) < 0) {
+					ok = 0;
+				} else {
+					PrismResult failed = prism_transpile_file(bad, f);
+					fflush(stderr);
+					if (dup2(saved_err, STDERR_FILENO) < 0) ok = 0;
+					PRISM_STATE();
+					ok = ok && prism_result_shape_ok(&failed) && failed.status == PRISM_ERR_IO &&
+					     _ps->source_defines == NULL && _ps->source_define_count == 0;
+					prism_free(&failed);
+				}
+				if (saved_err >= 0) close(saved_err);
+				if (err_sink) fclose(err_sink);
+			}
+			unlink(bad);
+		} else if (*p == 'M') {
+			/* Cache limits are caller-controlled; saturated values must never
+			 * overflow their byte/second conversions. K established an isolated
+			 * cache root before this action runs. */
+			ok = ok && setenv("PRISM_PP_CACHE_MAX_MB", "9223372036854775807", 1) == 0 &&
+			     setenv("PRISM_PP_CACHE_MAX_DAYS", "9223372036854775807", 1) == 0;
+			pp_cache_prune();
+			/* Specs files and dependency output are compiler side effects, not
+			 * preprocessor stdout. Both must bypass an otherwise valid cache hit. */
+			char *specs_joined[] = {"cc", "-specs=/tmp/prism-mutable.specs", NULL};
+			char *specs_split[] = {"cc", "-specs", "/tmp/prism-mutable.specs", NULL};
+			char *dep_argv[] = {"cc", "-MMD", "-MF", "/tmp/prism-side-effect.d", NULL};
+			char *empty_argv[] = {"cc", "", NULL};
+			PRISM_STATE();
+			int saved_dep_count = _ps->dep_flags_count;
+			_ps->dep_flags_count = 0;
+			ok = ok && pp_argv_disables_cache(specs_joined, 2) &&
+			     pp_argv_disables_cache(specs_split, 3) && pp_argv_disables_cache(dep_argv, 4) &&
+			     !pp_argv_disables_cache(empty_argv, 2);
+			const char *old_dep_env = getenv("DEPENDENCIES_OUTPUT");
+			const char *old_sun_dep_env = getenv("SUNPRO_DEPENDENCIES");
+			char *saved_dep_env = old_dep_env ? strdup(old_dep_env) : NULL;
+			char *saved_sun_dep_env = old_sun_dep_env ? strdup(old_sun_dep_env) : NULL;
+			ok = ok && (!old_dep_env || saved_dep_env) && (!old_sun_dep_env || saved_sun_dep_env) &&
+			     setenv("DEPENDENCIES_OUTPUT", "/tmp/prism-cache-deps", 1) == 0 &&
+			     pp_argv_disables_cache((char *[]){"cc", NULL}, 1) &&
+			     unsetenv("DEPENDENCIES_OUTPUT") == 0 &&
+			     setenv("SUNPRO_DEPENDENCIES", "/tmp/prism-cache-sun-deps", 1) == 0 &&
+			     pp_argv_disables_cache((char *[]){"cc", NULL}, 1);
+			if (saved_dep_env) setenv("DEPENDENCIES_OUTPUT", saved_dep_env, 1);
+			else unsetenv("DEPENDENCIES_OUTPUT");
+			if (saved_sun_dep_env) setenv("SUNPRO_DEPENDENCIES", saved_sun_dep_env, 1);
+			else unsetenv("SUNPRO_DEPENDENCIES");
+			free(saved_dep_env);
+			free(saved_sun_dep_env);
+			_ps->dep_flags_count = 1;
+			ok = ok && pp_argv_disables_cache((char *[]){"cc", NULL}, 1);
+			_ps->dep_flags_count = saved_dep_count;
+			/* A corrupt cache entry must be a harmless miss when its declared payload
+			 * is larger than the file that carries it. On 32-bit builds this value
+			 * additionally exceeds size_t, covering both allocation guards. */
+			PPKey corrupt = {0x123456789abcdef0ULL, 0x0fedcba987654321ULL};
+			char corrupt_path[PATH_MAX] = {0};
+			if (!pp_cache_path(&corrupt, corrupt_path, sizeof corrupt_path)) {
+				ok = 0;
+			} else {
+				FILE *fp = fopen(corrupt_path, "wb");
+				if (!fp) {
+					ok = 0;
+				} else {
+					int wrote = fputs(PP_CACHE_MAGIC, fp) >= 0 &&
+						    fputs("deps 0\npayload 9223372036854775807\n", fp) >= 0;
+					if (fclose(fp) != 0) wrote = 0;
+					ok = ok && wrote;
+				}
+				char *payload = pp_cache_load(&corrupt);
+				ok = ok && payload == NULL;
+				free(payload);
+				fp = fopen(corrupt_path, "wb");
+				if (!fp) {
+					ok = 0;
+				} else {
+					int wrote = fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 1\ninvalid dependency\npayload 0\n", fp) >= 0;
+					if (fclose(fp) != 0) wrote = 0;
+					ok = ok && wrote;
+				}
+					payload = pp_cache_load(&corrupt);
+					ok = ok && payload == NULL;
+					free(payload);
+					unlink(corrupt_path);
+				}
+				/* A same-length flip must not turn into silently altered generated C.
+				 * Exercise the payload checksum and the exact-EOF validation together. */
+				PPKey checked = {0x0badf00d12345678ULL, 0x87654321deadbeefULL};
+				char checked_path[PATH_MAX] = {0};
+				const char checked_payload[] = "int cache_checksum_value;\n";
+				PPKey checked_sum = pp_payload_checksum(checked_payload, sizeof checked_payload - 1);
+				if (!pp_cache_path(&checked, checked_path, sizeof checked_path)) {
+					ok = 0;
+				} else {
+					FILE *fp = fopen(checked_path, "wb");
+					int wrote = fp && fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 0\n", fp) >= 0 &&
+						fprintf(fp, "payload %zu %016llx %016llx\n", sizeof checked_payload - 1,
+							(unsigned long long)checked_sum.a, (unsigned long long)checked_sum.b) > 0 &&
+						fwrite(checked_payload, 1, sizeof checked_payload - 1, fp) == sizeof checked_payload - 1;
+					if (fp && fclose(fp) != 0) wrote = 0;
+					char *payload = pp_cache_load(&checked);
+					ok = ok && wrote && payload && !strcmp(payload, checked_payload);
+					free(payload);
+					fp = fopen(checked_path, "r+b");
+					int flipped = fp && fseek(fp, -1, SEEK_END) == 0 && fputc('X', fp) != EOF;
+					if (fp && fclose(fp) != 0) flipped = 0;
+					payload = pp_cache_load(&checked);
+					ok = ok && flipped && payload == NULL;
+					free(payload);
+					unlink(checked_path);
+				}
+				/* mkstemp-style cache publishing gives concurrent same-process stores
+				 * independent temporary names instead of one pid-only collision path. */
+				PPKey temp_key = {0x1111111111111111ULL, 0x2222222222222222ULL};
+				char cache_path[PATH_MAX] = {0}, temp_one[PATH_MAX] = {0}, temp_two[PATH_MAX] = {0};
+				int one_fd = -1, two_fd = -1;
+				if (!pp_cache_path(&temp_key, cache_path, sizeof cache_path) ||
+				    (one_fd = pp_cache_open_temp(cache_path, temp_one, sizeof temp_one)) < 0 ||
+				    (two_fd = pp_cache_open_temp(cache_path, temp_two, sizeof temp_two)) < 0)
+					ok = 0;
+				else
+					ok = ok && strcmp(temp_one, temp_two) != 0;
+				if (one_fd >= 0) close(one_fd);
+				if (two_fd >= 0) close(two_fd);
+				if (temp_one[0]) unlink(temp_one);
+				if (temp_two[0]) unlink(temp_two);
+				setenv("PRISM_PP_CACHE_MAX_MB", "1", 1);
+			unsetenv("PRISM_PP_CACHE_MAX_DAYS");
+		} else if (*p == 'H') {
+			/* build_clean_environ must snapshot the host environment per spawn.
+			 * CPATH changes between calls are both a functional requirement and a
+			 * guard against retaining C runtime-owned environment pointers. */
+			char root[PATH_MAX], first[PATH_MAX], second[PATH_MAX];
+			char one_h[PATH_MAX], two_h[PATH_MAX], one_c[PATH_MAX], two_c[PATH_MAX];
+			const char *old_cpath = getenv("CPATH");
+			char *saved_cpath = old_cpath ? strdup(old_cpath) : NULL;
+			int paths_ok = (!old_cpath || saved_cpath) &&
+				       snprintf(root, sizeof root, "/tmp/prism_recipe_env_%ld", (long)getpid()) > 0 &&
+				       snprintf(first, sizeof first, "%s/a", root) > 0 &&
+				       snprintf(second, sizeof second, "%s/replacement_include_path", root) > 0 &&
+				       snprintf(one_h, sizeof one_h, "%s/prism_env_before.h", first) > 0 &&
+				       snprintf(two_h, sizeof two_h, "%s/prism_env_after.h", second) > 0 &&
+				       snprintf(one_c, sizeof one_c, "%s/one.c", root) > 0 &&
+				       snprintf(two_c, sizeof two_c, "%s/two.c", root) > 0;
+			if (!paths_ok || mkdir(root, 0700) != 0 || mkdir(first, 0700) != 0 ||
+			    mkdir(second, 0700) != 0 || !write_text_file(one_h, "#define PRISM_ENV_BEFORE 17\n") ||
+			    !write_text_file(two_h, "#define PRISM_ENV_AFTER 23\n") ||
+			    !write_text_file(one_c, "#include <prism_env_before.h>\nint env_before=PRISM_ENV_BEFORE;\n") ||
+			    !write_text_file(two_c, "#include <prism_env_after.h>\nint env_after=PRISM_ENV_AFTER;\n")) {
+				ok = 0;
+			} else {
+				PrismFeatures f = prism_defaults();
+				ok = ok && setenv("CPATH", first, 1) == 0;
+				PrismResult before = prism_transpile_file(one_c, f);
+				ok = ok && before.status == PRISM_OK && before.output;
+				prism_free(&before);
+				ok = ok && setenv("CPATH", second, 1) == 0;
+				PrismResult after = prism_transpile_file(two_c, f);
+				ok = ok && after.status == PRISM_OK && after.output;
+				prism_free(&after);
+			}
+			if (saved_cpath) setenv("CPATH", saved_cpath, 1);
+			else unsetenv("CPATH");
+			free(saved_cpath);
+			unlink(one_c);
+			unlink(two_c);
+			unlink(one_h);
+			unlink(two_h);
+			rmdir(first);
+			rmdir(second);
+			rmdir(root);
+		} else if (*p == 'Y') {
+			/* Cache keys and validation must account for cwd-sensitive flags, raw
+			 * response files, volatile header macros, and opaque custom compilers. */
+			char old_cwd[PATH_MAX] = {0}, root[PATH_MAX] = {0}, first[PATH_MAX] = {0}, second[PATH_MAX] = {0};
+			char src[PATH_MAX] = {0}, first_h[PATH_MAX] = {0}, second_h[PATH_MAX] = {0};
+			char rsp[PATH_MAX] = {0}, rsp_arg[PATH_MAX + 2] = {0}, rsp_src[PATH_MAX] = {0};
+			char time_h[PATH_MAX] = {0}, time_src[PATH_MAX] = {0}, wrapper[PATH_MAX] = {0};
+			char config[PATH_MAX] = {0}, wrap_src[PATH_MAX] = {0}, dep[PATH_MAX] = {0}, dep_src[PATH_MAX] = {0};
+			const char *old_epoch = getenv("SOURCE_DATE_EPOCH");
+			char *saved_epoch = old_epoch ? strdup(old_epoch) : NULL;
+			int have_cwd = getcwd(old_cwd, sizeof old_cwd) != NULL;
+			int paths_ok = have_cwd && (!old_epoch || saved_epoch) &&
+				snprintf(root, sizeof root, "/tmp/prism_recipe_cache_more_%ld", (long)getpid()) > 0 &&
+				snprintf(first, sizeof first, "%s/a", root) > 0 &&
+				snprintf(second, sizeof second, "%s/b", root) > 0 &&
+				snprintf(src, sizeof src, "%s/main.c", root) > 0 &&
+				snprintf(first_h, sizeof first_h, "%s/choice.h", first) > 0 &&
+				snprintf(second_h, sizeof second_h, "%s/choice.h", second) > 0 &&
+				snprintf(rsp, sizeof rsp, "%s/flags.rsp", root) > 0 &&
+				snprintf(rsp_arg, sizeof rsp_arg, "@%s", rsp) > 0 &&
+				snprintf(rsp_src, sizeof rsp_src, "%s/rsp.c", root) > 0 &&
+				snprintf(time_h, sizeof time_h, "%s/volatile.h", root) > 0 &&
+				snprintf(time_src, sizeof time_src, "%s/time.c", root) > 0 &&
+				snprintf(dep, sizeof dep, "%s/side-effect.d", root) > 0 &&
+				snprintf(dep_src, sizeof dep_src, "%s/side-effect.c", root) > 0 &&
+				snprintf(wrapper, sizeof wrapper, "%s/wrapcc", root) > 0 &&
+				snprintf(config, sizeof config, "%s/config", root) > 0 &&
+				snprintf(wrap_src, sizeof wrap_src, "%s/wrap.c", root) > 0;
+			if (!paths_ok || mkdir(root, 0700) != 0 || mkdir(first, 0700) != 0 ||
+			    mkdir(second, 0700) != 0 || !write_text_file(first_h, "#define PRISM_CACHE_CWD 111\n") ||
+			    !write_text_file(second_h, "#define PRISM_CACHE_CWD 222\n") ||
+			    !write_text_file(src, "#include <choice.h>\nint cwd_value=PRISM_CACHE_CWD;\n")) {
+				ok = 0;
+			} else {
+				const char *dot[] = {"."};
+				PrismFeatures f = prism_defaults();
+				f.flatten_headers = false;
+				f.include_paths = dot;
+				f.include_count = N(dot);
+				PrismResult from_first = {0}, from_second = {0};
+				if (chdir(first) != 0) ok = 0;
+				else from_first = prism_transpile_file(src, f);
+				if (chdir(second) != 0) ok = 0;
+				else from_second = prism_transpile_file(src, f);
+				ok = ok && from_first.status == PRISM_OK && from_first.output &&
+				     from_second.status == PRISM_OK && from_second.output &&
+				     strstr(from_first.output, "111") && strstr(from_second.output, "222");
+				prism_free(&from_first);
+				prism_free(&from_second);
+
+				const char *no_markers[] = {"-P"};
+				f.compiler_flags = no_markers;
+				f.compiler_flags_count = N(no_markers);
+				PrismResult without_markers_before = prism_transpile_file(src, f);
+				ok = ok && without_markers_before.status == PRISM_OK && without_markers_before.output &&
+				     strstr(without_markers_before.output, "222");
+				prism_free(&without_markers_before);
+				ok = ok && write_text_file(second_h, "#define PRISM_CACHE_CWD 333\n");
+				PrismResult without_markers_after = prism_transpile_file(src, f);
+				ok = ok && without_markers_after.status == PRISM_OK && without_markers_after.output &&
+				     strstr(without_markers_after.output, "333");
+				prism_free(&without_markers_after);
+
+				ok = ok && write_text_file(rsp, "-DPRISM_RSP_VALUE=111\n") &&
+				     write_text_file(rsp_src, "int rsp_value=PRISM_RSP_VALUE;\n");
+				const char *response[] = {rsp_arg};
+				f = prism_defaults();
+				f.flatten_headers = false;
+				f.compiler_flags = response;
+				f.compiler_flags_count = N(response);
+				PrismResult rsp_before = prism_transpile_file(rsp_src, f);
+				ok = ok && rsp_before.status == PRISM_OK && rsp_before.output && strstr(rsp_before.output, "111");
+				prism_free(&rsp_before);
+				ok = ok && write_text_file(rsp, "-DPRISM_RSP_VALUE=333\n");
+				PrismResult rsp_after = prism_transpile_file(rsp_src, f);
+				ok = ok && rsp_after.status == PRISM_OK && rsp_after.output && strstr(rsp_after.output, "333");
+				prism_free(&rsp_after);
+
+				/* A hit can replay preprocessor stdout, but not the .d side effect.
+				 * Remove it between identical calls to prove dependency mode bypasses
+				 * the cache for public API compiler flags as well as CLI flags. */
+				const char *dep_flags[] = {"-MMD", "-MF", dep};
+				f = prism_defaults();
+				f.flatten_headers = false;
+				f.compiler_flags = dep_flags;
+				f.compiler_flags_count = N(dep_flags);
+				ok = ok && write_text_file(dep_src, "int prism_dep_side_effect;\n");
+				PrismResult dep_before = prism_transpile_file(dep_src, f);
+				int first_dep = access(dep, F_OK) == 0;
+				unlink(dep);
+				PrismResult dep_after = prism_transpile_file(dep_src, f);
+				int second_dep = access(dep, F_OK) == 0;
+				ok = ok && dep_before.status == PRISM_OK && dep_before.output && first_dep &&
+				     dep_after.status == PRISM_OK && dep_after.output && second_dep;
+				prism_free(&dep_before);
+				prism_free(&dep_after);
+
+				unsetenv("SOURCE_DATE_EPOCH");
+				ok = ok && write_text_file(time_h, "#define PRISM_HEADER_TIME __TIME__\n") &&
+				     write_text_file(time_src,
+						     "#include \"volatile.h\"\nconst char *header_time=PRISM_HEADER_TIME;\n");
+				f = prism_defaults();
+				f.flatten_headers = false;
+				PrismResult time_before = prism_transpile_file(time_src, f);
+				sleep(2);
+				PrismResult time_after = prism_transpile_file(time_src, f);
+				ok = ok && time_before.status == PRISM_OK && time_before.output &&
+				     time_after.status == PRISM_OK && time_after.output &&
+				     strcmp(time_before.output, time_after.output) != 0;
+				prism_free(&time_before);
+				prism_free(&time_after);
+
+				FILE *script = fopen(wrapper, "wb");
+				int script_ok = script &&
+					fprintf(script, "#!/bin/sh\nexec cc -DPRISM_WRAP_VALUE=$(cat %s) \"$@\"\n", config) >= 0;
+				if (script && fclose(script) != 0) script_ok = 0;
+				if (!script_ok || chmod(wrapper, 0700) != 0 || !write_text_file(config, "111\n") ||
+				    !write_text_file(wrap_src, "int wrap_value=PRISM_WRAP_VALUE;\n")) {
+					ok = 0;
+				} else {
+					f = prism_defaults();
+					f.flatten_headers = false;
+					f.compiler = wrapper;
+					PrismResult wrap_before = prism_transpile_file(wrap_src, f);
+					ok = ok && wrap_before.status == PRISM_OK && wrap_before.output && strstr(wrap_before.output, "111");
+					prism_free(&wrap_before);
+					ok = ok && write_text_file(config, "333\n");
+					PrismResult wrap_after = prism_transpile_file(wrap_src, f);
+					ok = ok && wrap_after.status == PRISM_OK && wrap_after.output && strstr(wrap_after.output, "333");
+					prism_free(&wrap_after);
+				}
+			}
+			if (have_cwd && chdir(old_cwd) != 0) ok = 0;
+			if (saved_epoch) setenv("SOURCE_DATE_EPOCH", saved_epoch, 1);
+			else unsetenv("SOURCE_DATE_EPOCH");
+			free(saved_epoch);
+			unlink(src);
+			unlink(first_h);
+			unlink(second_h);
+			unlink(rsp);
+			unlink(rsp_src);
+			unlink(time_h);
+			unlink(time_src);
+			unlink(dep);
+			unlink(dep_src);
+			unlink(wrapper);
+			unlink(config);
+			unlink(wrap_src);
+			rmdir(first);
+			rmdir(second);
+			rmdir(root);
+		} else if (*p == 'Z') {
+			/* A same-size rewrite can restore its exact mtime. ctime seconds alone
+			 * are not enough when both writes land in one second, so lock that old
+			 * stale-hit shape in with an explicit sub-second regression. */
+			char src[256] = {0}, hdr[256] = {0};
+			int names_ok = snprintf(src, sizeof src, "/tmp/prism_recipe_cache_stat_%ld.c", (long)getpid()) > 0 &&
+				       snprintf(hdr, sizeof hdr, "/tmp/prism_recipe_cache_stat_%ld.h", (long)getpid()) > 0;
+			int within_one_second = 0;
+			struct timeval fixed_time[2] = {{123456789, 123456}, {123456789, 123456}};
+			for (int attempt = 0; names_ok && ok && attempt < 3 && !within_one_second; attempt++) {
+				time_t edge = time(NULL);
+				while (time(NULL) == edge) usleep(1000);
+				if (!write_text_file(hdr, "#define PRISM_CACHE_STAT 111\n") || utimes(hdr, fixed_time) != 0) {
+					ok = 0;
+					break;
+				}
+				/* The generated include spelling needs this process's suffix. */
+				FILE *source = fopen(src, "wb");
+				int source_ok = source &&
+					fprintf(source, "#include \"%s\"\nint stat_value=PRISM_CACHE_STAT;\n", hdr) >= 0;
+				if (source && fclose(source) != 0) source_ok = 0;
+				if (!source_ok) {
+					ok = 0;
+					break;
+				}
+				PrismFeatures f = prism_defaults();
+				f.flatten_headers = false;
+				PrismResult before = prism_transpile_file(src, f);
+				struct stat old_id;
+				int got_old = stat(hdr, &old_id) == 0;
+				int rewrote = write_text_file(hdr, "#define PRISM_CACHE_STAT 222\n") &&
+					      utimes(hdr, fixed_time) == 0;
+				struct stat new_id;
+				int got_new = stat(hdr, &new_id) == 0;
+				PrismResult after = rewrote ? prism_transpile_file(src, f) : (PrismResult){0};
+				if (got_old && got_new && old_id.st_size == new_id.st_size &&
+				    old_id.st_mtime == new_id.st_mtime && old_id.st_ctime == new_id.st_ctime) {
+					within_one_second = 1;
+					ok = ok && before.status == PRISM_OK && before.output && strstr(before.output, "111") &&
+					     rewrote && after.status == PRISM_OK && after.output && strstr(after.output, "222");
+				}
+				prism_free(&before);
+				prism_free(&after);
+			}
+			ok = ok && names_ok && within_one_second;
+			unlink(src);
+			unlink(hdr);
+		} else if (*p == 'G') {
+			/* A directive between stripped raw prefixes must keep its own line:
+			 * the following raw is elided and cannot supply emit_tok's usual BOL. */
+			PrismResult raw_directive = prism_transpile_source(
+			    "void raw_directive_test(void){raw\n#pragma GCC diagnostic push\nraw int x;(void)x;}\n",
+			    "raw-directive.c", prism_defaults());
+			ok = ok && raw_directive.status == PRISM_OK && raw_directive.output &&
+			     strstr(raw_directive.output, "#pragma GCC diagnostic push\n") &&
+			     compile_output(raw_directive.output, 0) == 0;
+			prism_free(&raw_directive);
+		} else if (*p == 'I') {
+			/* Compiler command strings are argv, not shell fragments: embedded
+			 * quotes and backslash escapes must remain inside one argument. */
+			const char *argv[8] = {0};
+			int argc = 0;
+			char *dup = NULL;
+			cc_split_into_argv(argv, &argc,
+					   "cc -DNUM=7 -DSTR=\"a b\" -DSINGLE='c d' -DESC=a\\ b", &dup);
+			int split_ok = dup && argc == 5 && !strcmp(argv[0], "cc") &&
+			     !strcmp(argv[1], "-DNUM=7") && !strcmp(argv[2], "-DSTR=a b") &&
+			     !strcmp(argv[3], "-DSINGLE=c d") && !strcmp(argv[4], "-DESC=a b");
+			ok = ok && split_ok;
+			free(dup);
+			PrismFeatures f = prism_defaults();
+			f.flatten_headers = false;
+			f.compiler = "cc -DPRISM_CC_NUM=7 -DPRISM_CC_STR=\"a b\"";
+			char input[256];
+			snprintf(input, sizeof input, "/tmp/prism_recipe_compiler_command_%ld.c", (long)getpid());
+			int wrote = write_text_file(
+			    input, "#ifndef PRISM_CC_NUM\n#error missing compiler define\n#endif\nint compiler_command_value=PRISM_CC_NUM;\n");
+			PrismResult command = wrote ? prism_transpile_file(input, f) : (PrismResult){0};
+			int command_ok = command.status == PRISM_OK && command.output &&
+			     strstr(command.output, "compiler_command_value") && strstr(command.output, "7") &&
+			     compile_output(command.output, 0) == 0;
+			if ((!split_ok || !command_ok) && getenv("PRISM_INTERNAL_TRACE"))
+				fprintf(stderr, "compiler command split=%d argc=%d command=%d status=%d\n", split_ok,
+					argc, command_ok, command.status);
+			ok = ok && command_ok;
+			prism_free(&command);
+			unlink(input);
 		} else if (*p == 'N') {
 			PrismResult z = prism_transpile_file(NULL, prism_defaults());
 			ok = ok && z.status == PRISM_ERR_IO && z.error_msg && strstr(z.error_msg, "NULL");
 			prism_free(&z);
+		} else if (*p == 'L') {
+			/* `--prism-emit=<file>` must never truncate its input, including
+			 * a distinct hard-link spelling.  The CLI's one-file restriction is
+			 * kept in a small helper so this library-mode harness can exercise it. */
+			char input[256], alias[256], header[256], guard[256], failing[256];
+			const char source[] = "int prism_emit_input_value=17;\n";
+			snprintf(input, sizeof input, "/tmp/prism_recipe_emit_%ld.c", (long)getpid());
+			snprintf(alias, sizeof alias, "/tmp/prism_recipe_emit_alias_%ld.c", (long)getpid());
+			snprintf(header, sizeof header, "/tmp/prism_recipe_emit_header_%ld.h", (long)getpid());
+			snprintf(guard, sizeof guard, "/tmp/prism_recipe_emit_guard_%ld.c", (long)getpid());
+			snprintf(failing, sizeof failing, "/tmp/prism_recipe_emit_failing_%ld.c", (long)getpid());
+			unlink(input);
+			unlink(alias);
+			unlink(header);
+			unlink(guard);
+			unlink(failing);
+			if (!write_text_file(input, source) || link(input, alias) != 0) {
+				ok = 0;
+			} else {
+				int direct_rejected = !transpile(input, input) && errno == EINVAL;
+				char *after_direct = read_file_padded(input);
+				int alias_rejected = !transpile(input, alias) && errno == EINVAL;
+				char *after_alias = read_file_padded(input);
+				Cli one = {.output = "out.c", .source_count = 1};
+				Cli many = {.output = "out.c", .source_count = 2};
+				ok = ok && direct_rejected && alias_rejected && after_direct && after_alias &&
+					!strcmp(after_direct, source) && !strcmp(after_alias, source) &&
+					cli_emit_output_has_one_source(&one) && !cli_emit_output_has_one_source(&many);
+				free(after_direct);
+				free(after_alias);
+			}
+			/* Publishing only after translation keeps an include usable even when
+			 * it is deliberately selected as the destination, and preserves an
+			 * old destination when preprocessing rejects the input. */
+			FILE *inc = fopen(header, "wb");
+			int include_ok = inc && fprintf(inc, "#define PRISM_EMIT_HEADER_VALUE 41\n") > 0;
+			if (inc && fclose(inc) != 0) include_ok = 0;
+			FILE *source_fp = fopen(input, "wb");
+			if (source_fp && fprintf(source_fp, "#include \"%s\"\nint prism_emit_header_value=PRISM_EMIT_HEADER_VALUE;\n", header) < 0)
+				include_ok = 0;
+			if (source_fp && fclose(source_fp) != 0) include_ok = 0;
+			if (!source_fp) include_ok = 0;
+			pparse_ctx_init();
+			apply_features(prism_defaults());
+			int header_output_ok = include_ok && transpile(input, header);
+			char *header_output = read_file_padded(header);
+			ok = ok && header_output_ok && header_output && strstr(header_output, "prism_emit_header_value") &&
+			     strstr(header_output, "41") && compile_output(header_output, 0) == 0;
+			free(header_output);
+			prism_reset();
+
+			int guard_ok = write_text_file(guard, "prism emit sentinel\n") &&
+			       write_text_file(failing, "#error prism emit must not publish on preprocess failure\n");
+			int saved_err = dup(STDERR_FILENO);
+			FILE *err_sink = tmpfile();
+			if (saved_err < 0 || !err_sink || fflush(stderr) != 0 ||
+			    dup2(fileno(err_sink), STDERR_FILENO) < 0)
+				guard_ok = 0;
+			else {
+				pparse_ctx_init();
+				apply_features(prism_defaults());
+				guard_ok = guard_ok && !transpile(failing, guard);
+				prism_reset();
+				fflush(stderr);
+				if (dup2(saved_err, STDERR_FILENO) < 0) guard_ok = 0;
+			}
+			if (saved_err >= 0) close(saved_err);
+			if (err_sink) fclose(err_sink);
+			char *guard_after = read_file_padded(guard);
+			ok = ok && guard_ok && guard_after && !strcmp(guard_after, "prism emit sentinel\n");
+			free(guard_after);
+			unlink(alias);
+			unlink(input);
+			unlink(header);
+			unlink(guard);
+			unlink(failing);
+		} else if (*p == 'B') {
+			/* Response files are expanded only while Prism owns argv. Exercise the
+			 * boundary modes, operand splicing, BOMs, nested depth, and a pipe-backed
+			 * response file so eager expansion cannot regress any of them. */
+			char root[PATH_MAX] = {0}, normal[PATH_MAX] = {0}, outer[PATH_MAX] = {0};
+			char operand[PATH_MAX] = {0}, xlang[PATH_MAX] = {0}, dep[PATH_MAX] = {0};
+			char bom[PATH_MAX] = {0};
+			char normal_arg[PATH_MAX + 2] = {0}, outer_arg[PATH_MAX + 2] = {0};
+			char operand_arg[PATH_MAX + 2] = {0}, xlang_arg[PATH_MAX + 2] = {0};
+			char dep_arg[PATH_MAX + 2] = {0}, bom_arg[PATH_MAX + 2] = {0};
+			int setup = snprintf(root, sizeof root, "/tmp/prism_recipe_rsp_%ld", (long)getpid()) > 0 &&
+			    snprintf(normal, sizeof normal, "%s/normal.rsp", root) > 0 &&
+			    snprintf(outer, sizeof outer, "%s/outer.rsp", root) > 0 &&
+			    snprintf(operand, sizeof operand, "%s/operand.rsp", root) > 0 &&
+			    snprintf(xlang, sizeof xlang, "%s/xlang.rsp", root) > 0 &&
+			    snprintf(dep, sizeof dep, "%s/dep.rsp", root) > 0 &&
+			    snprintf(bom, sizeof bom, "%s/bom.rsp", root) > 0 && mkdir(root, 0700) == 0;
+			if (setup) {
+				snprintf(normal_arg, sizeof normal_arg, "@%s", normal);
+				snprintf(outer_arg, sizeof outer_arg, "@%s", outer);
+				snprintf(operand_arg, sizeof operand_arg, "@%s", operand);
+				snprintf(xlang_arg, sizeof xlang_arg, "@%s", xlang);
+				snprintf(dep_arg, sizeof dep_arg, "@%s", dep);
+				snprintf(bom_arg, sizeof bom_arg, "@%s", bom);
+				char outer_text[PATH_MAX + 64];
+				setup = write_text_file(normal, "-DPRISM_RSP_NORMAL=88 x.c\n") &&
+				    snprintf(outer_text, sizeof outer_text, "run x.c -- %s\n", normal_arg) > 0 &&
+				    write_text_file(outer, outer_text) &&
+				    write_text_file(operand, "rsp-output.o x.c\n") &&
+				    write_text_file(xlang, "c rsp-extensionless\n") &&
+				    write_text_file(dep, "rsp-output.d x.c\n");
+				FILE *fp = fopen(bom, "wb");
+				const unsigned char bom_text[] = {0xef, 0xbb, 0xbf, '-', 'D', 'P', 'R', 'I', 'S', 'M',
+								  '_', 'B', 'O', 'M', '=', '1', ' ', 'x', '.', 'c', '\n'};
+				if (!fp || fwrite(bom_text, 1, sizeof bom_text, fp) != sizeof bom_text || fclose(fp) != 0)
+					setup = 0;
+			}
+			if (!setup) {
+				ok = 0;
+			} else {
+				char *run_after_separator[] = {"prism", "run", "x.c", "--", normal_arg};
+				Cli c = cli_parse(N(run_after_separator), run_after_separator);
+				ok = ok && c.mode == CLI_RUN && c.source_count == 1 && c.prog_arg_count == 1 &&
+				     !strcmp(c.prog_args[0], normal_arg);
+				cli_free(&c);
+
+				char *check_args[] = {"prism", "check", "tool", "x.c", normal_arg};
+				c = cli_parse(N(check_args), check_args);
+				ok = ok && c.mode == CLI_CHECK && c.source_count == 1 && c.check_arg_count == 2 &&
+				     !strcmp(c.check_args[1], normal_arg);
+				cli_free(&c);
+
+				char *nested_separator[] = {"prism", outer_arg, "later.c"};
+				c = cli_parse(N(nested_separator), nested_separator);
+				ok = ok && c.mode == CLI_RUN && c.source_count == 1 && c.prog_arg_count == 2 &&
+				     !strcmp(c.prog_args[0], normal_arg) && !strcmp(c.prog_args[1], "later.c");
+				cli_free(&c);
+
+				char *normal_args[] = {"prism", normal_arg};
+				c = cli_parse(N(normal_args), normal_args);
+				ok = ok && c.mode == CLI_DEFAULT && c.source_count == 1 && c.cc_arg_count == 1 &&
+				     !strcmp(c.cc_args[0], "-DPRISM_RSP_NORMAL=88");
+				cli_free(&c);
+
+				/* `-f…` remains GNU's namespace on POSIX.  Only the explicit
+				 * uppercase MSVC dash forms `-Fe` and `-Fo` are output switches. */
+				char *gnu_f_args[] = {"prism", "-fexceptions", "x.c"};
+				c = cli_parse(N(gnu_f_args), gnu_f_args);
+				ok = ok && c.source_count == 1 && c.cc_arg_count == 1 && !c.output &&
+				     !strcmp(c.cc_args[0], "-fexceptions");
+				cli_free(&c);
+				ok = ok && !msvc_flag_takes_arg("/") && !msvc_output_flag_kind("/");
+
+				char *output_args[] = {"prism", "-o", operand_arg};
+				c = cli_parse(N(output_args), output_args);
+				ok = ok && c.source_count == 1 && c.output && !strcmp(c.output, "rsp-output.o");
+				cli_free(&c);
+
+				char *include_args[] = {"prism", "-I", operand_arg};
+				c = cli_parse(N(include_args), include_args);
+				ok = ok && c.source_count == 1 && c.cc_arg_count == 2 &&
+				     !strcmp(c.cc_args[0], "-I") && !strcmp(c.cc_args[1], "rsp-output.o");
+				cli_free(&c);
+
+				char *x_args[] = {"prism", "-x", xlang_arg};
+				c = cli_parse(N(x_args), x_args);
+				ok = ok && c.source_count == 1 && c.cc_arg_count == 2 &&
+				     !strcmp(c.sources[0], "rsp-extensionless");
+				cli_free(&c);
+
+				char *dep_args[] = {"prism", "-MF", dep_arg};
+				c = cli_parse(N(dep_args), dep_args);
+				ok = ok && c.source_count == 1 && c.dep_arg_count == 2 &&
+				     !strcmp(c.dep_args[1], "rsp-output.d");
+				cli_free(&c);
+
+				char *bom_args[] = {"prism", bom_arg};
+				c = cli_parse(N(bom_args), bom_args);
+				ok = ok && c.source_count == 1 && c.cc_arg_count == 1 &&
+				     !strcmp(c.cc_args[0], "-DPRISM_BOM=1");
+				cli_free(&c);
+
+				/* A directory is readable enough for fopen on some systems but not a
+				 * response stream. Keep it literal instead of silently deleting it. */
+				char directory_arg[PATH_MAX + 2];
+				snprintf(directory_arg, sizeof directory_arg, "@%s", root);
+				char *directory_args[] = {"prism", directory_arg};
+				c = cli_parse(N(directory_args), directory_args);
+				ok = ok && c.source_count == 0 && c.cc_arg_count == 1 &&
+				     !strcmp(c.cc_args[0], directory_arg);
+				cli_free(&c);
+
+				char depth_paths[RSP_MAX_DEPTH + 1][PATH_MAX];
+				int depth_ok = 1;
+				for (int i = 0; i <= RSP_MAX_DEPTH; i++) {
+					if (snprintf(depth_paths[i], sizeof depth_paths[i], "%s/depth-%d.rsp", root, i) <= 0)
+						depth_ok = 0;
+				}
+				for (int i = 0; depth_ok && i <= RSP_MAX_DEPTH; i++) {
+					char text[PATH_MAX + 4];
+					if (i == RSP_MAX_DEPTH) snprintf(text, sizeof text, "x.c\n");
+					else snprintf(text, sizeof text, "@%s\n", depth_paths[i + 1]);
+					if (!write_text_file(depth_paths[i], text)) depth_ok = 0;
+				}
+				char depth_arg[PATH_MAX + 2];
+				snprintf(depth_arg, sizeof depth_arg, "@%s", depth_paths[0]);
+				if (depth_ok) {
+					char *depth_args[] = {"prism", depth_arg};
+					c = cli_parse(N(depth_args), depth_args);
+					depth_ok = c.source_count == 1 && !strcmp(c.sources[0], "x.c");
+					cli_free(&c);
+				}
+				ok = ok && depth_ok;
+				for (int i = 0; i <= RSP_MAX_DEPTH; i++) unlink(depth_paths[i]);
+
+				int pipefd[2];
+				char pipe_arg[64];
+				int pipe_ok = pipe(pipefd) == 0;
+				const char pipe_text[] = "-DPRISM_RSP_PIPE=1 x.c\n";
+				if (pipe_ok && (write(pipefd[1], pipe_text, sizeof pipe_text - 1) != sizeof pipe_text - 1 ||
+						close(pipefd[1]) != 0)) {
+					close(pipefd[0]);
+					pipe_ok = 0;
+				}
+				if (pipe_ok) {
+					snprintf(pipe_arg, sizeof pipe_arg, "@/dev/fd/%d", pipefd[0]);
+					char *pipe_args[] = {"prism", pipe_arg};
+					c = cli_parse(N(pipe_args), pipe_args);
+					pipe_ok = c.source_count == 1 && c.cc_arg_count == 1 &&
+						!strcmp(c.cc_args[0], "-DPRISM_RSP_PIPE=1");
+					cli_free(&c);
+					close(pipefd[0]);
+				}
+				ok = ok && pipe_ok;
+			}
+			unlink(normal);
+			unlink(outer);
+			unlink(operand);
+			unlink(xlang);
+			unlink(dep);
+			unlink(bom);
+			rmdir(root);
+		} else if (*p == 'b') {
+			/* Non-flatten mode used to hoist direct system headers and selected
+			 * definitions. A synthetic -isystem path that looks like a Clang
+			 * resource header exercises the old SYS_SKIP/re-emission path: pragma
+			 * order and a post-include undef must both survive exactly. */
+			char root[PATH_MAX] = {0}, lib[PATH_MAX] = {0}, clang_dir[PATH_MAX] = {0};
+			char fixture[PATH_MAX] = {0}, inc[PATH_MAX] = {0};
+			char first[PATH_MAX] = {0}, second[PATH_MAX] = {0}, source[PATH_MAX] = {0};
+			int setup = snprintf(root, sizeof root, "/tmp/prism_recipe_system_order_%ld", (long)getpid()) > 0 &&
+			    snprintf(lib, sizeof lib, "%s/lib", root) > 0 &&
+			    snprintf(clang_dir, sizeof clang_dir, "%s/clang", lib) > 0 &&
+			    snprintf(fixture, sizeof fixture, "%s/fixture", clang_dir) > 0 &&
+			    snprintf(inc, sizeof inc, "%s/include", fixture) > 0 &&
+			    snprintf(first, sizeof first, "%s/prism_system_first.h", inc) > 0 &&
+			    snprintf(second, sizeof second, "%s/prism_system_second.h", inc) > 0 &&
+			    snprintf(source, sizeof source, "%s/main.c", root) > 0 && mkdir(root, 0700) == 0 &&
+			    mkdir(lib, 0700) == 0 && mkdir(clang_dir, 0700) == 0 && mkdir(fixture, 0700) == 0 &&
+			    mkdir(inc, 0700) == 0;
+			if (setup) {
+				setup = write_text_file(first, "struct prism_system_header_pack { char c; int i; };\n") &&
+				    write_text_file(second,
+						    "#ifdef PRISM_SYSTEM_SWITCH\n"
+						    "enum { prism_system_second_saw_switch = 1 };\n"
+						    "#else\n"
+						    "enum { prism_system_second_saw_switch = 0 };\n"
+						    "#endif\n") &&
+				    write_text_file(source,
+						    "#define PRISM_SYSTEM_SWITCH 1\n"
+						    "#pragma pack(push, 1)\n"
+						    "#include <prism_system_first.h>\n"
+						    "#pragma pack(pop)\n"
+						    "#undef PRISM_SYSTEM_SWITCH\n"
+						    "#include <prism_system_second.h>\n"
+						    "_Static_assert(prism_system_second_saw_switch == 0, \"undef ordering\");\n"
+						    "_Static_assert(sizeof(struct prism_system_header_pack) == 5, \"pragma ordering\");\n"
+						    "int prism_system_header_order_value;\n");
+			}
+			if (!setup) {
+				ok = 0;
+			} else {
+				const char *flags[] = {"-isystem", inc};
+				PrismFeatures f = prism_defaults();
+				f.flatten_headers = false;
+				f.compiler_flags = flags;
+				f.compiler_flags_count = N(flags);
+				PrismResult result = prism_transpile_file(source, f);
+				PPARSE_CTX();
+				ok = ok && result.status == PRISM_OK && result.output &&
+				     compile_output(result.output, 0) == 0 &&
+				     !(_pc->features & PPARSE_F_FLATTEN);
+				prism_free(&result);
+			}
+			unlink(first);
+			unlink(second);
+			unlink(source);
+			rmdir(inc);
+			rmdir(fixture);
+			rmdir(clang_dir);
+			rmdir(lib);
+			rmdir(root);
 		}
 		if (before && !ok && failed_action && !*failed_action) *failed_action = *p;
 		if (getenv("PRISM_INTERNAL_TRACE"))
 			fprintf(stderr, "internal %c: %s%s\n", *p, ok ? "ok" : "failed",
 				before ? "" : " (earlier failure)");
+	}
+	return ok;
+}
+#endif
+
+#ifdef _WIN32
+static int run_windows_internal(const Recipe *r, char *failed_action) {
+	int ok = 1;
+	for (const char *p = r->sequence; p && *p; p++) {
+		int before = ok;
+		if (*p == 'U') {
+			/* The native Unicode environment must round-trip through Prism's UTF-8
+			 * spawn snapshot and back into CreateProcessW's UTF-16 block. */
+			const wchar_t name[] = L"PRISM_TEST_UNICODE_ENV";
+			const wchar_t value[] = L"\u03c0\u4e2d";
+			const wchar_t want[] = L"PRISM_TEST_UNICODE_ENV=\u03c0\u4e2d";
+			SetLastError(ERROR_SUCCESS);
+			DWORD saved_len = GetEnvironmentVariableW(name, NULL, 0);
+			DWORD saved_error = GetLastError();
+			wchar_t *saved = saved_len ? malloc((size_t)saved_len * sizeof(*saved)) : NULL;
+			int had_saved = saved_len != 0 || saved_error == ERROR_SUCCESS;
+			if ((saved_len && (!saved || GetEnvironmentVariableW(name, saved, saved_len) == 0)) ||
+			    !SetEnvironmentVariableW(name, value)) {
+				ok = 0;
+			} else {
+				char **env = build_clean_environ();
+				wchar_t *block = win32_build_env_block(env);
+				const char want_utf8[] = "\xcf\x80\xe4\xb8\xad";
+				const char *split[4] = {0};
+				int split_n = 0;
+				char *split_dup = NULL;
+				cc_split_into_argv(split, &split_n,
+						   "C:\\Users\\O'Brien\\cl.exe -IC:\\O'Brien\\include", &split_dup);
+				int found = 0;
+				for (wchar_t *entry = block; block && *entry; ) {
+					if (wcscmp(entry, want) == 0) found = 1;
+					while (*entry) entry++;
+					entry++;
+				}
+				ok = ok && env && block && found && prism_getenv("PRISM_TEST_UNICODE_ENV") &&
+				     !strcmp(prism_getenv("PRISM_TEST_UNICODE_ENV"), want_utf8) && split_dup &&
+				     split_n == 2 && !strcmp(split[0], "C:\\Users\\O'Brien\\cl.exe") &&
+				     !strcmp(split[1], "-IC:\\O'Brien\\include");
+				free(split_dup);
+				free(block);
+				free(env);
+			}
+			if (had_saved) SetEnvironmentVariableW(name, saved ? saved : L"");
+			else SetEnvironmentVariableW(name, NULL);
+			free(saved);
+
+			/* MSVC options are parsed before source classification. In particular,
+			 * /Fo is not /c, and slash-option operands must never become Prism TUs. */
+			char *outputs[] = {"prism", "/c", "/Fo:", "obj.obj", "/Fe:", "app.exe", "main.c"};
+			Cli cli = cli_parse(N(outputs), outputs);
+			int cli_ok = cli.compile_only && cli.source_count == 1 &&
+			     !strcmp(cli.sources[0], "main.c") && cli.msvc_obj_output &&
+			     !strcmp(cli.msvc_obj_output, "obj.obj") && cli.msvc_exe_output &&
+			     !strcmp(cli.msvc_exe_output, "app.exe") && cli.output && !strcmp(cli.output, "obj.obj");
+			cli_free(&cli);
+			char *force[] = {"prism", "/FI", "force.c", "main.c"};
+			cli = cli_parse(N(force), force);
+			cli_ok = cli_ok && cli.source_count == 1 && !strcmp(cli.sources[0], "main.c") &&
+				 cli.cc_arg_count == 2 && !strcmp(cli.cc_args[0], "/FI") && !strcmp(cli.cc_args[1], "force.c");
+			cli_free(&cli);
+			char *define[] = {"prism", "/D", "NAME=foo.c", "main.c"};
+			cli = cli_parse(N(define), define);
+			cli_ok = cli_ok && cli.source_count == 1 && !strcmp(cli.sources[0], "main.c") &&
+				 cli.cc_arg_count == 2 && !strcmp(cli.cc_args[0], "/D") && !strcmp(cli.cc_args[1], "NAME=foo.c");
+			cli_free(&cli);
+			char *preprocess[] = {"prism", "/E", "main.c"};
+			cli = cli_parse(N(preprocess), preprocess);
+			/* Preprocess passthrough deliberately leaves the input in the
+			 * compiler argument list. It is not a Prism source to transpile. */
+			cli_ok = cli_ok && cli.passthrough && cli.source_count == 0 &&
+				 cli.cc_arg_count == 1 && !strcmp(cli.cc_args[0], "main.c");
+			cli_free(&cli);
+			char *stdin_source[] = {"prism", "-"};
+			cli = cli_parse(N(stdin_source), stdin_source);
+			cli_ok = cli_ok && cli.source_count == 1 && !strcmp(cli.sources[0], "-");
+			cli_free(&cli);
+
+			/* cl accepts UTF-16 response files. Also lock its Windows quote rule:
+			 * two slashes before a quote yield one literal slash and close quotes. */
+			char rsp_path[PATH_MAX], rsp_arg[PATH_MAX + 2];
+			snprintf(rsp_path, sizeof rsp_path, "%sprism_recipe_utf16_rsp_%lu.rsp", get_tmp_dir(),
+				 (unsigned long)GetCurrentProcessId());
+			FILE *rsp = fopen(rsp_path, "wb");
+			const char utf16_text[] = "-DPRISM_UTF16=1 x.c\n";
+			int rsp_ok = rsp && fputc(0xff, rsp) != EOF && fputc(0xfe, rsp) != EOF;
+			for (size_t i = 0; rsp_ok && i < sizeof utf16_text - 1; i++)
+				rsp_ok = fputc((unsigned char)utf16_text[i], rsp) != EOF && fputc(0, rsp) != EOF;
+			if (rsp && fclose(rsp) != 0) rsp_ok = 0;
+			snprintf(rsp_arg, sizeof rsp_arg, "@%s", rsp_path);
+			if (rsp_ok) {
+				char *rsp_argv[] = {"prism", rsp_arg};
+				cli = cli_parse(N(rsp_argv), rsp_argv);
+				rsp_ok = cli.source_count == 1 && cli.cc_arg_count == 1 &&
+					 !strcmp(cli.sources[0], "x.c") && !strcmp(cli.cc_args[0], "-DPRISM_UTF16=1");
+				cli_free(&cli);
+			}
+			unlink(rsp_path);
+			char **tokens = NULL, **owned_tokens = NULL;
+			int token_n = 0, token_cap = 0, owned_n = 0, owned_cap = 0;
+			int quote_ok = rsp_tokenize_buf("-DMSG=\"C:\\tmp\\\\\" \"C:\\Users\\O'Brien\\x.c\"",
+							  strlen("-DMSG=\"C:\\tmp\\\\\" \"C:\\Users\\O'Brien\\x.c\""),
+							  &tokens, &token_n, &token_cap, &owned_tokens, &owned_n, &owned_cap) == 0 &&
+				 token_n == 2 && !strcmp(tokens[0], "-DMSG=C:\\tmp\\") &&
+				 !strcmp(tokens[1], "C:\\Users\\O'Brien\\x.c");
+			for (int i = 0; i < owned_n; i++) free(owned_tokens[i]);
+			free(owned_tokens);
+			free(tokens);
+			ok = ok && cli_ok && rsp_ok && quote_ok;
+		}
+		if (before && !ok && failed_action && !*failed_action) *failed_action = *p;
 	}
 	return ok;
 }
@@ -1087,6 +2135,7 @@ static int run_lifecycle(const Recipe *r, Stats *st, const AxisValue *sel[4]) {
 		if (*p == 'R') prism_reset();
 		else if (*p == 'C') prism_thread_cleanup();
 		else if (*p == 'I') pparse_ctx_init();
+		else if (*p == 'F') prism_free(NULL);
 		else if (*p == 'E') {
 			PrismResult x = prism_transpile_source("defer (void)0;", "bad.c", f);
 			ok = x.status != PRISM_OK;
@@ -1338,7 +2387,12 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 			else fail(st, r, none, "internal action %c failed in sequence %s",
 				  failed_action ? failed_action : '?', r->sequence);
 #else
-			st->skipped++;
+			if ((r->requires & CAP_WINDOWS) && run_windows_internal(r, &failed_action)) st->passed++;
+			else if (r->requires & CAP_WINDOWS)
+				fail(st, r, none, "internal action %c failed in sequence %s",
+				     failed_action ? failed_action : '?', r->sequence);
+			else
+				st->skipped++;
 #endif
 			continue;
 		}
@@ -2114,7 +3168,15 @@ static const char *const av_run_sep[] = {"prism", "run", "x.c", "--", "--flag"};
 
 static const Recipe recipes[] = {
 	{"internal/platform", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
-	 NULL, NULL, NULL, 0, "KCSPODAFJTN"},
+	 NULL, NULL, NULL, 0, "KCSPODAFJTRMNYZWGILB"},
+	{"internal/system-header-ordering", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "b"},
+	{"internal/api-reset", NULL, NULL, {0}, O_INTERNAL, 0, 0, 0, NULL, NULL, NULL, 0, "Q"},
+	{"internal/api-validation", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX, NULL, NULL, NULL, 0, "V"},
+	{"internal/api-first-oom", NULL, NULL, {0}, O_INTERNAL, 0, 0, 0, NULL, NULL, NULL, 0, "E"},
+	{"internal/clean-environ", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX, NULL, NULL, NULL, 0, "H"},
+	{"internal/windows-unicode-environ", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_WINDOWS,
+	 NULL, NULL, NULL, 0, "U"},
 	{"fault/alloc-source-api", "@0@", NULL, {&ax_alloc_fault}, O_ALLOC_FAIL, 0, 0, 0},
 	{"fault/alloc-source-reject", "@0@", NULL, {&ax_alloc_fault_reject}, O_ALLOC_FAIL | O_REJECT,
 	 0, 0, 0},
@@ -2144,7 +3206,7 @@ static const Recipe recipes[] = {
 	{"driver/function-macro-preserve",
 	 "#define SUM(a,b) ((a)+(b))\n#include <stddef.h>\nint f(void){return SUM(2,3);}\n", NULL, {0},
 	 O_DRIVER_TRANSPILE | O_COMPILE, 0, FB_FLAT | FB_LINE, CAP_POSIX,
-	 "#ifndef SUM\n|#define SUM(a,b) ((a)+(b))", "#ifndef SUM(a,b)"},
+	 "return ((2)+(3))", "#ifndef SUM"},
 	{"runtime/passthrough-equivalence", "@0@", NULL, {&ax_passthrough},
 	 O_OK | O_OUTPUT_EQ_OFF | O_REFERENCE_RUN, 0, FB_LINE, CAP_POSIX},
 	{"corpus/retired-regressions", "@0@", NULL, {&ax_corpus},
@@ -2473,6 +3535,12 @@ static const Recipe recipes[] = {
 	 {0}, O_OK, 0, FB_LINE, 0},
 
 	{"reject/defer-filescope", "defer (void)0;", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
+	/* A second close brace reaches emitter recovery after the function scope has
+	 * been popped. This must be a normal syntax error, never scope_stack[-1]. */
+	{"reject/stray-close-brace", "int f(void){}}", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
+	{"reject/fuzz-file-scope-orelse",
+	 "orelse****\372*/*\377/*\377* \372  **\372*/\337", NULL, {0}, O_ANY_STATUS | O_REPLAY,
+	 FB_DEFER | FB_ORELSE | FB_BOUNDS | FB_AUR, FB_ZERO | FB_LINE | FB_AS | FB_WARN},
 	{"reject/defer-return", "void f(void){defer return;}", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
 	{"reject/defer-break", "void f(void){defer break;}", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
 	{"reject/defer-continue", "void f(void){defer continue;}", NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE},
@@ -2507,6 +3575,12 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX | CAP_VLA, NULL, NULL, NULL, 0},
 	{"runtime/bounds-in", "int main(void){int a[4]={1,2,3,4};volatile int i=3;return a[i]==4?0:1;}", NULL,
 	 {0}, O_OK | O_RUN, FB_BOUNDS, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
+	{.id="runtime/orelse-multidecl-defer-return",
+	 .source="static int logv;static int g(int x){return x;}static int choose(int a,int b){return a+b-18;}static void clean(void){logv++;}static int f(int v){defer clean();int x=g(v) orelse return choose(17,18),y=9;return x+y;}int main(void){logv=0;if(f(0)!=17||logv!=1)return 1;logv=0;return f(3)==12&&logv==1?0:2;}",
+	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
+	{.id="runtime/bounds-shadow-timeline",
+	 .source="int main(void){volatile int i=1;int sum=0;int a[2]={1,2};sum+=a[i];{int a[2]={2,3};sum+=a[i];{int a[2]={3,4};sum+=a[i];{int a[2]={4,5};sum+=a[i];{int a[2]={5,6};sum+=a[i];{int a[2]={6,7};sum+=a[i];{int a[2]={7,8};sum+=a[i];{int a[2]={8,9};sum+=a[i];{int a[2]={9,10};sum+=a[i];sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];return sum==108?0:1;}",
+	 .oracle=O_OK|O_RUN, .set_features=FB_BOUNDS, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
 	{.id="runtime/volatile-atomic-once",
 	 .source="static int g_calls,fb_calls;static int g(int v){g_calls++;return v;}static int fb(int v){fb_calls++;return v;}int main(void){volatile int a=g(0) orelse fb(9);if(a!=9||g_calls!=1||fb_calls!=1)return 1;g_calls=fb_calls=0;_Atomic int b=g(7) orelse fb(3);return b==7&&g_calls==1&&fb_calls==0?0:2;}",
 	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
@@ -2532,6 +3606,8 @@ static const Recipe recipes[] = {
 	 0, FB_LINE, 0, NULL, NULL, NULL, 0, "TETET"},
 	{"lifecycle/cleanup", "int f(void){int x;defer(void)0;return x;}", NULL, {0}, O_LIFECYCLE,
 	 0, FB_LINE, 0, NULL, NULL, NULL, 0, "TCITCIT"},
+	{"lifecycle/null-free", "int f(void){return 0;}", NULL, {0}, O_LIFECYCLE,
+	 0, FB_LINE, 0, NULL, NULL, NULL, 0, "FT"},
 
 	{"cli/help", NULL, NULL, {0}, O_CLI, 0, 0, 0, NULL, NULL, NULL, 0, NULL, av_help, 2,
 	 CLI_DEFAULT, CLI_ACT_HELP, 0, 0},

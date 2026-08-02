@@ -658,7 +658,12 @@ static void *pparse_arena_alloc(PParseArena *arena, size_t size) {
 }
 
 static void *pparse_arena_realloc(PParseArena *arena, void *old, size_t old_size, size_t new_size) {
-	if (old) {
+	/* Arena callers currently only grow, but this primitive is also used by
+	 * generic capacity helpers.  A shrink must preserve the allocation rather
+	 * than underflowing the copy/zero lengths below. */
+	if (!old) old_size = 0;
+	if (old && new_size <= old_size) return old;
+	if (old && arena->current) {
 		size_t aligned_old = (old_size + (PPARSE_ARENA_ALIGN - 1)) & ~(size_t)(PPARSE_ARENA_ALIGN - 1);
 		if ((char *)old + aligned_old == arena->current->data + arena->current->used) {
 			size_t aligned_new = (new_size + (PPARSE_ARENA_ALIGN - 1)) & ~(size_t)(PPARSE_ARENA_ALIGN - 1);
@@ -738,16 +743,14 @@ static void pparse_arena_restore(PParseArena *arena, PParseArenaMark mark) {
 	if (mark.block) mark.block->used = mark.used;
 }
 
-static void pparse_ctx_init(void) {
-	if (pparse_ctx) return;
+static bool pparse_ctx_init(void) {
+	if (pparse_ctx) return true;
 	PParseContext *c = calloc(1, sizeof(PParseContext));
-	if (!c) {
-		fprintf(stderr, "prism: out of memory\n");
-		exit(1);
-	}
+	if (!c) return false;
 	c->features = PPARSE_F_DEFER | PPARSE_F_ZEROINIT | PPARSE_F_LINE_DIR | PPARSE_F_FLATTEN | PPARSE_F_ORELSE;
 	c->tp_count = 1; // 0 reserved as NULL sentinel
 	pparse_ctx = c;
+	return true;
 }
 
 static void pparse_token_pool_ensure(size_t need) {
@@ -11003,7 +11006,8 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 						 PPARSE_TT_BITINT | PPARSE_TT_ALIGNAS | PPARSE_TT_INLINE | PPARSE_TT_ATTR | PPARSE_TT_RETURN |
 						 PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_GOTO)) &&
 				    !pparse_is_known_typedef(pv)));
-			if (cur_sid < pparse_scope_tree_count && pparse_scope_tree[cur_sid].is_struct && expr_ctx)
+			if (pparse_scope_tree && cur_sid < pparse_scope_tree_count &&
+			    pparse_scope_tree[cur_sid].is_struct && expr_ctx)
 				pparse_error_tok(ps->tok, PPARSE_ERR_ORELSE_STMT_LEVEL);
 			if (ps->p1d_init_brace_depth > 0 && expr_ctx &&
 			    !(pparse_ann(ps->tok) & P1_OE_BRACKET))
