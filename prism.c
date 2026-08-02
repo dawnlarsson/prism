@@ -66,7 +66,6 @@ typedef struct {
 
 /* Thread-local driver/emitter state; parse.c owns language state. */
 typedef struct {
-	int error_col;
 	const char *extra_compiler;
 	const char **extra_compiler_flags;
 	int extra_compiler_flags_count;
@@ -168,6 +167,22 @@ typedef enum {
 	DEFER_TO_DEPTH	// DEFER_TO_DEPTH=stop at given depth (for goto)
 } DeferEmitMode;
 
+static inline bool ascii_hspace(char c) {
+	return (c == ' ') | (c == '\t');
+}
+
+static inline bool ascii_line_space(char c) {
+	return ascii_hspace(c) | (c == '\n') | (c == '\r');
+}
+
+static inline bool ascii_line_done(char c) {
+	return (c == '\0') | (c == '\n');
+}
+
+static inline bool ascii_space(char c) {
+	return ascii_line_space(c) | (c == '\f') | (c == '\v');
+}
+
 typedef struct {
 	PParseToken *stmt, *end, *defer_kw;
 } DeferEntry;
@@ -178,7 +193,6 @@ typedef enum {
 	SCOPE_FOR_PAREN,  // for( ... ) — first ';' ends init, not stmt
 	SCOPE_CTRL_PAREN, // if/while/switch( ... )
 	SCOPE_GENERIC,	  // _Generic( ... )
-	SCOPE_TERNARY,	  // ? ... : — popped on matching ':'
 } ScopeKind;
 
 static inline bool is_brace_scope(ScopeKind k) {
@@ -239,8 +253,10 @@ typedef struct {
 
 extern char **environ;
 static char **cached_clean_env = NULL;
+#ifndef PRISM_LIB_MODE
 static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
+#endif
 
 #define SIGNAL_TEMPS_MAX 256
 static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
@@ -534,8 +550,7 @@ static inline PRISM_ALWAYS_INLINE void out_char(char c) {
 	out_buf[out_buf_pos++] = c;
 }
 
-static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
-	if (pparse_PRISM_UNLIKELY(len <= 0)) return;
+static inline PRISM_ALWAYS_INLINE void out_str_nonempty(const char *s, int len) {
 	if (pparse_PRISM_UNLIKELY(out_buf_pos + len >= OUT_BUF_SIZE)) {
 		out_str_slow(s, len);
 		return;
@@ -544,10 +559,15 @@ static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
 	out_buf_pos += len;
 }
 
+static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
+	if (pparse_PRISM_UNLIKELY(len <= 0)) return;
+	out_str_nonempty(s, len);
+}
+
 /* Compile-time string literal: exact-width inline store, no size ladder.
  * (Was gated on PRISM_MEM_OUT_LIT_STATIC, part of the removed mem.c kit; the
  * out_str fallback is what every build actually used.) */
-#define OUT_LIT(s) out_str((s), (int)sizeof(s) - 1)
+#define OUT_LIT(s) out_str_nonempty((s), (int)sizeof(s) - 1)
 
 // Check if the effective compiler is MSVC, falling back to PRISM_DEFAULT_CC
 static inline bool target_is_msvc(void) {
@@ -850,7 +870,7 @@ static inline bool in_ctrl_paren(void) {
 	for (int i = emit_scope_depth - 1; i >= 0; i--) {
 		ScopeKind k = scope_stack[i].kind;
 		if (is_brace_scope(k)) return false;
-		if (k == SCOPE_FOR_PAREN || k == SCOPE_CTRL_PAREN) return true;
+		if ((k == SCOPE_FOR_PAREN) | (k == SCOPE_CTRL_PAREN)) return true;
 	}
 	return false;
 }
@@ -923,7 +943,6 @@ static inline bool emit_newline_before_decl_after_stmt_boundary(PParseToken *pre
 	// Member declarations in struct/union/enum bodies use `;` between specifiers;
 	if (_ps->aggregate_member_nest > 0) return false;
 	if (in_struct_body()) return false;
-	if (pparse_at_bol(tok)) return false;
 	return (pparse_ann(tok) & P1_IS_DECL) != 0;
 }
 
@@ -962,10 +981,10 @@ static PRISM_HOT void emit_tok(PParseToken *tok) {
 		if ((feat & PPARSE_F_FLATTEN) && tok->len >= 8 && loc[0] == '#') {
 			const char *p = loc + 1;
 			const char *end = loc + tok->len;
-			while (p < end && (*p == ' ' || *p == '\t')) p++;
-			if (end - p >= 7 && prism_memeq_static(p, "define", 6) && (p[6] == ' ' || p[6] == '\t')) {
+			while (p < end && ascii_hspace(*p)) p++;
+			if (end - p >= 7 && prism_memeq_static(p, "define", 6) && ascii_hspace(p[6])) {
 				p += 6;
-				while (p < end && (*p == ' ' || *p == '\t')) p++;
+				while (p < end && ascii_hspace(*p)) p++;
 				const char *name = p;
 				while (p < end && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
 						   (*p >= '0' && *p <= '9') || *p == '_'))
@@ -1223,16 +1242,9 @@ static void check_enum_typedef_defer_shadow(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!pparse_feat(PPARSE_F_DEFER) || defer_count == 0 || emit_block_depth <= 0) return;
 	if (!(tok->tag & PPARSE_TT_TYPEDEF) && !pparse_is_enum_kw(tok)) return;
-	int depth = 0;
-	PPARSE_FOR_TAIL(t, tok) {
+	PParseToken *end = pparse_skip_to_semicolon(tok, NULL);
+	PPARSE_FOR_RANGE(t, tok, end)
 		if (pparse_ann(t) & P1_DEFER_SHADOW_NAME) check_defer_var_shadow(t);
-		if (t->flags & PPARSE_TF_OPEN)
-			depth++;
-		else if (t->flags & PPARSE_TF_CLOSE) {
-			if (depth > 0) depth--;
-		} else if (depth == 0 && pparse_match_ch(t, ';'))
-			break;
-	}
 }
 
 static inline bool is_orelse_keyword(PParseToken *tok) {
@@ -1289,7 +1301,7 @@ static void emit_type_range(PParseToken *start, PParseToken *end, bool strip_con
 	}
 }
 
-static PParseToken *emit_expr_to_stop(PParseToken *tok, PParseToken *stop, bool check_orelse) {
+static PParseToken *emit_expr_to_stop(PParseToken *tok, PParseToken *stop) {
 	PPARSE_CTX();
 	while (tok->kind != PPARSE_TK_EOF) {
 		if (tok->flags & PPARSE_TF_OPEN) {
@@ -1297,7 +1309,6 @@ static PParseToken *emit_expr_to_stop(PParseToken *tok, PParseToken *stop, bool 
 			continue;
 		}
 		if (pparse_match_ch(tok, ';') || (stop && tok == stop)) break;
-		if (check_orelse && is_orelse_keyword(tok)) break;
 		EMIT_TRY_TYPEOF_ORELSE(tok)
 		tok = emit_advance(tok);
 	}
@@ -1592,10 +1603,9 @@ static inline PParseToken *emit_stmt_expr(PParseToken *t) {
 	PPARSE_CTX();
 	emit_tok(t); // '('
 	PParseToken *se_end = pparse_pair_known(t);
-	PParseToken *inner = pparse_next(_pc, t); // '{'
 	bool saved_ss = emit_at_stmt_start;
 	CtrlState saved_ctrl = ctrl_state;
-	inner = emit_statements(inner, se_end, EMIT_NORMAL);
+	emit_statements(pparse_next(_pc, t), se_end, EMIT_NORMAL); // starts at '{'
 	emit_at_stmt_start = saved_ss;
 	ctrl_state = saved_ctrl;
 	emit_tok(se_end);
@@ -1835,7 +1845,7 @@ static PParseToken *scan_bracket_orelse(PParseToken *open, PParseToken *close, P
 			if (pparse_match_ch(open, '[') && pparse_match_ch(t, '(') && pparse_next(_pc, pp) == close) {
 				PParseToken *hit = find_ann_orelse(pparse_next(_pc, t), pp);
 				if (hit) {
-					if (paren_open_out) *paren_open_out = t;
+					*paren_open_out = t;
 					return hit;
 				}
 			}
@@ -1863,25 +1873,12 @@ static void bo_snapshot_ids(unsigned **dst, const unsigned *src, int n) {
 }
 
 static inline void emit_type_with_pragma_prelude(
-    PParseToken *pragma_start, PParseToken *type_start, PParseToken *type_end, PParseToken *raw_tok, bool is_split) {
+	PParseToken *pragma_start, PParseToken *type_start, PParseToken *type_end, bool is_split) {
 	PRISM_STATE();
-	PPARSE_CTX();
 	int saved_oe = _ps->bracket_oe_count, saved_dim = _ps->bracket_dim_count;
 	_ps->bracket_oe_count = 0;
 	_ps->bracket_dim_count = 0;
-	/* Bound the prelude at raw only when raw precedes the type. Walk because
-	 * linked token segments are neither address- nor index-ordered. */
 	PParseToken *prelude_end = type_start;
-	if (raw_tok) {
-		int budget = 64;
-		for (PParseToken *p = pragma_start; p && p != type_start && budget-- > 0;
-		     p = pparse_next(_pc, p)) {
-			if (p == raw_tok) {
-				prelude_end = raw_tok;
-				break;
-			}
-		}
-	}
 	if (pragma_start != prelude_end) emit_range(pragma_start, prelude_end);
 	emit_type_range(type_start, type_end, false, is_split);
 	_ps->bracket_oe_count = saved_oe;
@@ -2335,7 +2332,8 @@ static PParseToken *handle_const_orelse_fallback(PParseToken *tok,
 	emit_range(val_start, orelse_tok);
 	OUT_LIT(");");
 	for (;;) {
-		if ((tok->tag & (PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_GOTO)) || pparse_match_ch(tok, '{')) {
+		if (((tok->tag & (PPARSE_TT_RETURN | PPARSE_TT_BREAK | PPARSE_TT_CONTINUE | PPARSE_TT_GOTO)) != 0) |
+		    pparse_match_ch(tok, '{')) {
 			OUT_LIT(" if (!__prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(")");
@@ -2344,7 +2342,7 @@ static PParseToken *handle_const_orelse_fallback(PParseToken *tok,
 		}
 
 		/* volatile/_Atomic temps must not use `t = t ? t : fb` (double load). */
-		if (type->has_volatile || type->has_atomic) {
+		if (type->has_volatile | type->has_atomic) {
 			OUT_LIT(" if (!__prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(") __prism_oe_");
@@ -2492,7 +2490,6 @@ static PParseToken *process_declarators(PParseToken *tok,
 				  PParseTypeSpec *type,
 				  PParseToken *type_start,
 				  PParseToken *pragma_start,
-				  PParseToken *raw_tok,
 				  bool brace_wrap) {
 	PRISM_STATE();
 	PPARSE_CTX();
@@ -2557,8 +2554,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 
 		if (need_type_emit) {
 			if (!is_const_orelse_fallback)
-				emit_type_with_pragma_prelude(
-				    pragma_start, type_start, type->end, raw_tok, true);
+				emit_type_with_pragma_prelude(pragma_start, type_start, type->end, true);
 			need_type_emit = false;
 		}
 
@@ -2567,8 +2563,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 			if (!is_const_orelse_fallback) {
 				if (recipe & P1_DECL_AUTO_STATIC)
 					OUT_LIT("static ");
-				emit_type_with_pragma_prelude(
-				    pragma_start, type_start, type->end, raw_tok, false);
+				emit_type_with_pragma_prelude(pragma_start, type_start, type->end, false);
 			}
 			first_decl = false;
 		}
@@ -2604,7 +2599,7 @@ static PParseToken *process_declarators(PParseToken *tok,
 		if (has_bo) bo_restore(&bo_frame);
 		tok = decl.end;
 		uint8_t emit_zk = zero_kind;
-		if (emit_zk == P1Z_SCALAR || emit_zk == P1Z_AGG) {
+		if ((emit_zk == P1Z_SCALAR) | (emit_zk == P1Z_AGG)) {
 			if (emit_zk == P1Z_AGG) OUT_LIT(" = {0}");
 			else
 				OUT_LIT(" = 0");
@@ -2700,7 +2695,7 @@ static PParseToken *try_zero_init_decl(PParseToken *tok) {
 
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
 	if (brace_wrap) ctrl_reset();
-	return process_declarators(type.end, &type, start, pragma_start, NULL, brace_wrap);
+	return process_declarators(type.end, &type, start, pragma_start, brace_wrap);
 }
 
 static PParseToken *emit_expr_to_semicolon(PParseToken *tok) {
@@ -2709,7 +2704,7 @@ static PParseToken *emit_expr_to_semicolon(PParseToken *tok) {
 	int ternary_depth = 0;
 	bool expr_at_stmt_start = false;
 	while (tok->kind != PPARSE_TK_EOF) {
-		if (pparse_match_ch(tok, '(') || pparse_match_ch(tok, '[')) {
+		if (pparse_match_set(tok, pparse_CH('(') | pparse_CH('['))) {
 			tok = walk_balanced(tok);
 			expr_at_stmt_start = false;
 			continue;
@@ -2905,7 +2900,7 @@ static PParseToken *emit_return_body(PParseToken *tok, PParseToken *stop, bool a
 				OUT_LIT(" = (");
 			} else
 				OUT_LIT(" (");
-			if (stop) tok = emit_expr_to_stop(tok, stop, false);
+			if (stop) tok = emit_expr_to_stop(tok, stop);
 			else
 				tok = emit_expr_to_semicolon(tok);
 			OUT_LIT(");");
@@ -2921,7 +2916,7 @@ static PParseToken *emit_return_body(PParseToken *tok, PParseToken *stop, bool a
 		OUT_LIT(" return");
 		if (!is_empty) {
 			out_char(' ');
-			if (stop) tok = emit_expr_to_stop(tok, stop, false);
+			if (stop) tok = emit_expr_to_stop(tok, stop);
 			else
 				tok = emit_expr_to_semicolon(tok);
 		}
@@ -3059,7 +3054,7 @@ static PParseToken *handle_goto_keyword(PParseToken *tok) {
 	PPARSE_CTX();
 	PParseToken *goto_tok = tok;
 	tok = pparse_next(_pc, tok);
-	if (pparse_feat(PPARSE_F_DEFER)) {
+	if (pparse_feat(PPARSE_F_DEFER) && emit_scope_depth > 0) {
 		// Skip C23 attributes between goto and target: goto [[attr]] *ptr;
 		PParseToken *after_attrs = pparse_skip_noise(_pc, tok);
 		if (pparse_match_ch(after_attrs, '*')) {
@@ -3126,16 +3121,16 @@ static PParseToken *handle_open_brace(PParseToken *tok) {
 	ctrl_state.pending_for_paren = false;
 	ctrl_state.parens_just_closed = false;
 	uint32_t ann = pparse_ann(tok);
-	uint16_t sid = pparse_scope_id(tok);
-	PParseScopeInfo *si = sid ? &pparse_scope_tree[sid] : NULL;
+	uint16_t sid = (uint16_t)tok->parse_data;
+	PParseScopeInfo *si = &pparse_scope_tree[sid];
 	bool is_init_scope = ann & P1_SCOPE_INIT;
 	tok = emit_advance(tok);
 	scope_push_kind(is_init_scope ? SCOPE_INIT : SCOPE_BLOCK);
 	ScopeNode *s = &scope_stack[emit_scope_depth - 1];
 	s->is_loop = ann & P1_SCOPE_LOOP;
 	s->is_switch = ann & P1_SCOPE_SWITCH;
-	s->is_struct = is_init_scope || (si && si->is_struct);
-	s->is_stmt_expr = si && si->is_stmt_expr;
+	s->is_struct = is_init_scope || si->is_struct;
+	s->is_stmt_expr = si->is_stmt_expr;
 	if (did_push) s->is_ctrl_se = true;
 
 	if (s->is_stmt_expr) s->saved_defer_shadow_count = defer_shadow_count;
@@ -3155,7 +3150,7 @@ static PParseToken *handle_close_brace(PParseToken *tok) {
 	while (emit_scope_depth > 0 && !is_brace_scope(scope_stack[emit_scope_depth - 1].kind)) scope_pop();
 	if ((pparse_ann(tok) & P1_RAW_BLOCK) && _ps->raw_block_depth > 0)
 		_ps->raw_block_depth--;
-	if (pparse_feat(PPARSE_F_DEFER) && emit_scope_depth > 0) {
+	if (pparse_feat(PPARSE_F_DEFER)) {
 		ScopeNode *s = &scope_stack[emit_scope_depth - 1];
 		if (defer_count > s->defer_start_idx) {
 			emit_defers(DEFER_SCOPE);
@@ -3184,7 +3179,8 @@ static char **build_clean_environ(void) {
 	int j = 0;
 	for (char **e = environ; *e; e++) {
 #ifdef _WIN32
-		if (_strnicmp(*e, "CC=", 3) != 0 && _strnicmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
+		if (_strnicmp(*e, "CC=", 3) != 0 && _strnicmp(*e, "PRISM_CC=", 9) != 0)
+			env[j++] = *e;
 #else
 		if (strncmp(*e, "CC=", 3) != 0 && strncmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
 #endif
@@ -3206,30 +3202,19 @@ static int wait_for_child(pid_t pid) {
 	return -1;
 }
 
-static int spawn_command(char **argv, bool quiet_stderr) {
+static int spawn_command(char **argv, posix_spawn_file_actions_t *actions) {
 	char **env = build_clean_environ();
 	if (!env) return -1;
-	posix_spawn_file_actions_t actions;
-	posix_spawn_file_actions_t *actions_ptr = NULL;
-	int devnull = -1;
-	if (quiet_stderr) {
-		posix_spawn_file_actions_init(&actions);
-		devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0) posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
-		actions_ptr = &actions;
-	}
 
 	/* Transient under parallel builds: retry EAGAIN/ETXTBSY briefly. */
 	pid_t pid;
 	int err = 0;
 	for (int attempt = 0; attempt < 5; attempt++) {
-		err = posix_spawnp(&pid, argv[0], actions_ptr, NULL, argv, env);
-		if (err != EAGAIN && err != ETXTBSY) break;
+		err = posix_spawnp(&pid, argv[0], actions, NULL, argv, env);
+		if ((err != EAGAIN) & (err != ETXTBSY)) break;
 		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
 		nanosleep(&nap, NULL);
 	}
-	if (actions_ptr) posix_spawn_file_actions_destroy(actions_ptr);
-	if (devnull >= 0) close(devnull);
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
 		return -1;
@@ -3239,59 +3224,59 @@ static int spawn_command(char **argv, bool quiet_stderr) {
 
 #ifndef _WIN32
 static int run_command(char **argv) {
-	return spawn_command(argv, false);
+	return spawn_command(argv, NULL);
 }
 
 static int run_command_quiet(char **argv) {
-	return spawn_command(argv, true);
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull >= 0) posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+	int status = spawn_command(argv, &actions);
+	posix_spawn_file_actions_destroy(&actions);
+	if (devnull >= 0) close(devnull);
+	return status;
 }
 #endif
 
-static int
-make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent) {
+static int make_temp_file(char *buf, const char *source_adjacent) {
 	int n;
-	if (source_adjacent) {
-		const char *slash = strrchr(source_adjacent, '/');
-		const char *bslash = strrchr(source_adjacent, '\\');
-		char dir_path[PATH_MAX];
-		if (bslash && (!slash || bslash > slash)) slash = bslash;
+	const char *slash = strrchr(source_adjacent, '/');
+	const char *bslash = strrchr(source_adjacent, '\\');
+	char dir_path[PATH_MAX];
+	if (bslash && (!slash || bslash > slash)) slash = bslash;
+	if (slash) {
+		int dir_len = (int)(slash - source_adjacent);
+		if ((size_t)dir_len >= sizeof(dir_path)) return -1;
+		memcpy(dir_path, source_adjacent, (size_t)dir_len);
+		dir_path[dir_len] = '\0';
+	} else
+		strcpy(dir_path, ".");
+	if (dir_has_write_bits(dir_path)) {
 		if (slash) {
 			int dir_len = (int)(slash - source_adjacent);
-			if ((size_t)dir_len >= sizeof(dir_path)) return -1;
-			memcpy(dir_path, source_adjacent, (size_t)dir_len);
-			dir_path[dir_len] = '\0';
+			n = snprintf(
+			    buf, PATH_MAX, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
 		} else
-			strcpy(dir_path, ".");
-		if (dir_has_write_bits(dir_path)) {
-			if (slash) {
-				int dir_len = (int)(slash - source_adjacent);
-				n = snprintf(
-				    buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
-			} else
-				n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
-			suffix_len = 2;
-			if (n >= 0 && (size_t)n < bufsize) {
-				int fd = mkstemps(buf, suffix_len);
-				if (fd >= 0) return fd;
-			}
+			n = snprintf(buf, PATH_MAX, ".%s.XXXXXX.c", source_adjacent);
+		if (n >= 0 && n < PATH_MAX) {
+			int fd = mkstemps(buf, 2);
+			if (fd >= 0) return fd;
 		}
-		const char *base = slash ? slash + 1 : source_adjacent;
-		n = snprintf(buf, bufsize, "%s.%s.XXXXXX.c", get_tmp_dir(), base);
-		suffix_len = 2;
-	} else
-		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix ? prefix : "prism_tmp");
-	if (n < 0 || (size_t)n >= bufsize) return -1;
-	return suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
+	}
+	const char *base = slash ? slash + 1 : source_adjacent;
+	n = snprintf(buf, PATH_MAX, "%s.%s.XXXXXX.c", get_tmp_dir(), base);
+	if (n < 0 || n >= PATH_MAX) return -1;
+	return mkstemps(buf, 2);
 }
 
-static int make_temp_file_registered(
-    char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent) {
+static int make_temp_file_registered(char *buf, const char *source_adjacent) {
 	sigset_t mask, oldmask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
 	sigprocmask(SIG_BLOCK, &mask, &oldmask);
-	int fd = make_temp_file(buf, bufsize, prefix, suffix_len, source_adjacent);
+	int fd = make_temp_file(buf, source_adjacent);
 	if (fd >= 0) signal_temps_register(buf);
 	sigprocmask(SIG_SETMASK, &oldmask, NULL);
 	return fd;
@@ -3311,44 +3296,33 @@ static const char **alloc_argv(int count) {
 	return args;
 }
 
-static const char *cc_next_token(const char *p, const char **start, int *len, bool terminate) {
-	while (*p == ' ' || *p == '\t') p++;
+static const char *cc_next_token(const char *p, const char **start, int *len) {
+	while (ascii_hspace(*p)) p++;
 	if (!*p) {
 		*start = p;
 		*len = 0;
 		return p;
 	}
-	if (*p == '"' || *p == '\'') {
+	if ((*p == '"') | (*p == '\'')) {
 		char q = *p++;
 		*start = p;
 		while (*p && *p != q) p++;
 		*len = (int)(p - *start);
-		if (*p) {
-			if (terminate) *(char *)p = '\0';
-			p++;
-		}
 	} else {
 		*start = p;
-		while (*p && *p != ' ' && *p != '\t') p++;
+		while (*p && !ascii_hspace(*p)) p++;
 		*len = (int)(p - *start);
-		if (terminate && *p) *(char *)p++ = '\0';
 	}
-	return p;
+	return p + (*p != '\0');
 }
 
 /* Recognize an unquoted `CC=/path with spaces/cc` as one argv entry. */
 static size_t cc_whole_string_exe(const char *cc, char *buf, size_t bufsz) {
-	if (!cc || !*cc) return 0;
-	while (*cc == ' ' || *cc == '\t') cc++;
+	while (ascii_hspace(*cc)) cc++;
 	size_t tlen = strlen(cc);
-	while (tlen > 0 && (cc[tlen - 1] == ' ' || cc[tlen - 1] == '\t')) tlen--;
-	if (tlen == 0 || tlen >= bufsz) return 0;
-	bool has_space = false;
-	for (size_t i = 0; i < tlen; i++) {
-		if (cc[i] == '"' || cc[i] == '\'') return 0;
-		if (cc[i] == ' ' || cc[i] == '\t') has_space = true;
-	}
-	if (!has_space) return 0;
+	while (tlen > 0 && ascii_hspace(cc[tlen - 1])) tlen--;
+	if ((tlen == 0) | (tlen >= bufsz)) return 0;
+	if ((strpbrk(cc, "\"'") != NULL) | (strpbrk(cc, " \t") == NULL)) return 0;
 	memcpy(buf, cc, tlen);
 	buf[tlen] = '\0';
 #ifdef _WIN32
@@ -3359,7 +3333,6 @@ static size_t cc_whole_string_exe(const char *cc, char *buf, size_t bufsz) {
 }
 
 static const char *cc_executable(const char *cc) {
-	if (!cc || !*cc) return cc;
 	/* Prefer the whole string when it is an unquoted path with spaces. */
 	{
 		static PRISM_THREAD_LOCAL char whole[PATH_MAX];
@@ -3367,7 +3340,7 @@ static const char *cc_executable(const char *cc) {
 	}
 	const char *start;
 	int len;
-	cc_next_token(cc, &start, &len, false);
+	cc_next_token(cc, &start, &len);
 	if (len == 0) return cc;
 	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 	if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
@@ -3377,8 +3350,8 @@ static const char *cc_executable(const char *cc) {
 }
 
 static void cc_split_into_argv(const char **args, int *argc, const char *cc, char **out_dup) {
-	if (out_dup) *out_dup = NULL;
-	if (!cc || !*cc) return;
+	*out_dup = NULL;
+	if (!*cc) return;
 	char *dup = strdup(cc);
 	if (!dup) {
 		args[(*argc)++] = cc;
@@ -3393,7 +3366,7 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 		if (tlen) {
 			memcpy(dup, probe, tlen + 1);
 			args[(*argc)++] = dup;
-			if (out_dup) *out_dup = dup;
+			*out_dup = dup;
 			return;
 		}
 	}
@@ -3401,28 +3374,13 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 	while (*p) {
 		const char *start;
 		int len;
-		p = cc_next_token(p, &start, &len, true);
-		if (len > 0) args[(*argc)++] = start;
+		p = cc_next_token(p, &start, &len);
+		if (len > 0) {
+			((char *)start)[len] = '\0';
+			args[(*argc)++] = start;
+		}
 	}
-	if (out_dup) *out_dup = dup;
-}
-
-static int cc_extra_arg_count(const char *cc) {
-	if (!cc || !*cc) return 0;
-	/* Match cc_split_into_argv: whole-string executable → no extra tokens. */
-	{
-		char probe[PATH_MAX];
-		if (cc_whole_string_exe(cc, probe, sizeof(probe))) return 0;
-	}
-	const char *start;
-	int len;
-	const char *p = cc_next_token(cc, &start, &len, false); // skip first token
-	int count = 0;
-	while (*p) {
-		p = cc_next_token(p, &start, &len, false);
-		if (len > 0) count++;
-	}
-	return count;
+	*out_dup = dup;
 }
 
 #ifndef _WIN32
@@ -3436,8 +3394,11 @@ static bool cc_is_msvc(const char *cc) {
 
 static bool is_pp_skip_input_arg(const char *f);
 static bool cc_flag_takes_arg(const char *a);
+static bool cc_flag_takes_arg_nonnull(const char *a);
+#ifndef PRISM_LIB_MODE
 static bool cli_has_cxx_passthrough(const Cli *cli);
 static const char *cxx_driver_for_cc(const char *cc);
+#endif
 
 static void pp_msvc_define_reserve(int needed) {
 	if (needed <= pp_define_bufs_cap) return;
@@ -3470,13 +3431,16 @@ static void pp_append_define(const char **args, int *argc, bool msvc, int *msvc_
 }
 
 #ifndef _WIN32
+static bool macro_spec_matches(const char *spec, const char *name, size_t name_len) {
+	return spec && !strncmp(spec, name, name_len) &&
+	       ((spec[name_len] == '\0') | (spec[name_len] == '='));
+}
+
 static bool api_mentions_macro(const char *name, size_t name_len) {
 	PRISM_STATE();
 	for (int i = 0; i < _ps->extra_define_count; i++) {
 		const char *spec = _ps->extra_defines[i];
-		if (spec && !strncmp(spec, name, name_len) &&
-		    (spec[name_len] == '\0' || spec[name_len] == '='))
-			return true;
+		if (macro_spec_matches(spec, name, name_len)) return true;
 	}
 	for (int i = 0; i < _ps->extra_compiler_flags_count; i++) {
 		const char *flag = _ps->extra_compiler_flags[i];
@@ -3484,13 +3448,16 @@ static bool api_mentions_macro(const char *name, size_t name_len) {
 		const char *spec = flag[2] ? flag + 2
 					   : (i + 1 < _ps->extra_compiler_flags_count
 						  ? _ps->extra_compiler_flags[i + 1] : NULL);
-		if (spec && !strncmp(spec, name, name_len) &&
-		    (spec[name_len] == '\0' || spec[name_len] == '='))
-			return true;
+		if (macro_spec_matches(spec, name, name_len)) return true;
 	}
 	return false;
 }
 #endif
+
+static bool cc_is_save_temps_arg(const char *arg) {
+	return !strcmp(arg, "-save-temps") || !strncmp(arg, "-save-temps=", 12) ||
+	       !strcmp(arg, "--save-temps") || !strncmp(arg, "--save-temps=", 13);
+}
 
 static void build_pp_argv(const char **args, int *argc, const char *input_file, char **out_cc_dup) {
 	PRISM_STATE();
@@ -3516,8 +3483,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		 * Strip them once before the platform-specific cases. */
 		if (strcmp(f, "-c") == 0 || strcmp(f, "/c") == 0) continue;
 		if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) {
-			if ((strcmp(f, "/Fo") == 0 || strcmp(f, "/Fe") == 0) &&
-			    i + 1 < _ps->extra_compiler_flags_count)
+			if (!f[3] && i + 1 < _ps->extra_compiler_flags_count)
 				i++;
 			continue;
 		}
@@ -3531,9 +3497,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 			}
 			if (f[0] == '-' && f[1] == 'o' && f[2] != '\0') continue;
 			/* -save-temps with -E writes confusing sidecar files; drop it. */
-			if (!strcmp(f, "-save-temps") || !strncmp(f, "-save-temps=", 12) ||
-			    !strcmp(f, "--save-temps") || !strncmp(f, "--save-temps=", 13))
-				continue;
+			if (cc_is_save_temps_arg(f)) continue;
 		}
 		/* Skip sibling TUs/objects, including absolute paths for cl, but retain
 		 * a filename-looking operand consumed by -D/-include/-I/etc. */
@@ -3584,7 +3548,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	/* Clang rejects `cc -E -` without `-x`. Map `-x none` (extension guessing)
 	 * to `-x c` for stdin, and inject `-x c` when the user omitted `-x`. */
-	if (!msvc && input_file && !strcmp(input_file, "-")) {
+	if (!msvc && !strcmp(input_file, "-")) {
 		bool has_x = false;
 		for (int i = 0; i < *argc - 1; i++) {
 			if (!strcmp(args[i], "-x")) {
@@ -3663,7 +3627,7 @@ static int has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 			raw_closed:;
 				continue;
 			}
-		} else if (*p == 'u' || *p == 'U' || *p == 'L') {
+		} else if ((*p == 'u') | (*p == 'U') | (*p == 'L')) {
 			const char *rp = p;
 			if (*rp == 'u' && rp[1] == '8') rp += 2;
 			else
@@ -3673,7 +3637,7 @@ static int has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 				continue;
 			} // will hit R" on next iter
 		}
-		if (*p == '"' || *p == '\'') {
+		if ((*p == '"') | (*p == '\'')) {
 			quote = *p;
 			continue;
 		}
@@ -3688,26 +3652,49 @@ static int has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 }
 
 /* Update multiline-comment/raw-string state; free delimiters not retained. */
+static int source_scan_line_openers(const char *p,
+				    int cond_depth,
+				    bool *in_block_comment,
+				    bool *in_raw_string,
+				    char **raw_delim,
+				    int *raw_delim_len) {
+	char *rd = NULL;
+	int scan = has_unclosed_block_comment(p, &rd);
+	if (scan < 0) return -1;
+	if (scan > 0) {
+		*in_block_comment = true;
+	} else if (rd && cond_depth == 0) {
+		*in_raw_string = true;
+		*raw_delim = rd;
+		*raw_delim_len = (int)strlen(rd);
+	} else {
+		free(rd);
+	}
+	return 0;
+}
+
 #define PP_SCAN_LINE_OPENERS(p)                                                                      \
 	do {                                                                                         \
-		char *_rd = NULL;                                                                    \
-		int _scan = has_unclosed_block_comment((p), &_rd);                                  \
-		if (_scan < 0) goto oom;                                                            \
-		if (_scan > 0) {                                                                    \
-			in_block_comment = true;                                                     \
-		} else if (_rd && cond_depth == 0) {                                                 \
-			in_raw_string = true;                                                        \
-			raw_delim = _rd;                                                             \
-			raw_delim_len = (int)strlen(_rd);                                            \
-		} else                                                                               \
-			free(_rd);                                                                   \
+		if (source_scan_line_openers((p),                                                    \
+					     cond_depth,                                             \
+					     &in_block_comment,                                      \
+					     &in_raw_string,                                         \
+					     &raw_delim,                                              \
+					     &raw_delim_len) < 0)                                    \
+			goto oom;                                                                      \
 	} while (0)
+
+static char *source_newline_end(char *line) {
+	char *end = line + strlen(line);
+	while (end > line && ((end[-1] == '\n') | (end[-1] == '\r'))) end--;
+	return end;
+}
 
 static void collect_source_defines(const char *input_file) {
 	PRISM_STATE();
 	PPARSE_CTX();
 	free_source_defines();
-	if (!input_file || pparse_feat(PPARSE_F_FLATTEN)) return;
+	if (pparse_feat(PPARSE_F_FLATTEN)) return;
 	FILE *f = fopen(input_file, "r");
 	if (!f) return;
 	char *line = NULL;
@@ -3743,7 +3730,7 @@ static void collect_source_defines(const char *input_file) {
 			if (!end) continue;
 			in_block_comment = false;
 			p = end + 2;
-			while (*p == ' ' || *p == '\t') p++;
+			while (ascii_hspace(*p)) p++;
 			if (in_hash_block_comment) {
 				in_hash_block_comment = false;
 				goto parse_directive;
@@ -3752,7 +3739,7 @@ static void collect_source_defines(const char *input_file) {
 			goto have_hash;
 		}
 		if (in_raw_string) {
-			for (char *r = line; *r && *r != '\n'; r++) {
+			for (char *r = line; !ascii_line_done(*r); r++) {
 				if (*r == ')' &&
 				    (raw_delim_len == 0 || strncmp(r + 1, raw_delim, raw_delim_len) == 0) &&
 				    r[1 + raw_delim_len] == '"') {
@@ -3760,14 +3747,13 @@ static void collect_source_defines(const char *input_file) {
 					p = r + 2 + raw_delim_len;
 					free(raw_delim);
 					raw_delim = NULL;
-					raw_delim_len = 0;
 					goto after_raw_string_close;
 				}
 			}
 			continue; // entire line is inside raw string
 		after_raw_string_close:
-			while (*p == ' ' || *p == '\t') p++;
-			if (*p == '\n' || *p == '\0') continue;
+			while (ascii_hspace(*p)) p++;
+			if (ascii_line_done(*p)) continue;
 			if (*p == '#') goto have_hash;
 			{
 				PP_SCAN_LINE_OPENERS(p);
@@ -3775,12 +3761,11 @@ static void collect_source_defines(const char *input_file) {
 			continue;
 		}
 		if (in_continuation) {
-			char *end = line + strlen(line);
-			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
+			char *end = source_newline_end(line);
 			in_continuation = (end > line && end[-1] == '\\');
 			continue;
 		}
-		while (*p == ' ' || *p == '\t') p++;
+		while (ascii_hspace(*p)) p++;
 		/* Digraph `%:` and trigraph `??=` are `#` — collect before PP. */
 		if (p[0] == '%' && p[1] == ':') {
 			p += 2;
@@ -3791,7 +3776,7 @@ static void collect_source_defines(const char *input_file) {
 			goto parse_directive;
 		}
 		if (*p != '#') {
-			if (*p == '\n' || *p == '\0' || (p[0] == '/' && p[1] == '/')) goto check_continuation;
+			if (ascii_line_done(*p) || (p[0] == '/' && p[1] == '/')) goto check_continuation;
 			if (p[0] == '/' && p[1] == '*') {
 				char *close = strstr(p + 2, "*/");
 				if (!close) {
@@ -3799,7 +3784,7 @@ static void collect_source_defines(const char *input_file) {
 					goto check_continuation;
 				}
 				p = close + 2;
-				while (*p == ' ' || *p == '\t') p++;
+				while (ascii_hspace(*p)) p++;
 				if (*p != '#') {
 					PP_SCAN_LINE_OPENERS(p);
 					goto check_continuation;
@@ -3813,7 +3798,7 @@ static void collect_source_defines(const char *input_file) {
 		}
 	have_hash:
 		p++; // skip '#'
-		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
+		while (ascii_hspace(*p) || (p[0] == '/' && p[1] == '*')) {
 			if (p[0] == '/' && p[1] == '*') {
 				char *end = strstr(p + 2, "*/");
 				if (!end) {
@@ -3826,16 +3811,15 @@ static void collect_source_defines(const char *input_file) {
 				p++;
 		}
 	parse_directive:;
-		line_end = p + strlen(p);
-		while (line_end > p && (line_end[-1] == '\n' || line_end[-1] == '\r')) line_end--;
+		line_end = source_newline_end(p);
 		dir_has_continuation = (line_end > p && line_end[-1] == '\\');
 		dir_text_end = line_end;
 		if (dir_has_continuation) dir_text_end--;
-		while (dir_text_end > p && (dir_text_end[-1] == ' ' || dir_text_end[-1] == '\t'))
+		while (dir_text_end > p && ascii_hspace(dir_text_end[-1]))
 			dir_text_end--;
 		dir_text_len = (int)(dir_text_end - p);
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
-		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
+		    (strncmp(p, "if", 2) == 0 && (ascii_hspace(p[2]) || p[2] == '('))) {
 			if (cond_depth >= cond_stack_cap) {
 				int old = cond_stack_cap;
 				size_t nc = pparse_vec_grow_cap((size_t)old, (size_t)cond_depth + 1, 32);
@@ -3857,8 +3841,6 @@ static void collect_source_defines(const char *input_file) {
 				cond_depth--;
 				free(cond_stack[cond_depth].opening);
 				free(cond_stack[cond_depth].branches);
-				cond_stack[cond_depth].opening = NULL;
-				cond_stack[cond_depth].branches = NULL;
 			}
 			goto check_continuation;
 		}
@@ -3898,11 +3880,11 @@ static void collect_source_defines(const char *input_file) {
 			if (!can_extract) goto check_continuation;
 		}
 
-		if (strncmp(p, "define", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
+		if (strncmp(p, "define", 6) == 0 && ascii_hspace(p[6])) {
 			p += 6;
-			while (*p == ' ' || *p == '\t') p++;
+			while (ascii_hspace(*p)) p++;
 			char *name_start = p;
-			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '(') p++;
+			while (!(ascii_line_done(*p) | ascii_hspace(*p) | (*p == '('))) p++;
 			int name_len = (int)(p - name_start);
 			if (name_len <= 0) goto check_continuation;
 			/* Adjacent macro parameters are part of the -D name. */
@@ -3916,42 +3898,38 @@ static void collect_source_defines(const char *input_file) {
 			if (!saved_name) goto oom;
 			memcpy(saved_name, name_start, name_len);
 			saved_name[name_len] = '\0';
-			while (*p == ' ' || *p == '\t') p++;
+			while (ascii_hspace(*p)) p++;
 			char *val_start = p;
 			char *end = val_start + strlen(val_start);
-			while (end > val_start &&
-			       (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+			while (end > val_start && ascii_line_space(end[-1]))
 				end--;
 			bool has_continuation = (end > val_start && end[-1] == '\\');
 			if (has_continuation) end--;
-			bool prev_had_ws = (end > val_start && (end[-1] == ' ' || end[-1] == '\t'));
-			while (end > val_start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+			bool prev_had_ws = end > val_start && ascii_hspace(end[-1]);
+			while (end > val_start && ascii_hspace(end[-1])) end--;
 			int val_len = (int)(end - val_start);
 			char *full_val = NULL;
 			int full_val_len = 0;
 			if (has_continuation) {
-				size_t cap = (val_len > 0 ? val_len : 0) + 256;
+				size_t cap = (size_t)val_len + 256;
 				full_val = malloc(cap);
 				if (!full_val) {
 					free(saved_name);
 					goto oom;
 				}
-				if (val_len > 0) {
-					memcpy(full_val, val_start, val_len);
-					full_val_len = val_len;
-				}
+				memcpy(full_val, val_start, val_len);
+				full_val_len = val_len;
 				while (getline(&line, &line_cap, f) >= 0) {
 					char *lp = line;
-					bool cur_leading_ws = (*lp == ' ' || *lp == '\t');
-					while (*lp == ' ' || *lp == '\t') lp++;
+					bool cur_leading_ws = ascii_hspace(*lp);
+					while (ascii_hspace(*lp)) lp++;
 					char *le = lp + strlen(lp);
-					while (le > lp && (le[-1] == '\n' || le[-1] == '\r' ||
-							   le[-1] == ' ' || le[-1] == '\t'))
+					while (le > lp && ascii_line_space(le[-1]))
 						le--;
 					bool more = (le > lp && le[-1] == '\\');
 					if (more) le--;
-					bool cur_trailing_ws = (le > lp && (le[-1] == ' ' || le[-1] == '\t'));
-					while (le > lp && (le[-1] == ' ' || le[-1] == '\t')) le--;
+					bool cur_trailing_ws = le > lp && ascii_hspace(le[-1]);
+					while (le > lp && ascii_hspace(le[-1])) le--;
 					int chunk = (int)(le - lp);
 					if (chunk > 0) {
 						size_t need = full_val_len + 1 + chunk + 1;
@@ -3965,7 +3943,7 @@ static void collect_source_defines(const char *input_file) {
 							}
 							full_val = tmp;
 						}
-						if (full_val_len > 0 && (prev_had_ws || cur_leading_ws))
+					if ((full_val_len > 0) & (prev_had_ws | cur_leading_ws))
 							full_val[full_val_len++] = ' ';
 						memcpy(full_val + full_val_len, lp, chunk);
 						full_val_len += chunk;
@@ -4024,16 +4002,12 @@ static void collect_source_defines(const char *input_file) {
 									char *ce = strstr(line, "*/");
 									if (ce) {
 										char *rest = ce + 2;
-										while (*rest == ' ' ||
-										       *rest == '\t')
+										while (ascii_hspace(*rest))
 											rest++;
 										char *re =
 										    rest + strlen(rest);
 										while (re > rest &&
-										       (re[-1] == '\n' ||
-											re[-1] == '\r' ||
-											re[-1] == ' ' ||
-											re[-1] == '\t'))
+										       ascii_line_space(re[-1]))
 											re--;
 										int rlen = (int)(re - rest);
 										if (rlen > 0) {
@@ -4053,12 +4027,8 @@ static void collect_source_defines(const char *input_file) {
 											val[vlen] = '\0';
 										} else {
 											vlen = cs;
-											while (
-											    vlen > 0 &&
-											    (val[vlen - 1] ==
-												 ' ' ||
-											     val[vlen - 1] ==
-												 '\t'))
+											while (vlen > 0 &&
+											       ascii_hspace(val[vlen - 1]))
 												vlen--;
 											val[vlen] = '\0';
 										}
@@ -4068,9 +4038,7 @@ static void collect_source_defines(const char *input_file) {
 								}
 								if (!found_close) {
 									vlen = cs;
-									while (vlen > 0 &&
-									       (val[vlen - 1] == ' ' ||
-										val[vlen - 1] == '\t'))
+									while (vlen > 0 && ascii_hspace(val[vlen - 1]))
 										vlen--;
 									val[vlen] = '\0';
 								}
@@ -4078,8 +4046,6 @@ static void collect_source_defines(const char *input_file) {
 							}
 						}
 					}
-				}
-				if (val) {
 					full_val = val;
 					full_val_len = vlen;
 					val_start = full_val;
@@ -4150,8 +4116,7 @@ static void collect_source_defines(const char *input_file) {
 			_ps->source_defines[_ps->source_define_count++] = (SourceDefine){def, guard, cond_depth};
 		}
 	check_continuation: {
-		char *end = line + strlen(line);
-		while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
+		char *end = source_newline_end(line);
 		/* A backslash-newline inside a block comment or a raw string does
 		 * splice the source -- C11 5.1.1.2 runs phase 2 before phase 3 -- but
 		 * it does not continue a *directive*, and the comment/raw state above
@@ -4165,8 +4130,8 @@ static void collect_source_defines(const char *input_file) {
 		 * survived. `prism check` forces flatten off, so the artifact handed
 		 * to the analyzer was the one missing the macro. */
 		in_continuation =
-		    !in_block_comment && !in_raw_string && (end > line && end[-1] == '\\');
-		if (!in_continuation && !in_block_comment && !in_raw_string) {
+		    (!in_block_comment & !in_raw_string) && (end > line && end[-1] == '\\');
+		if (!in_continuation & !in_block_comment & !in_raw_string) {
 			PP_SCAN_LINE_OPENERS(line);
 		}
 	}
@@ -4189,38 +4154,40 @@ static void collect_source_defines(const char *input_file) {
 	}
 }
 
-/* Read `path` whole into a malloc'd buffer with `pad` trailing NUL bytes.
- * Callers want different padding - the tokenizer needs 8 for its SWAR scan,
- * plain text consumers need 1 - which is the only way the two copies of this
- * function differed. Returns NULL on any failure. */
-static char *read_file_bytes(const char *path, size_t pad) {
+typedef struct {
+	char *data;
+	size_t size;
+} FileBytes;
+
+/* Read `path` whole into a malloc'd buffer with the tokenizer's eight-byte
+ * zero padding. Returns NULL on any failure. */
+static FileBytes read_file_bytes(const char *path) {
 	FILE *f = fopen(path, "rb");
 	long sz = 0;
-	char *buf = NULL;
-	if (!f) return NULL;
+	if (!f) return (FileBytes){0};
 	if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
 		fclose(f);
-		return NULL;
+		return (FileBytes){0};
 	}
-	buf = malloc((size_t)sz + pad);
+	char *buf = malloc((size_t)sz + 8);
 	if (!buf) {
 		fclose(f);
-		return NULL;
+		return (FileBytes){0};
 	}
 	if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
 		free(buf);
 		fclose(f);
-		return NULL;
+		return (FileBytes){0};
 	}
 	fclose(f);
-	memset(buf + (size_t)sz, 0, pad);
-	return buf;
+	memset(buf + (size_t)sz, 0, 8);
+	return (FileBytes){buf, (size_t)sz};
 }
 
-#define read_file_padded(path) read_file_bytes((path), 8)
+#define read_file_padded(path) read_file_bytes(path).data
 
 static bool input_is_dot_i(const char *path) {
-	size_t n = path ? strlen(path) : 0;
+	size_t n = strlen(path);
 	return n >= 2 && path[n - 2] == '.' && ((path[n - 1] | 0x20) == 'i');
 }
 
@@ -4275,7 +4242,10 @@ static void ppk_feed(PPKey *k, const void *p, size_t n) {
 	k->a ^= n * 0xff51afd7ed558ccdULL;
 }
 
-static void ppk_feed_str(PPKey *k, const char *s) { ppk_feed(k, s ? s : "", s ? strlen(s) : 0); }
+static void ppk_feed_str(PPKey *k, const char *s) {
+	if (!s) s = "";
+	ppk_feed(k, s, strlen(s));
+}
 
 /* Environment variables the preprocessor consults for header search. A change
  * here changes the output without changing any file prism can stat. */
@@ -4296,10 +4266,12 @@ static bool pp_is_dir_sep(char c) {
  * upgrading or switching compilers invalidates every entry. */
 static void ppk_feed_compiler(PPKey *k, const char *name) {
 	PPStat id;
-	bool has_sep = false;
-	for (const char *c = name; *c; c++)
-		if (pp_is_dir_sep(*c)) has_sep = true;
-	if (has_sep) {
+#ifdef _WIN32
+	const char *sep_in_name = strpbrk(name, "/\\");
+#else
+	const char *sep_in_name = strchr(name, '/');
+#endif
+	if (sep_in_name) {
 		if (pp_stat_id(name, &id)) ppk_feed(k, &id, sizeof id);
 		return;
 	}
@@ -4343,7 +4315,7 @@ static bool pp_pathf(char *out, size_t cap, const char *fmt, ...) {
 	va_start(ap, fmt);
 	n = vsnprintf(out, cap, fmt, ap);
 	va_end(ap);
-	return n >= 0 && (size_t)n < cap;
+	return (n >= 0) & ((size_t)n < cap);
 }
 
 /* Cache root, or NULL if it cannot be composed or created. Callers treat NULL
@@ -4416,15 +4388,15 @@ static bool pp_text_has_time_macro(const char *buf, size_t len) {
 static size_t pp_marker_path(const char *l, const char *end, char *out, size_t outcap) {
 	if (l >= end || *l != '#') return 0;
 	l++;
-	while (l < end && (*l == ' ' || *l == '\t')) l++;
+	while (l < end && ascii_hspace(*l)) l++;
 	/* Accept GCC/Clang `# 1` and MSVC `#line 1` markers. */
 	if (l + 4 <= end && prism_memeq_static(l, "line", 4)) {
 		l += 4;
-		while (l < end && (*l == ' ' || *l == '\t')) l++;
+		while (l < end && ascii_hspace(*l)) l++;
 	}
 	if (l >= end || *l < '0' || *l > '9') return 0;
 	while (l < end && *l >= '0' && *l <= '9') l++;
-	while (l < end && (*l == ' ' || *l == '\t')) l++;
+	while (l < end && ascii_hspace(*l)) l++;
 	if (l >= end || *l != '"') return 0;
 	l++;
 	size_t n = 0;
@@ -4440,21 +4412,17 @@ static size_t pp_marker_path(const char *l, const char *end, char *out, size_t o
 	return (n && out[0] != '<') ? n : 0;
 }
 
-static bool pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file) {
+static void pp_cache_key(PPKey *k, char **argv, int argc, const char *input_file) {
 	char abs[PATH_MAX];
 	*k = (PPKey){0xcbf29ce484222325ULL, 0x9e3779b97f4a7c15ULL};
 	ppk_feed_str(k, PP_CACHE_MAGIC);
-	for (int i = 0; i < argc; i++) {
-		if (!argv[i]) return false;
-		ppk_feed_str(k, argv[i]);
-	}
-	if (argc > 0) ppk_feed_compiler(k, argv[0]);
+	for (int i = 0; i < argc; i++) ppk_feed_str(k, argv[i]);
+	ppk_feed_compiler(k, argv[0]);
 	for (size_t i = 0; i < sizeof pp_cache_env_keys / sizeof *pp_cache_env_keys; i++) {
 		ppk_feed_str(k, pp_cache_env_keys[i]);
 		ppk_feed_str(k, getenv(pp_cache_env_keys[i]));
 	}
 	if (realpath(input_file, abs)) ppk_feed_str(k, abs);
-	return true;
 }
 
 static bool pp_cache_path(const PPKey *k, char *out, size_t cap) {
@@ -4492,7 +4460,7 @@ static char *pp_cache_load(const PPKey *k) {
 
 	if (!fgets(line, sizeof line, f) || strcmp(line, PP_CACHE_MAGIC) != 0) goto done;
 	if (!fgets(line, sizeof line, f) || sscanf(line, "deps %ld", &ndeps) != 1) goto done;
-	if (ndeps < 0 || ndeps > 65536) goto done;
+	if ((ndeps < 0) | (ndeps > 65536)) goto done;
 
 	for (i = 0; i < ndeps; i++) {
 		PPStat rec, now;
@@ -4500,16 +4468,16 @@ static char *pp_cache_load(const PPKey *k) {
 		char *p = NULL;
 		size_t pl = 0;
 		if (!fgets(line, sizeof line, f)) goto done;
-		if (sscanf(line, "%lld %lld %lld %lld %n", &rec.size, &rec.mtime_sec, &rec.mtime_nsec,
-			   &rec.ctime_sec, &off) < 4 ||
-		    off <= 0)
+		if ((sscanf(line, "%lld %lld %lld %lld %n", &rec.size, &rec.mtime_sec, &rec.mtime_nsec,
+			    &rec.ctime_sec, &off) < 4) |
+		    (off <= 0))
 			goto done;
 		p = line + off;
 		pl = strlen(p);
 		while (pl && (p[pl - 1] == '\n' || p[pl - 1] == '\r')) p[--pl] = '\0';
-		if (!pl || !pp_stat_id(p, &now)) goto done;
-		if (now.size != rec.size || now.mtime_sec != rec.mtime_sec ||
-		    now.mtime_nsec != rec.mtime_nsec || now.ctime_sec != rec.ctime_sec)
+		if ((pl == 0) | !pp_stat_id(p, &now)) goto done;
+		if ((now.size != rec.size) | (now.mtime_sec != rec.mtime_sec) |
+		    (now.mtime_nsec != rec.mtime_nsec) | (now.ctime_sec != rec.ctime_sec))
 			goto done;
 	}
 
@@ -4638,7 +4606,7 @@ static void pp_cache_prune(void) {
 	if (s.total > max_bytes) {
 		/* Oldest first, down to 80% of the cap so this does not run every hour. */
 		qsort(s.v, (size_t)s.n, sizeof *s.v, pp_entry_cmp);
-		for (i = 0; i < s.n && s.total > max_bytes * 4 / 5; i++) {
+		for (i = 0; (i < s.n) & (s.total > max_bytes * 4 / 5); i++) {
 			if (s.v[i].size < 0) continue;
 			if (!pp_pathf(full, sizeof full, "%s/%s", dir, s.v[i].name)) continue;
 			if (remove(full) == 0) s.total -= s.v[i].size;
@@ -4662,6 +4630,7 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 	if (!deps) return;
 	if (!realpath(input_file, abs)) goto out;
 	deps[ndeps++] = strdup(abs);
+	if (!deps[0]) goto out;
 
 	/* The dependency set is recovered from the output's own linemarkers, so no
 	 * -MD sidecar has to be produced or kept in sync. */
@@ -4681,15 +4650,13 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 			if (!seen) {
 				if (ndeps >= MAX_DEPS) goto out;
 				deps[ndeps++] = strdup(can);
+				if (!deps[ndeps - 1]) goto out;
 			}
 		}
 		nl = memchr(l, '\n', (size_t)(end - l));
 		if (!nl) break;
 		l = nl + 1;
 	}
-	for (i = 0; i < ndeps; i++)
-		if (!deps[i]) goto out;
-
 	if (!pp_cache_path(k, path, sizeof path)) goto out;
 	if (!pp_pathf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid())) goto out;
 	f = fopen(tmp, "wb");
@@ -4704,7 +4671,7 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 		/* Without sub-second resolution, a file written in the second we are
 		 * recording could change again and still compare equal. Skip the entry;
 		 * the next build a second later records it safely. */
-		if (id.mtime_nsec == 0 && now - id.mtime_sec < 2) {
+		if ((id.mtime_nsec == 0) & (now - id.mtime_sec < 2)) {
 			ok = false;
 			break;
 		}
@@ -4737,7 +4704,7 @@ static bool pp_source_is_cacheable(const char *input_file) {
 	if (stat(input_file, &st) != 0) return false;
 	/* Not off_t: that name is POSIX and MSVC only exposes it under
 	 * _CRT_DECLARE_NONSTDC_NAMES. st_size is an integer type on every target. */
-	if (st.st_size <= 0 || (long long)st.st_size > (long long)(64 << 20)) return false;
+	if ((st.st_size <= 0) | ((long long)st.st_size > (long long)(64 << 20))) return false;
 	f = fopen(input_file, "rb");
 	if (!f) return false;
 	b = malloc((size_t)st.st_size);
@@ -4764,7 +4731,6 @@ static void pp_info_cb(const char *dir, const char *name, void *ud) {
 	char full[PATH_MAX];
 	PPScan *s = (PPScan *)ud;
 	PPStat id;
-	(void)name;
 	if (!pp_pathf(full, sizeof full, "%s/%s", dir, name)) return;
 	if (!pp_stat_id(full, &id)) return;
 	s->n++;
@@ -4797,26 +4763,20 @@ static char *preprocess_with_cc(const char *input_file) {
 	/* `.i` is already preprocessed. GCC's `cc -E file.i` emits nothing, so
 	 * re-running the preprocessor would drop the whole TU (including orelse). */
 	if (input_is_dot_i(input_file)) {
-		char *buf = read_file_padded(input_file);
+		FileBytes input = read_file_bytes(input_file);
+		char *buf = input.data;
 		if (!buf) {
 			fprintf(stderr, "pparse_error: cannot read preprocessed input: %s\n", input_file);
 			return NULL;
 		}
-		size_t len = strlen(buf);
-		FILE *f = fopen(input_file, "rb");
-		long sz = -1;
-		if (f) {
-			if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
-			fclose(f);
-		}
-		if (sz > 0 && (size_t)sz != len) {
+		if (memchr(buf, '\0', input.size) != NULL) {
 			fprintf(stderr,
 				"pparse_error: preprocessed input '%s' contains embedded null bytes\n",
 				input_file);
 			free(buf);
 			return NULL;
 		}
-		if (sz >= 2) {
+		if (input.size >= 2) {
 			unsigned char b0 = (unsigned char)buf[0], b1 = (unsigned char)buf[1];
 			if ((b0 == 0xFF && b1 == 0xFE) || (b0 == 0xFE && b1 == 0xFF)) {
 				fprintf(stderr,
@@ -4830,7 +4790,7 @@ static char *preprocess_with_cc(const char *input_file) {
 		return buf;
 	}
 	const char *pp_cc = _ps->extra_compiler ? _ps->extra_compiler : PRISM_DEFAULT_CC;
-	int argcap = 16 + cc_extra_arg_count(pp_cc) + _ps->extra_compiler_flags_count + _ps->dep_flags_count +
+	int argcap = 16 + (int)strlen(pp_cc) + _ps->extra_compiler_flags_count + _ps->dep_flags_count +
 		     _ps->extra_include_count * 2 + _ps->extra_define_count * 2 +
 		     _ps->extra_force_include_count * 2;
 	const char **args = alloc_argv(argcap);
@@ -4843,9 +4803,9 @@ static char *preprocess_with_cc(const char *input_file) {
 	 * environment; validity is checked against every file the cached output
 	 * was built from. A hit skips the spawn entirely. */
 	PPKey key;
-	bool cacheable = pp_cache_enabled() && pp_source_is_cacheable(input_file) &&
-			 pp_cache_key(&key, argv, argc, input_file);
+	bool cacheable = pp_cache_enabled() && pp_source_is_cacheable(input_file);
 	if (cacheable) {
+		pp_cache_key(&key, argv, argc, input_file);
 		char *hit = pp_cache_load(&key);
 		if (hit) {
 			if (prism_profile) fprintf(stderr, "[prism-prof] pp-cache=hit\n");
@@ -4980,7 +4940,7 @@ static inline void track_ctrl_paren_close(void) {
 	// ctrl_state.pending is still live) must not leak parens_just_closed.
 	if (emit_scope_depth == 0) return;
 	ScopeKind k = scope_stack[emit_scope_depth - 1].kind;
-	if (k != SCOPE_FOR_PAREN && k != SCOPE_CTRL_PAREN) return;
+	if ((k != SCOPE_FOR_PAREN) & (k != SCOPE_CTRL_PAREN)) return;
 	scope_pop();
 	ctrl_state.parens_just_closed = true;
 	emit_at_stmt_start = true;
@@ -5004,7 +4964,7 @@ static inline void track_ctrl_semicolon(void) {
 static PRISM_ALWAYS_INLINE inline void track_generic_token(PParseToken *tok) {
 	if (tok->len != 1) return;
 	char c = tok->ch0;
-	if (c != '(' && c != ')') return;
+	if ((c != '(') & (c != ')')) return;
 	if (!in_generic()) return;
 	if (c == '(') scope_push_kind(SCOPE_GENERIC);
 	else if (emit_scope_depth > 0 && scope_stack[emit_scope_depth - 1].kind == SCOPE_GENERIC)
@@ -5061,22 +5021,22 @@ static PParseToken *emit_through(PParseToken *from, PParseToken *to) {
 	return from;
 }
 
-static bool orelse_has_chain(PParseToken *start, bool comma_term) {
-	PPARSE_CTX();
-	int pd = 0;
-	for (PParseToken *p = start; p->kind != PPARSE_TK_EOF; p = pparse_next(_pc, p)) {
-		if (p->flags & PPARSE_TF_OPEN) pd++;
-		else if (p->flags & PPARSE_TF_CLOSE)
-			pd--;
-		else if (pd == 0 && (pparse_match_ch(p, ';') || (comma_term && pparse_match_ch(p, ','))))
-			break;
-		if (pd == 0 && (pparse_ann(p) & P1_IS_ORELSE_KW)) return true;
-	}
-	return false;
-}
-
 static bool bare_is_stmt_end(PParseToken *s, bool comma_term) {
 	return pparse_match_ch(s, ';') || (comma_term && pparse_match_ch(s, ','));
+}
+
+static PParseToken *bare_find_next_orelse(PParseToken *start, bool comma_term) {
+	PPARSE_CTX();
+	for (PParseToken *p = start; p->kind != PPARSE_TK_EOF; p = pparse_next(_pc, p)) {
+		PPARSE_SKIP_GROUP_ON_CLOSE(p)
+		if ((p->flags & PPARSE_TF_CLOSE) || bare_is_stmt_end(p, comma_term)) break;
+		if (pparse_ann(p) & P1_IS_ORELSE_KW) return p;
+	}
+	return NULL;
+}
+
+static bool orelse_has_chain(PParseToken *start, bool comma_term) {
+	return bare_find_next_orelse(start, comma_term) != NULL;
 }
 
 static PParseToken *
@@ -5208,26 +5168,7 @@ static PParseToken *emit_bare_orelse_impl(PParseToken *t, PParseToken *end, bool
 				}
 				nest++;
 				PParseToken *fb_start = t;
-				PParseToken *fb_orelse = NULL;
-				{
-					int fd = 0;
-					for (PParseToken *s = t; s->kind != PPARSE_TK_EOF; s = pparse_next(_pc, s)) {
-						if ((s->flags & PPARSE_TF_OPEN) &&
-						    (pparse_match_ch(s, '(') || pparse_match_ch(s, '['))) {
-							s = pparse_pair_known(s);
-							continue;
-						}
-						if (s->flags & PPARSE_TF_OPEN) fd++;
-						else if (s->flags & PPARSE_TF_CLOSE)
-							fd--;
-						else if (fd == 0 && bare_is_stmt_end(s, comma_term))
-							break;
-						if (fd == 0 && (pparse_ann(s) & P1_IS_ORELSE_KW)) {
-							fb_orelse = s;
-							break;
-						}
-					}
-				}
+				PParseToken *fb_orelse = bare_find_next_orelse(t, comma_term);
 				oe_id = _ps->ret_counter++;
 				emit_typeof_keyword();
 				out_char('(');
@@ -5492,7 +5433,7 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 		emit_at_stmt_start = false;
 		if (tag & PPARSE_TT_NORETURN_FN) {
 			uint32_t ti = pparse_idx(_pc, tok);
-			if (!(ti >= 1 && (pparse_token_pool[ti - 1].tag & PPARSE_TT_MEMBER))) {
+			if (!(pparse_token_pool[ti - 1].tag & PPARSE_TT_MEMBER)) {
 				if (has_defer && has_active_defers() && !quiet)
 					fprintf(
 					    stderr,
@@ -5601,7 +5542,7 @@ static PParseToken *preprocess_and_tokenize(char *input_file, double *pp_ms, dou
 	double t0 = prism_now_ms();
 	char *pp_buf = preprocess_with_cc(input_file);
 	double t1 = prism_now_ms();
-	if (pp_ms) *pp_ms = t1 - t0;
+	*pp_ms = t1 - t0;
 	if (!pp_buf) {
 		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
 		return NULL;
@@ -5609,11 +5550,7 @@ static PParseToken *preprocess_and_tokenize(char *input_file, double *pp_ms, dou
 	double t2 = prism_now_ms();
 	PParseToken *tok = pparse_tokenize_buffer(input_file, pp_buf);
 	double t3 = prism_now_ms();
-	if (tok_ms) *tok_ms = t3 - t2;
-	if (!tok) {
-		fprintf(stderr, "Failed to pparse_tokenize preprocessed output\n");
-		pparse_tokenizer_teardown(false);
-	}
+	*tok_ms = t3 - t2;
 	return tok;
 }
 
@@ -5657,7 +5594,7 @@ static int transpile(char *input_file, char *output_file) {
 static int transpile_to_stdout(char *input_file) {
 #ifdef _WIN32
 	char temp[PATH_MAX];
-	int fd = make_temp_file_registered(temp, sizeof(temp), NULL, 0, input_file);
+	int fd = make_temp_file_registered(temp, input_file);
 	if (fd < 0) return 0;
 	FILE *wfp = fdopen(fd, "w");
 	if (!wfp) {
@@ -5735,7 +5672,7 @@ static int verify_transpiled_output(char *orig_input, char *out1_path) {
 	char tmp2[PATH_MAX];
 	int ok = 0;
 	char diag[256] = "re-transpile of emitted C failed (output is not valid re-parseable C)";
-	int fd = make_temp_file_registered(tmp2, sizeof(tmp2), NULL, 2, out1_path);
+	int fd = make_temp_file_registered(tmp2, out1_path);
 	if (fd >= 0) {
 		close(fd);
 		uint32_t saved_features = _pc->features;
@@ -5746,8 +5683,8 @@ static int verify_transpiled_output(char *orig_input, char *out1_path) {
 		if (retrans_ok) {
 			/* 8 bytes of padding, not 1: these go through the tokenizer,
 			 * which looks a few bytes past the current position. */
-			char *o1 = read_file_bytes(out1_path, 8);
-			char *o2 = read_file_bytes(tmp2, 8);
+			char *o1 = read_file_bytes(out1_path).data;
+			char *o2 = read_file_bytes(tmp2).data;
 			if (o1 && o2) {
 				VerifyKwCounts k1, k2;
 				pparse_count_dialect_keywords(out1_path, o1, &k1.defer, &k1.orelse);
@@ -5856,11 +5793,9 @@ static void apply_features(PrismFeatures features) {
 
 #ifdef PRISM_LIB_MODE
 static void error_recovery_init(void) {
-	PRISM_STATE();
 	PPARSE_CTX();
 	_pc->error_msg[0] = '\0';
 	_pc->error_line = 0;
-	_ps->error_col = 0;
 	_pc->error_jmp_set = true;
 }
 
@@ -5870,8 +5805,7 @@ static void error_recovery_result(PrismResult *r) {
 	_pc->error_jmp_set = false;
 	*r = (PrismResult){.status = PRISM_ERR_SYNTAX,
 			   .error_msg = strdup(_pc->error_msg[0] ? _pc->error_msg : "Unknown pparse_error"),
-			   .error_line = _pc->error_line,
-			   .error_col = _ps->error_col};
+			   .error_line = _pc->error_line};
 	/* fclose publishes the final memstream pointer; it must precede free. */
 	if (out_fp) {
 		fclose(out_fp);
@@ -5948,12 +5882,6 @@ static void prism_transpile_file_into(PrismResult *result, const char *input_fil
 	 * token_source itself; recovery must still be able to free the buffer. */
 	pparse_ctx->token_source = pp_buf;
 	tok = pparse_tokenize_buffer((char *)input_file, pp_buf);
-	if (!tok) {
-		result->status = PRISM_ERR_SYNTAX;
-		result->error_msg = strdup("Failed to pparse_tokenize");
-		pparse_tokenizer_teardown(false);
-		goto cleanup;
-	}
 
 	*result = transpile_to_result(tok);
 
@@ -6005,12 +5933,6 @@ static void prism_transpile_source_into(PrismResult *result, const char *source,
 	 * library error-recovery path cannot leak it. */
 	_pc->token_source = buf;
 	tok = pparse_tokenize_buffer((char *)fname, buf);
-	if (!tok) {
-		result->status = PRISM_ERR_SYNTAX;
-		result->error_msg = strdup("Failed to pparse_tokenize");
-		pparse_tokenizer_teardown(false);
-		goto src_cleanup;
-	}
 
 	*result = transpile_to_result(tok);
 
@@ -6034,21 +5956,36 @@ PrismResult prism_transpile_source(const char *source, const char *filename, Pri
 		(arr)[(cnt)++] = (item);                                                                     \
 	} while (0)
 
-static inline bool has_ext(const char *f, const char *ext) {
-	size_t fl = strlen(f), el = strlen(ext);
-	return fl >= el && !strcmp(f + fl - el, ext);
+static bool has_any_ext(const char *path, const char *const *exts, size_t count) {
+	size_t path_len = strlen(path);
+	for (size_t i = 0; i < count; i++) {
+		size_t ext_len = strlen(exts[i]);
+		if (path_len >= ext_len && !strcmp(path + path_len - ext_len, exts[i])) return true;
+	}
+	return false;
 }
+
+static bool is_c_input_ext(const char *path) {
+	static const char *const exts[] = {".c", ".i"};
+	return has_any_ext(path, exts, sizeof(exts) / sizeof(*exts));
+}
+
+#ifndef PRISM_LIB_MODE
+static bool is_cxx_input_ext(const char *path) {
+	static const char *const exts[] = {".cpp", ".cc", ".cxx", ".C", ".mm"};
+	return has_any_ext(path, exts, sizeof(exts) / sizeof(*exts));
+}
+#endif
 
 /* Args that must not be fed to `cc -E` of a Prism .c/.i unit: other TUs and
  * objects. Without this, `prism a.c b.cpp` preprocesses both and Prism parses
  * C++ as C (misccompile / bogus rejects). */
 static bool is_pp_skip_input_arg(const char *f) {
-	if (!f || !*f || f[0] == '-') return false;
-	return has_ext(f, ".c") || has_ext(f, ".i") || has_ext(f, ".cpp") || has_ext(f, ".cc") ||
-	       has_ext(f, ".cxx") || has_ext(f, ".C") || has_ext(f, ".m") || has_ext(f, ".mm") ||
-	       has_ext(f, ".s") || has_ext(f, ".S") || has_ext(f, ".o") || has_ext(f, ".obj") ||
-	       has_ext(f, ".a") || has_ext(f, ".lib") || has_ext(f, ".so") || has_ext(f, ".dylib") ||
-	       has_ext(f, ".dll") || has_ext(f, ".exe");
+	if (!*f || f[0] == '-') return false;
+	static const char *const exts[] = {".c",   ".i",   ".cpp", ".cc",  ".cxx", ".C",
+					   ".m",   ".mm",  ".s",   ".S",   ".o",   ".obj",
+					   ".a",   ".lib", ".so",  ".dylib", ".dll", ".exe"};
+	return has_any_ext(f, exts, sizeof(exts) / sizeof(*exts));
 }
 
 static bool str_startswith(const char *s, const char *prefix) {
@@ -6083,47 +6020,42 @@ static const char *const cc_separate_operand_flags[] = {
     "-current_version",
 };
 
-static bool cc_flag_takes_arg(const char *a) {
-	if (!a) return false;
-	if (a[0] != '-' || !a[1]) return false;
-	if (!a[2]) {
-		switch (a[1]) {
-		case 'c':
-		case 'E':
-		case 'S':
-		case 'v':
-		case 'w':
-		case 's':
-		case 'g':
-		case 'H':
-		case 'P':
-		case 'p':
-		case 'r':
-		case 'C':
-		case 'h':
-		case 'Q':
-		case 'O':
-		case 'W':
-		case 'M':
-		case 'd': return false;
-		default: return true;
-		}
-	}
-	for (size_t i = 0; i < sizeof cc_separate_operand_flags / sizeof cc_separate_operand_flags[0]; i++)
-		if (!strcmp(a, cc_separate_operand_flags[i])) return true;
+static bool str_in_list(const char *s, const char *const *values, size_t count) {
+	for (size_t i = 0; i < count; i++)
+		if (!strcmp(s, values[i])) return true;
 	return false;
+}
+
+static bool str_contains_any(const char *s, const char *const *needles, size_t count) {
+	for (size_t i = 0; i < count; i++)
+		if (strstr(s, needles[i])) return true;
+	return false;
+}
+
+static bool cc_flag_takes_arg_nonnull(const char *a) {
+	if (a[0] != '-' || !a[1]) return false;
+	if (!a[2]) return strchr("cESvwsgHPprChQOWMd", a[1]) == NULL;
+	return str_in_list(a,
+			   cc_separate_operand_flags,
+			   sizeof(cc_separate_operand_flags) / sizeof(*cc_separate_operand_flags));
+}
+
+static __attribute__((noinline)) bool cc_flag_takes_arg(const char *a) {
+	if (!a) return false;
+	return cc_flag_takes_arg_nonnull(a);
 }
 
 static int dep_flag_kind(const char *a) {
 	if (a[1] == 'M') {
-		if (!strcmp(a, "-MD") || !strcmp(a, "-MMD") || !strcmp(a, "-MP")) return 1;
-		if (!strcmp(a, "-MF") || !strcmp(a, "-MT") || !strcmp(a, "-MQ")) return 2;
+		static const char *const generate[] = {"-MD", "-MMD", "-MP"};
+		static const char *const target[] = {"-MF", "-MT", "-MQ"};
+		if (str_in_list(a, generate, sizeof(generate) / sizeof(*generate))) return 1;
+		if (str_in_list(a, target, sizeof(target) / sizeof(*target))) return 2;
 	}
 	if (a[1] == 'W' && a[2] == 'p' && a[3] == ',') {
 		const char *v = a + 4;
-		if (strstr(v, "-MD") || strstr(v, "-MMD") || strstr(v, "-MF") || strstr(v, "-MT") ||
-		    strstr(v, "-MQ") || strstr(v, "-MP"))
-			return 1;
+		static const char *const flags[] = {"-MD", "-MMD", "-MF", "-MT", "-MQ", "-MP"};
+		if (str_contains_any(v, flags, sizeof(flags) / sizeof(*flags))) return 1;
 	}
 	return 0;
 }
@@ -6163,10 +6095,11 @@ static int rsp_tokenize_buf(const char *text,
 			    int depth) {
 	const char *p = text;
 	while (*p) {
-		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+		while (ascii_space(*p)) p++;
 		if (!*p) break;
-		char *tokbuf = NULL;
-		size_t n = 0, tcap = 0;
+		size_t n = 0, tcap = 64;
+		char *tokbuf = malloc(tcap);
+		if (!tokbuf) return -1;
 		/* libiberty buildargv semantics: backslash escapes the next char in
 		 * every state; single/double quotes toggle anywhere in the token
 		 * (`-DMSG="a b"` is ONE arg); a trailing lone backslash is dropped.
@@ -6176,13 +6109,12 @@ static int rsp_tokenize_buf(const char *text,
 		bool squote = false, dquote = false, bsquote = false;
 		while (*p) {
 			char c = *p;
-			if (!bsquote && !squote && !dquote &&
-			    (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'))
+			if (!bsquote & !squote & !dquote & ascii_space(c))
 				break;
 			bool emit = false;
 			bool is_escape = c == '\\';
 #ifdef _WIN32
-			is_escape = is_escape && p[1] == '"';
+			is_escape &= p[1] == '"';
 #endif
 			if (bsquote) {
 				bsquote = false;
@@ -6206,7 +6138,7 @@ static int rsp_tokenize_buf(const char *text,
 			}
 			if (emit) {
 				if (n + 1 >= tcap) {
-					tcap = tcap ? tcap * 2 : 64;
+					tcap *= 2;
 					char *nt = realloc(tokbuf, tcap);
 					if (!nt) {
 						free(tokbuf);
@@ -6218,15 +6150,9 @@ static int rsp_tokenize_buf(const char *text,
 			}
 			p++;
 		}
-		if (!tokbuf) {
-			tokbuf = strdup("");
-			if (!tokbuf) return -1;
-		} else {
-			tokbuf[n] = '\0';
-		}
-		int nested_rc = 0;
+		tokbuf[n] = '\0';
 		if (tokbuf[0] == '@' && tokbuf[1]) {
-			nested_rc = rsp_expand_file(
+			int nested_rc = rsp_expand_file(
 			    tokbuf + 1, out, count, cap, owned, owned_count, owned_cap, depth + 1);
 			/* Unreadable nested @file: GCC keeps the arg literally. */
 			if (nested_rc > 0)
@@ -6317,14 +6243,37 @@ fail:
 	for (int j = 0; j < owned_count; j++) free(owned[j]);
 	free(owned);
 	free(out);
-	*out_argc = *owned_count_out = 0;
-	*owned_out = NULL;
 	return NULL;
 }
 
 static bool prism_handles_x_lang(const char *lang) {
 	if (!lang || !*lang) return false;
-	return !strcmp(lang, "c") || !strcmp(lang, "cpp-output") || !strcmp(lang, "c-header");
+	static const char *const handled[] = {"c", "cpp-output", "c-header"};
+	return str_in_list(lang, handled, sizeof(handled) / sizeof(*handled));
+}
+
+static void cli_add_source(Cli *cli, const char *source, const char *x_lang, int x_arg_idx) {
+	if (cli->source_count == 0) {
+		cli->source_x_lang = x_lang;
+		cli->source_x_arg_idx = x_arg_idx;
+	}
+	CLI_PUSH(cli->sources, cli->source_count, cli->source_cap, source);
+}
+
+static bool cli_apply_mode_word(Cli *cli, const char *word) {
+	static const struct {
+		const char *word;
+		CliMode mode;
+	} modes[] = {{"run", CLI_RUN},
+		     {"transpile", CLI_EMIT},
+		     {"install", CLI_INSTALL},
+		     {"check", CLI_CHECK}};
+	for (size_t i = 0; i < sizeof(modes) / sizeof(*modes); i++) {
+		if (strcmp(word, modes[i].word)) continue;
+		cli->mode = modes[i].mode;
+		return true;
+	}
+	return false;
 }
 
 typedef struct {
@@ -6356,6 +6305,10 @@ static bool cli_apply_feature_flag(Cli *cli, const char *name, bool on) {
 	return false;
 }
 
+static inline bool cli_short_flag(const char *arg, char flag) {
+	return arg[1] == flag && !arg[2];
+}
+
 static Cli cli_parse(int argc, char **argv) {
 	Cli cli = {.features = prism_defaults(), .source_x_arg_idx = -1};
 	char **owned = NULL;
@@ -6385,13 +6338,13 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.check_tool = a;
 				continue;
 			}
-			if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i") ||
+			if (a[0] != '-' && (is_c_input_ext(a) ||
 					    prism_handles_x_lang(cur_x_lang)))
 				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 			CLI_PUSH(cli.check_args, cli.check_arg_count, cli.check_arg_cap, a);
 			continue;
 		}
-		if (a[0] == '-' && a[1] == '-' && !a[2]) {
+		if (!strcmp(a, "--")) {
 			for (int j = i + 1; j < argc; j++)
 				CLI_PUSH(cli.prog_args, cli.prog_arg_count, cli.prog_arg_cap, argv[j]);
 			break;
@@ -6402,29 +6355,10 @@ static Cli cli_parse(int argc, char **argv) {
 #else
 		if (a[0] != '-' || !a[1]) {
 #endif
-			if (!strcmp(a, "run")) {
-				cli.mode = CLI_RUN;
-				continue;
-			}
-			if (!strcmp(a, "transpile")) {
-				cli.mode = CLI_EMIT;
-				continue;
-			}
-			if (!strcmp(a, "install")) {
-				cli.mode = CLI_INSTALL;
-				continue;
-			}
-			if (!strcmp(a, "check")) {
-				cli.mode = CLI_CHECK;
-				continue;
-			}
+			if (cli_apply_mode_word(&cli, a)) continue;
 			/* GCC/Clang: lone `-` means read the TU from stdin. */
 			if (!strcmp(a, "-")) {
-				if (cli.source_count == 0) {
-					cli.source_x_lang = cur_x_lang;
-					cli.source_x_arg_idx = last_x_arg_idx;
-				}
-				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+				cli_add_source(&cli, a, cur_x_lang, last_x_arg_idx);
 				continue;
 			}
 			/* MSVC-style /c /Fe /Fo — honor on all hosts so they are
@@ -6434,7 +6368,7 @@ static Cli cli_parse(int argc, char **argv) {
 					cli.compile_only = true;
 					continue;
 				}
-				if (a[1] == 'F' && (a[2] == 'e' || a[2] == 'o')) {
+				if (a[1] == 'F' && ((a[2] == 'e') | (a[2] == 'o'))) {
 					const char *output = a[3] == ':' ? a + 4
 							   : a[3] ? a + 3
 								  : (i + 1 < argc ? argv[++i] : NULL);
@@ -6447,12 +6381,8 @@ static Cli cli_parse(int argc, char **argv) {
 			}
 			/* `.c`/`.i`, or extensionless under `-x c` / `cpp-output`. */
 			if (!cli.passthrough &&
-			    (has_ext(a, ".c") || has_ext(a, ".i") || prism_handles_x_lang(cur_x_lang))) {
-				if (cli.source_count == 0) {
-					cli.source_x_lang = cur_x_lang;
-					cli.source_x_arg_idx = last_x_arg_idx;
-				}
-				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+			    (is_c_input_ext(a) || prism_handles_x_lang(cur_x_lang))) {
+				cli_add_source(&cli, a, cur_x_lang, last_x_arg_idx);
 				continue;
 			}
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
@@ -6510,17 +6440,17 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.mode = CLI_EMIT;
 				continue;
 			}
-		} else if (a[1] == 'h' && !a[2]) {
+		} else if (cli_short_flag(a, 'h')) {
 			cli.action = CLI_ACT_HELP;
 			return cli;
-		} else if (a[1] == 'c' && !a[2]) {
+		} else if (cli_short_flag(a, 'c')) {
 			cli.compile_only = true;
-		} else if (a[1] == 'S' && !a[2]) {
+		} else if (cli_short_flag(a, 'S')) {
 			cli.compile_only = true;
 			cli.assemble_only = true;
-		} else if (a[1] == 'E' && !a[2]) {
+		} else if (cli_short_flag(a, 'E')) {
 			cli.passthrough = true;
-		} else if (!strcmp(a, "-M") || !strcmp(a, "-MM")) {
+		} else if ((strcmp(a, "-M") == 0) | (strcmp(a, "-MM") == 0)) {
 			/* Like -E: preprocess-only. Must not transpile via stdin `-`
 			 * (backend would emit `-.o:` as the dep target). */
 			cli.passthrough = true;
@@ -6551,7 +6481,12 @@ static Cli cli_parse(int argc, char **argv) {
 			cur_x_lang = cli.cc_args[cli.cc_arg_count - 1];
 			continue;
 		}
+#ifdef _WIN32
 		if (a[1] == 'x' && a[2] && a[2] != '-') {
+#else
+		/* Lone `-` was handled as an input above, so a[2] is readable here. */
+		if ((a[1] == 'x') & (a[2] != '\0') & (a[2] != '-')) {
+#endif
 			last_x_arg_idx = cli.cc_arg_count;
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			cur_x_lang = a + 2;
@@ -6559,7 +6494,7 @@ static Cli cli_parse(int argc, char **argv) {
 		}
 
 		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-		if (i + 1 < argc && cc_flag_takes_arg(a))
+		if (i + 1 < argc && cc_flag_takes_arg_nonnull(a))
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
 	}
 
@@ -6572,21 +6507,10 @@ static void cli_free(Cli *cli) {
 	free(cli->cc_args);
 	free(cli->dep_args);
 	free(cli->prog_args);
-	if (cli->rsp_owned) {
-		for (int i = 0; i < cli->rsp_owned_count; i++) free(cli->rsp_owned[i]);
-		free(cli->rsp_owned);
-	}
+	for (int i = 0; i < cli->rsp_owned_count; i++) free(cli->rsp_owned[i]);
+	free(cli->rsp_owned);
 	free(cli->rsp_argv);
-	cli->rsp_argv = NULL;
 	free(cli->check_args);
-	cli->check_args = NULL;
-	cli->check_arg_count = 0;
-	cli->sources = NULL;
-	cli->cc_args = NULL;
-	cli->dep_args = NULL;
-	cli->prog_args = NULL;
-	cli->rsp_owned = NULL;
-	cli->rsp_owned_count = 0;
 }
 
 #ifndef PRISM_LIB_MODE
@@ -6602,9 +6526,9 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	 * backend's stdin, leaving nothing to verify.  Under verification we
 	 * materialize the output first, check the re-transpilation fixed
 	 * point, then feed the verified bytes to the backend. */
-	if (prism_verify_mode && !prism_in_verify) {
+	if (prism_verify_mode & !prism_in_verify) {
 		char vtmp[PATH_MAX];
-		int vfd = make_temp_file_registered(vtmp, sizeof(vtmp), NULL, 2, input_file);
+		int vfd = make_temp_file_registered(vtmp, input_file);
 		if (vfd < 0) return -1;
 		FILE *vfp = fdopen(vfd, "w");
 		if (!vfp) {
@@ -6706,25 +6630,25 @@ static noreturn void die(char *message) {
 }
 
 #ifndef _WIN32
-static bool get_self_exe_path(char *buf, size_t bufsize) {
+static bool get_self_exe_path(char *buf) {
 #if defined(__APPLE__)
-	uint32_t sz = (uint32_t)bufsize;
+	uint32_t sz = PATH_MAX;
 	if (_NSGetExecutablePath(buf, &sz) == 0) {
 		char temp[PATH_MAX];
 		if (realpath(buf, temp)) {
-			strncpy(buf, temp, bufsize - 1);
-			buf[bufsize - 1] = '\0';
+			strncpy(buf, temp, PATH_MAX - 1);
+			buf[PATH_MAX - 1] = '\0';
 		}
 		return true;
 	}
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
 	int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
-	size_t len = bufsize;
+	size_t len = PATH_MAX;
 	if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) return true;
 #else
 	const char *links[] = {"/proc/self/exe", "/proc/curproc/exe", "/proc/self/path/a.out"};
 	for (int i = 0; i < 3; i++) {
-		ssize_t len = readlink(links[i], buf, bufsize - 1);
+		ssize_t len = readlink(links[i], buf, PATH_MAX - 1);
 		if (len > 0) {
 			buf[len] = '\0';
 			return true;
@@ -6735,14 +6659,12 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 }
 
 static const char *get_install_path(void) {
-#ifndef _WIN32
 	const char *prefix = getenv("PREFIX");
 	if (prefix && *prefix) {
 		static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 		snprintf(buf, sizeof(buf), "%s/bin/prism", prefix);
 		return buf;
 	}
-#endif
 	return INSTALL_PATH;
 }
 
@@ -6774,14 +6696,17 @@ static bool ensure_install_dir(const char *p) {
 	return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static void add_to_user_path(const char *dir) {
-	(void)dir;
+static bool install_escalator_exists(const char *usr_path, const char *bin_path, const char *prefix_path) {
+	if (access(usr_path, X_OK) == 0) return true;
+	if (access(bin_path, X_OK) == 0) return true;
+	return prefix_path[0] && access(prefix_path, X_OK) == 0;
 }
+
 #endif
 
-static void read_trimmed_line(char *buf, int bufsize, FILE *fp) {
+static void read_trimmed_line(char *buf, FILE *fp) {
 	buf[0] = '\0';
-	if (!fgets(buf, bufsize, fp)) return;
+	if (!fgets(buf, PATH_MAX, fp)) return;
 	size_t len = strlen(buf);
 	if (len > 0 && buf[len - 1] == '\n') buf[--len] = '\0';
 	if (len > 0 && buf[len - 1] == '\r') buf[len - 1] = '\0';
@@ -6792,7 +6717,7 @@ static void check_path_shadow(const char *install_path) {
 	FILE *fp = popen(cmd, "r");
 	if (!fp) return;
 	char first_hit[PATH_MAX];
-	read_trimmed_line(first_hit, sizeof(first_hit), fp);
+	read_trimmed_line(first_hit, fp);
 	char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
 #ifdef _WIN32
 	char cwd[PATH_MAX];
@@ -6811,7 +6736,7 @@ static void check_path_shadow(const char *install_path) {
 			if (!sep) sep = strrchr(first_dir, '/');
 			if (sep) *sep = '\0';
 			if (_stricmp(first_dir, cwd) == 0) {
-				read_trimmed_line(first_hit, sizeof(first_hit), fp);
+				read_trimmed_line(first_hit, fp);
 			}
 		}
 	}
@@ -6830,7 +6755,7 @@ static void check_path_shadow(const char *install_path) {
 	}
 #endif
 	pclose(fp);
-	if (first_hit[0] && strcmp(first_hit, install_path) != 0) {
+	if (first_hit[0] & (strcmp(first_hit, install_path) != 0)) {
 		char *rh = realpath(first_hit, resolved_hit);
 		char *ri = realpath(install_path, resolved_install);
 		if (rh && ri && strcmp(rh, ri) == 0) return; // Same file via symlink — no shadow
@@ -6858,7 +6783,7 @@ static bool paths_are_same_file(const char *a, const char *b) {
 #else
 	struct stat sa, sb;
 	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return strcmp(a, b) == 0;
-	return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+	return (sa.st_dev == sb.st_dev) & (sa.st_ino == sb.st_ino);
 #endif
 }
 
@@ -6871,11 +6796,11 @@ static int install(char *self_path) {
 	char old_path[PATH_MAX];
 	old_path[0] = '\0';
 #endif
+	FILE *input;
+	FILE *output;
 
-	FILE *input = NULL;
-	FILE *output = NULL;
 	if (!ensure_install_dir(install_path)) goto use_sudo;
-	if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
+	if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path))
 		self_path = resolved_path;
 	if (paths_are_same_file(self_path, install_path)) {
 		printf("[prism] Already installed at %s\n", install_path);
@@ -6883,10 +6808,11 @@ static int install(char *self_path) {
 	}
 
 	input = fopen(self_path, "rb");
-	output = input ? fopen(install_path, "wb") : NULL;
+	if (!input) goto use_sudo;
+	output = fopen(install_path, "wb");
 
 #ifdef _WIN32
-	if (input && !output && GetLastError() == ERROR_SHARING_VIOLATION) {
+	if (!output && GetLastError() == ERROR_SHARING_VIOLATION) {
 		snprintf(old_path, sizeof(old_path), "%s.old", install_path);
 		remove(old_path); // remove any leftover from a previous update
 		if (MoveFileA(install_path, old_path)) output = fopen(install_path, "wb");
@@ -6895,7 +6821,7 @@ static int install(char *self_path) {
 	}
 #endif
 
-	if (input && output) {
+	if (output) {
 		char buffer[4096];
 		size_t bytes;
 		while ((bytes = fread(buffer, 1, 4096, input)) > 0) {
@@ -6933,22 +6859,21 @@ static int install(char *self_path) {
 		}
 #endif
 		printf("[prism] Installed!\n");
+#ifdef _WIN32
 		{
 			char dir[PATH_MAX];
 			strncpy(dir, install_path, PATH_MAX - 1);
 			dir[PATH_MAX - 1] = '\0';
-			char *sep = strrchr(dir, '/');
-			char *bsep = strrchr(dir, '\\');
-			if (bsep && (!sep || bsep > sep)) sep = bsep;
-			if (sep) *sep = '\0';
+			char *base = (char *)path_basename(dir);
+			if (base != dir) base[-1] = '\0';
 			add_to_user_path(dir);
 		}
+#endif
 		check_path_shadow(install_path);
 		return 0;
 	}
 
-	if (input) fclose(input);
-	if (output) fclose(output);
+	fclose(input);
 
 use_sudo:;
 #ifdef _WIN32
@@ -6974,11 +6899,9 @@ use_sudo:;
 				snprintf(doas_path, sizeof(doas_path), "%s/bin/doas", prefix);
 			} else
 				sudo_path[0] = doas_path[0] = '\0';
-			if (access("/usr/bin/sudo", X_OK) == 0 || access("/bin/sudo", X_OK) == 0 ||
-			    (sudo_path[0] && access(sudo_path, X_OK) == 0))
+			if (install_escalator_exists("/usr/bin/sudo", "/bin/sudo", sudo_path))
 				escalate = "sudo";
-			else if (access("/usr/bin/doas", X_OK) == 0 || access("/bin/doas", X_OK) == 0 ||
-				 (doas_path[0] && access(doas_path, X_OK) == 0))
+			else if (install_escalator_exists("/usr/bin/doas", "/bin/doas", doas_path))
 				escalate = "doas";
 			if (!escalate) {
 				fprintf(stderr,
@@ -7011,39 +6934,48 @@ use_sudo:;
 }
 
 static bool is_prism_cc(const char *cc) {
-	if (!cc || !*cc) return false;
 	const char *exe = cc_executable(cc);
 	const char *base = path_basename(exe);
 	if (strncmp(base, "prism", 5) == 0) {
 		char next = base[5];
-		if (next == '\0' || next == ' ' || next == '.') return true;
+		if (strchr(" .", next)) return true;
 	}
 	return false;
 }
 
 static const char *get_real_cc(const char *cc) {
-	if (!cc || !*cc || is_prism_cc(cc)) return PRISM_DEFAULT_CC;
+	if (!cc || !*cc) return PRISM_DEFAULT_CC;
+	if (is_prism_cc(cc)) return PRISM_DEFAULT_CC;
 	const char *exe = cc_executable(cc);
 	if (!strpbrk(exe, "/\\")) return cc;
 	char cc_real[PATH_MAX], self_real[PATH_MAX];
-	if (get_self_exe_path(self_real, sizeof(self_real)) && realpath(exe, cc_real))
+	if (get_self_exe_path(self_real) && realpath(exe, cc_real))
 		if (strcmp(cc_real, self_real) == 0) return PRISM_DEFAULT_CC;
 	return cc;
 }
 
-static int capture_first_line(char **argv, char *buf, size_t bufsize);
+static char *compiler_from_env(const char *name) {
+#ifdef _WIN32
+	char *cc = (char *)get_env_utf8(name);
+#else
+	char *cc = getenv(name);
+#endif
+	if (!cc || !*cc || is_prism_cc(cc)) return NULL;
+	return cc;
+}
+
+static int capture_first_line(char **argv, char *buf);
 
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
-	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
+	if (strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
 #endif
-	if (!cc || !*cc) return false;
 	const char *exe = cc_executable(cc);
 	const char *base = path_basename(exe);
 	if (strncmp(base, "clang", 5) == 0) return true;
 	char ver[256];
 	char *probe_argv[] = {(char *)exe, "--version", NULL};
-	if (capture_first_line(probe_argv, ver, sizeof(ver)) == 0) {
+	if (capture_first_line(probe_argv, ver) == 0) {
 		for (char *p = ver; *p; p++) *p = (char)tolower((unsigned char)*p);
 		if (strstr(ver, "clang")) return true;
 	}
@@ -7095,8 +7027,8 @@ static ssize_t spawn_capture_stdout(char **argv, char *buf, size_t bufsize) {
 	return (ssize_t)total;
 }
 
-static int capture_first_line(char **argv, char *buf, size_t bufsize) {
-	ssize_t n = spawn_capture_stdout(argv, buf, bufsize);
+static int capture_first_line(char **argv, char *buf) {
+	ssize_t n = spawn_capture_stdout(argv, buf, 256);
 	if (n <= 0) {
 		buf[0] = '\0';
 		return -1;
@@ -7108,7 +7040,7 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 
 static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	ssize_t n = spawn_capture_stdout(argv, buf, bufsize);
-	return (n > 0) ? 0 : -1;
+	return -(n <= 0);
 }
 #endif
 
@@ -7193,9 +7125,8 @@ static void add_warn_suppress(const char **args, int *argc, bool clang, bool msv
 	    "-Wno-unused-parameter",
 	};
 	for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++) args[(*argc)++] = w[i];
-	if (clang) args[(*argc)++] = "-Wno-unknown-warning-option";
-	else
-		args[(*argc)++] = "-Wno-logical-op";
+	static const char *const extra[] = {"-Wno-logical-op", "-Wno-unknown-warning-option"};
+	args[(*argc)++] = extra[clang];
 }
 
 static void verbose_argv(char **args) {
@@ -7211,41 +7142,31 @@ typedef struct {
 	const char *output;
 	bool compile_only;
 	bool optimize;
-	bool suppress_warnings;
 	bool use_preprocessed;
 } TempCompilePlan;
+
+static void cli_unit_output(char *out, const char *src, bool assemble_only, bool msvc) {
+	const char *base = path_basename(src);
+	snprintf(out, PATH_MAX, "%s", base);
+	char *dot = strrchr(out, '.');
+	static const char *const exts[] = {".o", ".obj", ".s", ".s"};
+	const char *ext = exts[(unsigned)assemble_only * 2u + (unsigned)msvc];
+	if (dot) snprintf(dot, PATH_MAX - (size_t)(dot - out), "%s", ext);
+	else {
+		size_t n = strlen(out);
+		snprintf(out + n, PATH_MAX - n, "%s", ext);
+	}
+}
 
 static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool msvc) {
 	static PRISM_THREAD_LOCAL char defobj[PATH_MAX];
 	if (cli->mode == CLI_RUN) return temp_exe;
 	if (cli->output) return cli->output;
-	if (cli->compile_only && cli->source_count == 1) {
-		const char *base = path_basename(cli->sources[0]);
-		snprintf(defobj, sizeof(defobj), "%s", base);
-		char *dot = strrchr(defobj, '.');
-		const char *ext = cli->assemble_only ? ".s" : (msvc ? ".obj" : ".o");
-		if (dot) snprintf(dot, sizeof(defobj) - (size_t)(dot - defobj), "%s", ext);
-		else {
-			size_t n = strlen(defobj);
-			snprintf(defobj + n, sizeof(defobj) - n, "%s", ext);
-		}
+	if (cli->compile_only & (cli->source_count == 1)) {
+		cli_unit_output(defobj, cli->sources[0], cli->assemble_only, msvc);
 		return defobj;
 	}
 	return NULL;
-}
-
-/* Default object/asm name for source path (basename + .o/.s/.obj). */
-static void cli_default_unit_output(char *out, size_t outsz, const char *src, bool assemble_only,
-				   bool msvc) {
-	const char *base = path_basename(src);
-	snprintf(out, outsz, "%s", base);
-	char *dot = strrchr(out, '.');
-	const char *ext = assemble_only ? ".s" : (msvc ? ".obj" : ".o");
-	if (dot) snprintf(dot, outsz - (size_t)(dot - out), "%s", ext);
-	else {
-		size_t n = strlen(out);
-		snprintf(out + n, outsz - n, "%s", ext);
-	}
 }
 
 /* -MD/-MMD deps are generated during preprocess (`cc -E`), which strips `-o`.
@@ -7253,17 +7174,20 @@ static void cli_default_unit_output(char *out, size_t outsz, const char *src, bo
 static void cli_inject_dep_mt_from_output(Cli *cli) {
 	if (!cli->output || !cli->output[0]) return;
 	bool has_md = false, has_mt = false;
+	static const char *const generate[] = {"-MD", "-MMD"};
+	static const char *const target[] = {"-MT", "-MQ"};
 	for (int i = 0; i < cli->dep_arg_count; i++) {
 		const char *a = cli->dep_args[i];
-		if (!strcmp(a, "-MD") || !strcmp(a, "-MMD")) has_md = true;
-		if (!strcmp(a, "-MT") || !strcmp(a, "-MQ")) has_mt = true;
-		if (a[0] == '-' && a[1] == 'W' && a[2] == 'p' && a[3] == ',') {
+		has_md |= str_in_list(a, generate, sizeof(generate) / sizeof(*generate));
+		has_mt |= str_in_list(a, target, sizeof(target) / sizeof(*target));
+		if (strncmp(a, "-Wp,", 4) == 0) {
 			const char *v = a + 4;
-			if (strstr(v, "-MD") || strstr(v, "-MMD")) has_md = true;
-			if (strstr(v, "-MT") || strstr(v, "-MQ")) has_mt = true;
+			has_md |= str_contains_any(
+			    v, generate, sizeof(generate) / sizeof(*generate));
+			has_mt |= str_contains_any(v, target, sizeof(target) / sizeof(*target));
 		}
 	}
-	if (!has_md || has_mt) return;
+	if (!has_md | has_mt) return;
 	CLI_PUSH(cli->dep_args, cli->dep_arg_count, cli->dep_arg_cap, "-MT");
 	CLI_PUSH(cli->dep_args, cli->dep_arg_count, cli->dep_arg_cap, cli->output);
 }
@@ -7272,9 +7196,8 @@ static void argv_add_output(const char **args, int *argc, const char *out, bool 
 	if (!out) return;
 	if (msvc) {
 		static PRISM_THREAD_LOCAL char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
-		if (compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
-		else
-			snprintf(flag, sizeof(flag), "/Fe:%s", out);
+		static const char *const formats[] = {"/Fe:%s", "/Fo:%s"};
+		snprintf(flag, sizeof(flag), formats[compile_only], out);
 		args[(*argc)++] = flag;
 	} else {
 		args[(*argc)++] = "-o";
@@ -7288,28 +7211,61 @@ static void argv_add_output(const char **args, int *argc, const char *out, bool 
  * (redefinitions + untranspiled orelse/defer). Also covers -Wp,-include,file
  * and -Xpreprocessor -include -Xpreprocessor file. */
 static int cc_force_include_skip(const char *a) {
-	if (!a) return 0;
-	if (!strcmp(a, "-include") || !strcmp(a, "-imacros")) return 2;
-	if (!strcmp(a, "/FI") || !strcmp(a, "-FI")) return 2;
-	if ((!strncmp(a, "/FI", 3) || !strncmp(a, "-FI", 3)) && a[3]) return 1;
-	if (!strncmp(a, "-Wp,-include,", 13) || !strncmp(a, "-Wp,-imacros,", 13)) return 1;
+	static const char *const separate[] = {"-include", "-imacros", "/FI", "-FI"};
+	if (str_in_list(a, separate, sizeof(separate) / sizeof(*separate))) return 2;
+	static const struct {
+		const char *prefix;
+		uint8_t len;
+		bool require_suffix;
+	} attached[] = {{"/FI", 3, true},
+			 {"-FI", 3, true},
+			 {"-Wp,-include,", 13, false},
+			 {"-Wp,-imacros,", 13, false}};
+	for (size_t i = 0; i < sizeof(attached) / sizeof(*attached); i++) {
+		if (strncmp(a, attached[i].prefix, attached[i].len) != 0) continue;
+		if (!attached[i].require_suffix | (a[attached[i].len] != '\0')) return 1;
+	}
 	return 0;
 }
 
 static int cc_backend_force_include_skip(const char **args, int i, int n) {
 	int k = cc_force_include_skip(args[i]);
 	if (k) return k;
-	if (!strcmp(args[i], "-Xpreprocessor") && i + 3 < n &&
-	    (!strcmp(args[i + 1], "-include") || !strcmp(args[i + 1], "-imacros")) &&
-	    !strcmp(args[i + 2], "-Xpreprocessor"))
-		return 4;
+	static const char *const operands[] = {"-include", "-imacros"};
+	if (i + 3 < n) {
+		bool match = (strcmp(args[i], "-Xpreprocessor") == 0) &
+			     str_in_list(args[i + 1], operands, sizeof(operands) / sizeof(*operands)) &
+			     (strcmp(args[i + 2], "-Xpreprocessor") == 0);
+		if (match) return 4;
+	}
 	return 0;
 }
 
-static void make_run_temp(char *buf, size_t size, CliMode mode) {
+static void argv_add_filtered_cc_args(const Cli *cli,
+				      const char **args,
+				      int *argc,
+				      bool skip_msvc_std,
+				      int x_flag_idx) {
+	for (int i = 0; i < cli->cc_arg_count; i++) {
+		const char *arg = cli->cc_args[i];
+		if (i == x_flag_idx) {
+			if (!strcmp(arg, "-x")) i++;
+			continue;
+		}
+		if (skip_msvc_std && !strncmp(arg, "/std:", 5)) continue;
+		int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
+		if (fi_skip) {
+			i += fi_skip - 1;
+			continue;
+		}
+		args[(*argc)++] = arg;
+	}
+}
+
+static void make_run_temp(char *buf, CliMode mode) {
 	buf[0] = '\0';
 	if (mode != CLI_RUN) return;
-	snprintf(buf, size, "%sprism_run.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
+	snprintf(buf, PATH_MAX, "%sprism_run.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
 #ifdef _WIN32
 	int fd = mkstemps(buf, (int)sizeof(EXE_SUFFIX) - 1);
 #else
@@ -7321,13 +7277,14 @@ static void make_run_temp(char *buf, size_t size, CliMode mode) {
 }
 
 static int passthrough_cc(const Cli *cli) {
-	const char *compiler = get_real_cc(cli->cc);
+	PRISM_STATE();
+	const char *compiler = _ps->extra_compiler;
 	bool msvc = cc_is_msvc(compiler);
 	/* Pure .cpp/.cc/… never hit compile_sources; still need g++/clang++ so
 	 * libc++/libstdc++ link (else STL/iostream fail at link). */
 	if (!msvc && cli_has_cxx_passthrough(cli)) compiler = cxx_driver_for_cc(compiler);
-	int cc_extra = cc_extra_arg_count(compiler);
-	const char **args = alloc_argv(cli->cc_arg_count + cli->dep_arg_count + cc_extra + 8);
+	const char **args =
+	    alloc_argv(cli->cc_arg_count + cli->dep_arg_count + (int)strlen(compiler) + 8);
 	int argc = 0;
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, compiler, &cc_dup);
@@ -7348,9 +7305,7 @@ static void cleanup_temp_range(char **temps, int count) {
 #ifdef _WIN32
 		// MSVC places .obj in the CWD using the input file's basename.
 		{
-			const char *base = temps[i];
-			for (const char *p = temps[i]; *p; p++)
-				if (*p == '/' || *p == '\\') base = p + 1;
+			const char *base = path_basename(temps[i]);
 			char obj_path[PATH_MAX];
 			strncpy(obj_path, base, sizeof(obj_path) - 1);
 			obj_path[sizeof(obj_path) - 1] = '\0';
@@ -7368,9 +7323,8 @@ static void cleanup_temp_range(char **temps, int count) {
 }
 
 static bool compiler_is_cxx_driver(const char *cc) {
-	if (!cc || !*cc) return false;
 	const char *base = path_basename(cc_executable(cc));
-	return strstr(base, "++") != NULL || strcmp(base, "c++") == 0;
+	return strstr(base, "++") != NULL;
 }
 
 /* g++ with leading `-x c` omits -lstdc++ (GCC 16+). clang++ / Apple's c++
@@ -7378,7 +7332,6 @@ static bool compiler_is_cxx_driver(const char *cc) {
  * duplicates the library and can fail under -Wl,-fatal_warnings. */
 static void argv_add_cxx_stdlib(const char **args, int *argc, const char *compiler, bool clang) {
 	if (clang) return;
-	if (!compiler || !*compiler) return;
 	const char *base = path_basename(cc_executable(compiler));
 	/* `c++` drivers (libstdc++ or libc++) already pull the runtime. */
 	if (strcmp(base, "c++") == 0) return;
@@ -7386,9 +7339,9 @@ static void argv_add_cxx_stdlib(const char **args, int *argc, const char *compil
 }
 
 static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, const TempCompilePlan *plan) {
-	int cc_extra = cc_extra_arg_count(plan->compiler);
 	/* +2 per temp for repeated `-x c`, +4 for none/stdlib */
-	const char **args = alloc_argv(temp_count * 3 + cli->cc_arg_count + cc_extra + 32);
+	const char **args = alloc_argv(temp_count * 3 + cli->cc_arg_count +
+				      (int)strlen(plan->compiler) + 32);
 	int argc = 0;
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
@@ -7397,11 +7350,14 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 		// Prism may emit typeof()/typeof_unqual() which require C23 mode on MSVC.
 		args[argc++] = "/std:clatest";
 	}
-	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
+	if (plan->optimize) {
+		static const char *const flags[] = {"-O2", "/O2"};
+		args[argc++] = flags[plan->msvc];
+	}
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	/* Multi-file `prism a.c b.c main.cpp` upgrades to g++/clang++ for libstdc++.
 	 * GCC only applies `-x` to the next input, so repeat before every temp. */
-	bool force_c_temps = !plan->msvc && compiler_is_cxx_driver(plan->compiler) && temp_count > 0;
+	bool force_c_temps = !plan->msvc && compiler_is_cxx_driver(plan->compiler);
 	for (int i = 0; i < temp_count; i++) {
 		if (force_c_temps) {
 			args[argc++] = "-x";
@@ -7414,19 +7370,12 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 		args[argc++] = "-x";
 		args[argc++] = "none";
 	}
-	for (int i = 0; i < cli->cc_arg_count; i++) {
-		// Skip user's /std: flags on MSVC — we already injected /std:clatest.
-		if (plan->msvc && strncmp(cli->cc_args[i], "/std:", 5) == 0) continue;
-		int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
-		if (fi_skip) {
-			i += fi_skip - 1;
-			continue;
-		}
-		args[argc++] = cli->cc_args[i];
-	}
-	if (plan->suppress_warnings) add_warn_suppress(args, &argc, plan->clang, plan->msvc);
+	/* Skip user's /std: flags on MSVC; /std:clatest is already present. */
+	argv_add_filtered_cc_args(cli, args, &argc, plan->msvc, -1);
+	add_warn_suppress(args, &argc, plan->clang, plan->msvc);
 	argv_add_output(args, &argc, plan->output, plan->msvc, plan->compile_only);
-	if (force_c_temps && !plan->compile_only) argv_add_cxx_stdlib(args, &argc, plan->compiler, plan->clang);
+	if (force_c_temps & !plan->compile_only)
+		argv_add_cxx_stdlib(args, &argc, plan->compiler, plan->clang);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
 	int status = run_command((char **)args);
@@ -7435,33 +7384,18 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 	return status;
 }
 
-static const char *resolve_install_compiler(const Cli *cli) {
-#ifdef _WIN32
-	const char *cc = get_real_cc(cli->cc ? cli->cc : get_env_utf8("PRISM_CC"));
-	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
-		cc = get_env_utf8("CC");
-		if (cc) cc = get_real_cc(cc);
-	}
-#else
-	const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
-	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
-		cc = getenv("CC");
-		if (cc) cc = get_real_cc(cc);
-	}
-#endif
-	return cc ? cc : PRISM_DEFAULT_CC;
-}
-
 static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	char **temps = calloc(cli->source_count, sizeof(char *));
 	if (!temps) die("Out of memory");
 	signal_temps_clear();
 	for (int i = 0; i < cli->source_count; i++) {
+		/* A shorter buffer silently disables source-adjacent placement for
+		 * deeply nested paths even though the tmpdir fallback would fit. */
+		temps[i] = malloc(PATH_MAX);
+		if (!temps[i]) die("Out of memory");
+		int fd = make_temp_file_registered(temps[i], cli->sources[i]);
+		if (fd < 0) die("Failed to create temp file");
 		if (use_lib_api) {
-			temps[i] = malloc(PATH_MAX);
-			if (!temps[i]) die("Out of memory");
-			int fd = make_temp_file_registered(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
-			if (fd < 0) die("Failed to create temp file");
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
 			if (result.status != PRISM_OK) {
 				fprintf(stderr,
@@ -7485,16 +7419,6 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			fclose(f);
 			prism_free(&result);
 		} else {
-			/* PATH_MAX, matching the use_lib_api branch above. 512 was
-			 * not reachable as a failure -- make_temp_file falls back to
-			 * a tmpdir path built from the basename, and NAME_MAX caps
-			 * that well under 512 -- but it silently denied the
-			 * source-adjacent placement to any source in a deep enough
-			 * directory, for no reason the other branch shares. */
-			temps[i] = malloc(PATH_MAX);
-			if (!temps[i]) die("Out of memory");
-			int fd = make_temp_file_registered(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
-			if (fd < 0) die("Failed to create temp file");
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
 			FILE *wfp = fdopen(fd, "w");
@@ -7506,10 +7430,11 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
-			if (prism_verify_mode && !prism_in_verify &&
-			    !verify_transpiled_output((char *)cli->sources[i], temps[i])) {
-				cleanup_temp_range(temps, i + 1);
-				return NULL;
+			if (prism_verify_mode & !prism_in_verify) {
+				if (!verify_transpiled_output((char *)cli->sources[i], temps[i])) {
+					cleanup_temp_range(temps, i + 1);
+					return NULL;
+				}
 			}
 		}
 	}
@@ -7517,6 +7442,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 }
 
 static int install_from_source(Cli *cli) {
+	PRISM_STATE();
 	char temp_bin[PATH_MAX];
 	snprintf(temp_bin, sizeof(temp_bin), "%sprism_inst_.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
 #ifdef _WIN32
@@ -7526,7 +7452,7 @@ static int install_from_source(Cli *cli) {
 #endif
 	if (fd < 0) die("Failed to create temp file");
 	close(fd);
-	const char *cc = resolve_install_compiler(cli);
+	const char *cc = _ps->extra_compiler;
 	bool msvc = cc_is_msvc(cc);
 	char **temps = transpile_sources_to_temps(cli, true);
 	if (!temps) return 1;
@@ -7535,7 +7461,6 @@ static int install_from_source(Cli *cli) {
 	    .msvc = msvc,
 	    .output = temp_bin,
 	    .optimize = true,
-	    .suppress_warnings = true,
 	};
 	int status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
 	cleanup_temp_range(temps, cli->source_count);
@@ -7576,7 +7501,7 @@ static const char *host_platform_tag(void) {
 }
 
 static bool link_pragma_platform_matches(const char *platform, size_t plen, const char *host) {
-	if (plen == 1 && platform[0] == '*') return true;
+	if ((plen == 1) & (platform[0] == '*')) return true;
 	size_t hlen = strlen(host);
 	if (plen == hlen && prism_memeq_runtime_sized(platform, host, (uint32_t)hlen)) return true;
 	const char *us = memchr(host, '_', hlen);
@@ -7587,64 +7512,61 @@ static bool link_pragma_platform_matches(const char *platform, size_t plen, cons
 	return false;
 }
 
+static char *link_pragma_skip_hspace(char *p) {
+	while (ascii_hspace(*p)) p++;
+	return p;
+}
+
+static char *link_pragma_token_end(char *p) {
+	while (*p && !ascii_line_space(*p)) p++;
+	return p;
+}
+
+static char *link_pragma_alloc(size_t size) {
+	char *buf = malloc(size);
+	if (!buf) die("out of memory");
+	return buf;
+}
+
 static void collect_link_pragmas_file(const char *path, Cli *cli, const char *host, bool macos) {
-	if (!path || cli->no_link_pragma) return;
 	FILE *f = fopen(path, "r");
 	if (!f) return;
 	char *line = NULL;
 	size_t cap = 0;
-	ssize_t n;
-	while ((n = getline(&line, &cap, f)) != -1) {
-		char *p = line;
-		while (*p == ' ' || *p == '\t') p++;
+	while (getline(&line, &cap, f) != -1) {
+		char *p = link_pragma_skip_hspace(line);
 		if (*p != '#') continue;
-		p++;
-		while (*p == ' ' || *p == '\t') p++;
+		p = link_pragma_skip_hspace(p + 1);
 		if (strncmp(p, "pragma", 6) != 0) continue;
 		p += 6;
-		if (*p != ' ' && *p != '\t') continue;
-		while (*p == ' ' || *p == '\t') p++;
+		if (!ascii_hspace(*p)) continue;
+		p = link_pragma_skip_hspace(p);
 		if (strncmp(p, "link", 4) != 0) continue;
 		p += 4;
-		if (*p != ' ' && *p != '\t') continue;
-		while (*p == ' ' || *p == '\t') p++;
+		if (!ascii_hspace(*p)) continue;
+		p = link_pragma_skip_hspace(p);
 		char *plat = p;
-		while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+		p = link_pragma_token_end(p);
 		size_t plen = (size_t)(p - plat);
-		if (plen == 0) continue;
 		bool match = link_pragma_platform_matches(plat, plen, host);
-		while (*p) {
-			while (*p == ' ' || *p == '\t') p++;
-			if (!*p || *p == '\n' || *p == '\r') break;
-			if (p[0] == '/' && (p[1] == '/' || p[1] == '*')) break;
+		if (!match) continue;
+		for (;;) {
+			p = link_pragma_skip_hspace(p);
+			if (!*p | (*p == '\n') | (*p == '\r')) break;
+			if ((p[0] == '/') & ((p[1] == '/') | (p[1] == '*'))) break;
 			char *tok = p;
-			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+			p = link_pragma_token_end(p);
 			size_t tlen = (size_t)(p - tok);
-			if (!match || tlen == 0) continue;
-			if (tok[0] == '-' || macos) {
-				char *dup = malloc(tlen + 1);
-				if (!dup) {
-					free(line);
-					fclose(f);
-					die("out of memory");
-				}
-				memcpy(dup, tok, tlen);
-				dup[tlen] = 0;
-				if (tok[0] != '-') CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
-				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
-			} else {
-				char *buf = malloc(tlen + 3);
-				if (!buf) {
-					free(line);
-					fclose(f);
-					die("out of memory");
-				}
-				buf[0] = '-';
-				buf[1] = 'l';
-				memcpy(buf + 2, tok, tlen);
-				buf[tlen + 2] = 0;
-				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, buf);
-			}
+			bool plain_name = tok[0] != '-';
+			bool add_name_flag = plain_name & macos;
+			size_t prefix_len = 2 * (size_t)(plain_name & !macos);
+			char *arg = link_pragma_alloc(tlen + prefix_len + 1);
+			memcpy(arg, "-l", prefix_len);
+			memcpy(arg + prefix_len, tok, tlen);
+			arg[prefix_len + tlen] = 0;
+			if (add_name_flag)
+				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
+			CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, arg);
 		}
 	}
 
@@ -7653,7 +7575,7 @@ static void collect_link_pragmas_file(const char *path, Cli *cli, const char *ho
 }
 
 static void collect_link_pragmas(Cli *cli) {
-	if (cli->no_link_pragma || cli->source_count == 0) return;
+	if (cli->no_link_pragma) return;
 	const char *host = host_platform_tag();
 	bool macos = strncmp(host, "macos", 5) == 0;
 	for (int i = 0; i < cli->source_count; i++)
@@ -7663,10 +7585,8 @@ static void collect_link_pragmas(Cli *cli) {
 static bool cli_has_cxx_passthrough(const Cli *cli) {
 	for (int i = 0; i < cli->cc_arg_count; i++) {
 		const char *a = cli->cc_args[i];
-		if (!a || a[0] == '-') continue;
-		if (has_ext(a, ".cpp") || has_ext(a, ".cc") || has_ext(a, ".cxx") || has_ext(a, ".C") ||
-		    has_ext(a, ".mm"))
-			return true;
+		if (a[0] == '-') continue;
+		if (is_cxx_input_ext(a)) return true;
 	}
 	return false;
 }
@@ -7674,12 +7594,10 @@ static bool cli_has_cxx_passthrough(const Cli *cli) {
 /* SPEC: C++ passthrough triggers g++/clang++ so libstdc++/libc++ link.
  * Preserve cross prefixes: x86_64-w64-mingw32-gcc → x86_64-w64-mingw32-g++. */
 static const char *cxx_driver_for_cc(const char *cc) {
-	if (!cc || !*cc) return "g++";
-	if (cc_is_msvc(cc)) return cc;
 	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 	const char *exe = cc_executable(cc);
 	const char *base = path_basename(exe);
-	if (strstr(base, "++") || strcmp(base, "c++") == 0) return cc;
+	if (strstr(base, "++")) return cc;
 	size_t dir_len = (size_t)(base - exe);
 	if (strncmp(base, "clang", 5) == 0) {
 		snprintf(buf, sizeof(buf), "%.*sclang++%s", (int)dir_len, exe, base + 5);
@@ -7716,32 +7634,30 @@ static int compile_sources(Cli *cli) {
 	collect_link_pragmas(cli);
 	_ps->extra_compiler_flags = cli->cc_args;
 	_ps->extra_compiler_flags_count = cli->cc_arg_count;
-	const char *compiler = get_real_cc(cli->cc);
+	const char *compiler = _ps->extra_compiler;
 	bool msvc = cc_is_msvc(compiler);
 	if (!msvc && cli_has_cxx_passthrough(cli)) compiler = cxx_driver_for_cc(compiler);
-	int cc_extra = cc_extra_arg_count(compiler);
 	bool clang = cc_is_clang(compiler);
 	char temp_exe[PATH_MAX];
-	make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
+	make_run_temp(temp_exe, cli->mode);
 	if (temp_exe[0]) {
 		signal_temp_store(0);
 		memcpy(signal_temp_path, temp_exe, sizeof(signal_temp_path));
 		signal_temp_store(1);
 	}
 
-	use_linemarkers = pparse_feat(PPARSE_F_FLATTEN) && !clang && !msvc;
+	use_linemarkers = (pparse_feat(PPARSE_F_FLATTEN) != 0) & !clang & !msvc;
 	/* Stdin pipe + -save-temps makes the backend invent `-.i` / `-.s` names
 	 * (invalid args). Fall back to on-disk temps so save-temps keeps working. */
 	bool save_temps = false;
 	for (int i = 0; i < cli->cc_arg_count; i++) {
 		const char *a = cli->cc_args[i];
-		if (!strcmp(a, "-save-temps") || !strncmp(a, "-save-temps=", 12) ||
-		    !strcmp(a, "--save-temps") || !strncmp(a, "--save-temps=", 13)) {
+		if (cc_is_save_temps_arg(a)) {
 			save_temps = true;
 			break;
 		}
 	}
-	if (cli->source_count == 1 && !msvc && !save_temps) {
+	if ((cli->source_count == 1) & !msvc & !save_temps) {
 		/* Pipe language follows the `-x` that bound the Prism source
 		 * (GCC positional rules). Do NOT steal a later `-x c++` meant
 		 * for a passthrough .cpp — that used to compile C as C++. */
@@ -7749,20 +7665,20 @@ static int compile_sources(Cli *cli) {
 		int x_flag_idx = cli->source_x_arg_idx;
 		/* GCC `-x none` restores extension-based guessing for subsequent files.
 		 * Our pipe is stdin, so map `none` back to the TU's default language. */
-		if (pipe_lang && !strcmp(pipe_lang, "none")) pipe_lang = "c";
+		if (!strcmp(pipe_lang, "none")) pipe_lang = "c";
 
-		const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 24);
+		const char **args = alloc_argv(cli->cc_arg_count + (int)strlen(compiler) + 24);
 		int argc = 0;
 		char *cc_dup = NULL;
 		cc_split_into_argv(args, &argc, compiler, &cc_dup);
 		args[argc++] = "-x";
 		args[argc++] = pipe_lang;
-		if (pparse_feat(PPARSE_F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
+		if (use_linemarkers) args[argc++] = "-fpreprocessed";
 		args[argc++] = "-";
 		bool need_x_none = false;
 		for (int i = 0; i < cli->cc_arg_count; i++) {
 			if (i == x_flag_idx) {
-				if (!strcmp(cli->cc_args[i], "-x") && i + 1 < cli->cc_arg_count) i++;
+				if (!strcmp(cli->cc_args[i], "-x")) i++;
 				continue;
 			}
 			const char *a = cli->cc_args[i];
@@ -7770,7 +7686,7 @@ static int compile_sources(Cli *cli) {
 			 * Treating them as inputs falsely cleared -fpreprocessed
 			 * (split `-I /usr/include` misscompiled flatten mode). */
 			if (a[0] == '-') {
-				if (cc_flag_takes_arg(a) && i + 1 < cli->cc_arg_count) i++;
+				if (cc_flag_takes_arg_nonnull(a) & (i + 1 < cli->cc_arg_count)) i++;
 				continue;
 			}
 			need_x_none = true;
@@ -7778,22 +7694,11 @@ static int compile_sources(Cli *cli) {
 		}
 		if (need_x_none) {
 			/* -fpreprocessed must not apply to passthrough .cpp/.s/… */
-			if (pparse_feat(PPARSE_F_FLATTEN) && !clang) args[argc++] = "-fno-preprocessed";
+			if (use_linemarkers) args[argc++] = "-fno-preprocessed";
 			args[argc++] = "-x";
 			args[argc++] = "none";
 		}
-		for (int i = 0; i < cli->cc_arg_count; i++) {
-			if (i == x_flag_idx) {
-				if (!strcmp(cli->cc_args[i], "-x") && i + 1 < cli->cc_arg_count) i++;
-				continue;
-			}
-			int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
-			if (fi_skip) {
-				i += fi_skip - 1;
-				continue;
-			}
-			args[argc++] = cli->cc_args[i];
-		}
+		argv_add_filtered_cc_args(cli, args, &argc, false, x_flag_idx);
 		add_warn_suppress(args, &argc, clang, false);
 		argv_add_output(args, &argc, cli_output_path(cli, temp_exe, false), false, cli->compile_only);
 		/* Leading `-x c` makes g++ drop -lstdc++; restore when linking C++. */
@@ -7807,33 +7712,31 @@ static int compile_sources(Cli *cli) {
 	} else {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
-		if (cli->compile_only && cli->output && cli->source_count > 1) {
-			fprintf(stderr, "pparse_error: cannot specify -o when generating multiple output files\n");
-			status = 1;
-			cleanup_temp_range(temps, cli->source_count);
-		} else if (cli->compile_only && !cli->output && cli->source_count > 1) {
-			/* `cc -c a.c b.c` writes a.o b.o — not temp basenames. */
-			status = 0;
-			for (int i = 0; i < cli->source_count; i++) {
-				char out[PATH_MAX];
-				cli_default_unit_output(out, sizeof(out), cli->sources[i], cli->assemble_only,
-							msvc);
-				TempCompilePlan plan = {
-				    .compiler = compiler,
-				    .clang = clang,
-				    .msvc = msvc,
-				    .output = out,
-				    .compile_only = true,
-				    .suppress_warnings = true,
-				    .use_preprocessed = pparse_feat(PPARSE_F_FLATTEN) && !clang && !msvc,
-				};
-				int st = run_temp_compile_plan(cli, &temps[i], 1, &plan);
-				if (st != 0) {
-					status = st;
-					break;
+		if (cli->compile_only & (cli->source_count > 1)) {
+			if (cli->output) {
+				fprintf(stderr,
+					"pparse_error: cannot specify -o when generating multiple output files\n");
+				status = 1;
+			} else {
+				/* `cc -c a.c b.c` writes a.o b.o — not temp basenames. */
+				for (int i = 0; i < cli->source_count; i++) {
+					char out[PATH_MAX];
+					cli_unit_output(out, cli->sources[i], cli->assemble_only, msvc);
+					TempCompilePlan plan = {
+					    .compiler = compiler,
+					    .clang = clang,
+					    .msvc = msvc,
+					    .output = out,
+					    .compile_only = true,
+					    .use_preprocessed = use_linemarkers,
+					};
+					int st = run_temp_compile_plan(cli, &temps[i], 1, &plan);
+					if (st != 0) {
+						status = st;
+						break;
+					}
 				}
 			}
-			cleanup_temp_range(temps, cli->source_count);
 		} else {
 			TempCompilePlan plan = {
 			    .compiler = compiler,
@@ -7841,12 +7744,11 @@ static int compile_sources(Cli *cli) {
 			    .msvc = msvc,
 			    .output = cli_output_path(cli, temp_exe, msvc),
 			    .compile_only = cli->compile_only,
-			    .suppress_warnings = true,
-			    .use_preprocessed = pparse_feat(PPARSE_F_FLATTEN) && !clang && !msvc,
+			    .use_preprocessed = use_linemarkers,
 			};
 			status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
-			cleanup_temp_range(temps, cli->source_count);
 		}
+		cleanup_temp_range(temps, cli->source_count);
 	}
 
 	if (status != 0) {
@@ -7888,10 +7790,10 @@ static void signal_cleanup_handler(int sig) {
 		win32_memstream_fp = NULL;
 	}
 #endif
-	if (signal_temp_load() && signal_temp_path[0]) unlink(signal_temp_path);
+	if (signal_temp_load() & (signal_temp_path[0] != '\0')) unlink(signal_temp_path);
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0') unlink(signal_temps[i]);
+		if (signal_temps_ready_load(i) & (signal_temps[i][0] != '\0')) unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
@@ -7915,7 +7817,7 @@ PRISM_STATE();
 
 	Cli cli = cli_parse(argc, argv);
 	prism_profile = cli.profile;
-	prism_verify_mode = cli.verify || getenv("PRISM_VERIFY") != NULL;
+	prism_verify_mode = cli.verify | (getenv("PRISM_VERIFY") != NULL);
 	if (cli.action == CLI_ACT_HELP) {
 		print_help();
 		cli_free(&cli);
@@ -7943,20 +7845,9 @@ PRISM_STATE();
 	}
 
 	if (!cli.cc) {
-#ifdef _WIN32
-		char *env_cc = (char *)get_env_utf8("PRISM_CC");
-		if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
-			env_cc = (char *)get_env_utf8("CC");
-			if (is_prism_cc(env_cc)) env_cc = NULL;
-		}
-#else
-		char *env_cc = getenv("PRISM_CC");
-		if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
-			env_cc = getenv("CC");
-			if (is_prism_cc(env_cc)) env_cc = NULL;
-		}
-#endif
-		cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
+		char *env_cc = compiler_from_env("PRISM_CC");
+		if (!env_cc) env_cc = compiler_from_env("CC");
+		cli.cc = env_cc ? env_cc : PRISM_DEFAULT_CC;
 	}
 
 	/* Analysis profile for `prism check`: keep language semantics (defer/
@@ -7972,8 +7863,6 @@ PRISM_STATE();
 	_ps->extra_compiler = get_real_cc(cli.cc);
 	_ps->extra_compiler_flags = cli.cc_args;
 	_ps->extra_compiler_flags_count = cli.cc_arg_count;
-	_ps->dep_flags = cli.dep_args;
-	_ps->dep_flags_count = cli.dep_arg_count;
 	cli_inject_dep_mt_from_output(&cli);
 	_ps->dep_flags = cli.dep_args;
 	_ps->dep_flags_count = cli.dep_arg_count;
@@ -8007,7 +7896,7 @@ PRISM_STATE();
 		}
 		status = run_command((char **)targv);
 		free((void *)targv);
-		if (temps) cleanup_temp_range(temps, cli.source_count);
+		cleanup_temp_range(temps, cli.source_count);
 	} else if (cli.mode == CLI_INSTALL)
 		status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);
 	else if (cli.mode == CLI_EMIT) {

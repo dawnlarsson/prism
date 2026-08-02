@@ -1107,11 +1107,11 @@ static pid_t waitpid(pid_t pid, int *status, int options) {
 
 // Resolve the path to the currently running executable.
 // Uses GetModuleFileNameW to handle non-ASCII install paths.
-static bool get_self_exe_path(char *buf, size_t bufsize) {
+static bool get_self_exe_path(char *buf) {
 	wchar_t wbuf[PATH_MAX];
 	DWORD len = GetModuleFileNameW(NULL, wbuf, PATH_MAX);
 	if (len == 0 || len >= PATH_MAX) return false;
-	int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, (int)bufsize, NULL, NULL);
+	int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, PATH_MAX, NULL, NULL);
 	return (utf8_len > 0);
 }
 
@@ -1346,8 +1346,8 @@ static int win32_capture_stdout(char **argv, char *buf, size_t bufsize, bool fir
 	return pos > 0 ? 0 : -1;
 }
 
-static int capture_first_line(char **argv, char *buf, size_t bufsize) {
-	return win32_capture_stdout(argv, buf, bufsize, true);
+static int capture_first_line(char **argv, char *buf) {
+	return win32_capture_stdout(argv, buf, 256, true);
 }
 
 // Windows twin of the POSIX capture_all_output: reads to EOF, does not
