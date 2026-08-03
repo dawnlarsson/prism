@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-45,532%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-46,261_case_gate-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a transpiler that makes C safer and faster without changing how you write it. One source file, no dependencies beyond a C compiler.
 
-- **45,532+ test cases:** edge cases, control flow, nightmares, trying hard to break Prism
+- **46,261+ tests:** edge cases, control flow, nightmares, fuzz, trying hard to break Prism
 - **Building Real C:** OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler:** full semantic analysis before a single byte is emitted
 - **Progressive optimization:** auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -109,6 +109,8 @@ It is better, but we can take it further, see `orelse` section.
 
 
 Defers execute in **LIFO order** (last defer runs first) at scope exit, whether via `return`, `break`, `continue`, `goto`, or reaching `}`.
+For a braceless defer, the body is one complete statement: `defer if (ok) a();
+else b();` captures the entire `if`/`else`, not only its first branch.
 
 **Edge cases handled:**
 - Statement expressions `({ ... })`: defers fire at inner scope, not outer
@@ -446,6 +448,10 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 - Struct/union member subscripts: `s.arr[i]`, `p->arr[i]`: field size ≠ any same-named local
 - Unary address-of: `&arr[i]`: C permits one-past-end addresses (index == length is legal)
 - Pointer subscripts (`p[i]` where `p` is `int *`)
+- Derived array-pointer bases whose one true extent cannot be proven, such as
+  `(a + i)[0]`, `i[a]`, or `(pick ? a : b)[i]`. Strict safety mode diagnoses
+  these rather than attaching one array's bound to another; `-fno-safety`
+  leaves valid host C unwrapped.
 - Array parameters: `void f(int a[4])` declares a pointer, not an array (C11 §6.7.6.3p7), so there is no length to check against. This includes `int a[static 4]`, where C does promise at least 4 elements but Prism does not yet use that promise
 - Pointer-to-array dereference: `int (*p)[4]; (*p)[i]` and `p[0][i]` carry their length in the type but are not currently wrapped
 - `raw { ... }` blocks (Prism transformations are fully suppressed)

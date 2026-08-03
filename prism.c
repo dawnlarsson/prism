@@ -1021,8 +1021,13 @@ static PRISM_HOT void emit_tok(PParseToken *tok) {
 		line_no = tok->line_no;
 		tok_fname = f->name;
 		need_line = (_ps->last_filename != tok_fname) |
-			    (f->is_system != _ps->last_system_header) |
-			    ((line_no != _ps->last_line_no) & (line_no != _ps->last_line_no + 1));
+		    (f->is_system != _ps->last_system_header) |
+		    /* Ordinarily a source line increment is represented by the newline
+		     * copied before an at-BOL token.  Phase 2 may remove that physical
+		     * newline, however: the next token then has the next physical line
+		     * number without AT_BOL, so it needs an explicit marker. */
+		    ((line_no != _ps->last_line_no) &
+		     ((line_no != _ps->last_line_no + 1) || !pparse_at_bol(tok)));
 	}
 
 	if (pparse_at_bol(tok) || need_line || emit_newline_before_decl_after_stmt_boundary(last_emitted, tok))

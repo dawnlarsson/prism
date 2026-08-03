@@ -201,6 +201,9 @@ static const char PPARSE_ERR_BOUNDS_PTR_ARITH_DEREF[] =
 static const char PPARSE_ERR_BOUNDS_PTR_ARITH_SUB[] =
     "-fbounds-check: pointer-arithmetic subscript with tracked array base "
     "cannot be verified (rewrite as array[index])";
+static const char PPARSE_ERR_BOUNDS_CONDITIONAL_BASE[] =
+    "-fbounds-check: conditional subscript base derived from tracked array "
+    "cannot be verified (rewrite as array[index])";
 static const char PPARSE_ERR_ORELSE_EXPECT_EXPR[] =
     "expected expression before 'orelse'";
 static const char PPARSE_ERR_ORELSE_EXPECT_STMT[] =
@@ -528,6 +531,12 @@ typedef struct {
 	bool at_bol;
 	bool has_space;
 	int line_no;
+	/* Phase 2 removes backslash-newline pairs before tokenization.  Keep the
+	 * compacted offsets so token locations still refer to physical source
+	 * lines for diagnostics and #line emission. */
+	const uint32_t *splice_offsets;
+	uint32_t splice_count;
+	uint32_t splice_next;
 } PParseTokState;
 
 typedef struct {
@@ -1311,6 +1320,12 @@ static inline __attribute__((always_inline)) PParseToken *
 pparse_new_token(PParseTokenKind kind, char *start, char *end, PParseTokState *ts) {
 	PPARSE_CTX();
 	PParseFile *cf = _pc->current_file;
+	uint32_t start_idx = (uint32_t)(start - _pc->token_source);
+	while (ts->splice_next < ts->splice_count &&
+	       ts->splice_offsets[ts->splice_next] <= start_idx) {
+		ts->line_no++;
+		ts->splice_next++;
+	}
 	if (__builtin_expect(pparse_token_count >= pparse_token_cap, 0))
 		pparse_token_pool_ensure((size_t)pparse_token_count + 1);
 	uint32_t token_idx = pparse_token_count++;
@@ -1323,7 +1338,7 @@ pparse_new_token(PParseTokenKind kind, char *start, char *end, PParseTokState *t
 				      (ts->has_space ? PPARSE_TF_HAS_SPACE : 0) |
 				      (cf->skip_emit ? PPARSE_TF_SYS_SKIP : 0),
 			     .ch0 = (uint8_t)*start};
-	tok->match_idx = (uint32_t)(start - _pc->token_source);
+	tok->match_idx = start_idx;
 	{
 		long long ln = (long long)ts->line_no + cf->line_delta;
 		int clamped = ln > 0x1FFFF ? 0x1FFFF : (ln < -0x20000 ? -0x20000 : (int)ln);
@@ -1867,12 +1882,96 @@ static const uint8_t pparse_char_class[256] = {
 	0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,  /* 0xF0 */
 };
 
+/* C translation phase 1 converts every trigraph before phase 2 recognizes
+ * backslash-newline pairs.  A zero return means `c` is not a trigraph tail. */
+static char pparse_trigraph_char(char c) {
+	switch (c) {
+	case '=': return '#';
+	case '/': return '\\';
+	case '\'': return '^';
+	case '(': return '[';
+	case ')': return ']';
+	case '!': return '|';
+	case '<': return '{';
+	case '>': return '}';
+	case '-': return '~';
+	default: return 0;
+	}
+}
+
+/* Apply C translation phases 1 and 2, including inside comments, literals,
+ * directives, and identifiers.  The offset table lets pparse_new_token keep
+ * reporting physical source lines after compacting the input in place. */
+static uint32_t *pparse_splice_logical_lines(char *contents, size_t *contents_len,
+					      uint32_t *splice_count) {
+	char *end = contents + *contents_len;
+	char *read = contents;
+	uint32_t count = 0;
+	bool has_trigraph = false;
+	while (read < end) {
+		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' ?
+				   pparse_trigraph_char(read[2]) : 0;
+		if (tri == '\\' && read + 3 < end && read[3] == '\n') {
+			count++;
+			read += 4;
+		} else if (tri == '\\' && read + 4 < end && read[3] == '\r' && read[4] == '\n') {
+			count++;
+			read += 5;
+		} else if (tri) {
+			has_trigraph = true;
+			read += 3;
+		} else if (read[0] == '\\' && read + 1 < end && read[1] == '\n') {
+			count++;
+			read += 2;
+		} else if (read[0] == '\\' && read + 2 < end && read[1] == '\r' && read[2] == '\n') {
+			count++;
+			read += 3;
+		} else
+			read++;
+	}
+	*splice_count = count;
+	if (!count && !has_trigraph) return NULL;
+
+	PPARSE_CTX();
+	uint32_t *offsets = count ?
+		pparse_arena_alloc(&_pc->main_arena, (size_t)count * sizeof(*offsets)) : NULL;
+	char *write = contents;
+	read = contents;
+	uint32_t i = 0;
+	while (read < end) {
+		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' ?
+				   pparse_trigraph_char(read[2]) : 0;
+		if (tri == '\\' && read + 3 < end && read[3] == '\n') {
+			offsets[i++] = (uint32_t)(write - contents);
+			read += 4;
+		} else if (tri == '\\' && read + 4 < end && read[3] == '\r' && read[4] == '\n') {
+			offsets[i++] = (uint32_t)(write - contents);
+			read += 5;
+		} else if (tri) {
+			*write++ = tri;
+			read += 3;
+		} else if (read[0] == '\\' && read + 1 < end && read[1] == '\n') {
+			offsets[i++] = (uint32_t)(write - contents);
+			read += 2;
+		} else if (read[0] == '\\' && read + 2 < end && read[1] == '\r' && read[2] == '\n') {
+			offsets[i++] = (uint32_t)(write - contents);
+			read += 3;
+		} else
+			*write++ = *read++;
+	}
+	*write = '\0';
+	*contents_len = (size_t)(write - contents);
+	return offsets;
+}
+
 static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t contents_len) {
 	PPARSE_CTX();
 	_pc->current_file = file;
-	_pc->token_source = contents;
 	if (contents_len > UINT32_MAX)
 		pparse_error_at(contents, "source file exceeds 4 GiB; cannot record token locations");
+	uint32_t splice_count = 0;
+	uint32_t *splice_offsets = pparse_splice_logical_lines(contents, &contents_len, &splice_count);
+	_pc->token_source = contents;
 	char *p = contents;
 	/* Skip leading UTF-8 BOM (EF BB BF). UTF-16 BOMs are rejected earlier. */
 	if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
@@ -1880,7 +1979,11 @@ static PParseToken *pparse_tokenize(PParseFile *file, char *contents, size_t con
 	pparse_token_pool_ensure(pparse_token_count + contents_len / 2 + 4096);
 	uint32_t first_idx = pparse_token_count;
 	uint32_t tag_summary = 0;
-	PParseTokState ts = {true, false, 1};
+	PParseTokState ts = {.at_bol = true,
+				     .has_space = false,
+				     .line_no = 1,
+				     .splice_offsets = splice_offsets,
+				     .splice_count = splice_count};
 	unsigned kw_shadow_mask = 0;
 	bool in_system_include = false;
 	int delimiter_cap = 64, delimiter_n = 0, builtin_n = 0, builtin_cap = 0;
@@ -4358,7 +4461,34 @@ static bool pparse_bounds_group_is_cast(PParseToken *open) {
 	PPARSE_CTX();
 	PParseToken *fi = open ? pparse_next(_pc, open) : NULL;
 	return fi && (pparse_is_type_keyword(fi) ||
-		      (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)));
+		      (fi->tag & (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF)) ||
+		      pparse_is_known_typedef(fi));
+}
+
+/* The recovery path scans a parenthesized base for a tracked array. That is
+ * sound for redundant parentheses and casts, but not for a conditional: both
+ * arrays decay to pointers in `(pick ? a : b)[i]`, so the first branch's
+ * bound cannot safely guard the other. Only a conditional in the outer base
+ * (or redundant wrappers around it) matters; an unrelated nested subscript
+ * or member expression is not itself a conditional base. */
+static bool pparse_bounds_recovered_base_has_conditional(PParseToken *last) {
+	PPARSE_CTX();
+	while (last && pparse_match_ch(last, ')')) {
+		PParseToken *open = pparse_pair_known(last);
+		PParseToken *first = open ? pparse_next(_pc, open) : NULL;
+		if (!first || first == last) return false;
+		if (pparse_match_ch(first, '(') && (first->flags & PPARSE_TF_OPEN) &&
+		    pparse_next(_pc, pparse_pair_known(first)) == last) {
+			last = pparse_pair_known(first);
+			continue;
+		}
+		PPARSE_FOR_RANGE(t, first, last) {
+			if (pparse_match_ch(t, '?')) return true;
+			PPARSE_SKIP_GROUP_ON_CLOSE(t)
+		}
+		return false;
+	}
+	return false;
 }
 
 static bool pparse_bounds_span_has_array_arithmetic(PParseToken *lhs, PParseToken *scan_end) {
@@ -4774,6 +4904,8 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
 			PParseToken *hit = pparse_bounds_find_tracked_array(pparse_next(_pc, op), probe);
 			if (hit && pparse_bounds_is_tracked_array(hit)) {
+				if (pparse_bounds_recovered_base_has_conditional(probe))
+					PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_CONDITIONAL_BASE);
 				name_tok = hit;
 				break;
 			}
@@ -6272,8 +6404,15 @@ static bool pparse_is_const_literal_initializer(PParseToken *eq) {
 			}
 			return false;
 		}
+		/* `true` / `false` are ordinary identifiers in C99/C11.  The CLI
+		 * preprocessor has already expanded <stdbool.h> macros to numeric
+		 * literals, but library callers may legitimately bind either spelling
+		 * as a local or parameter.  Accepting them by text here would turn a
+		 * runtime initializer into an invalid static initializer.  C23 bare
+		 * bool keywords are a safe false negative until the input dialect is
+		 * represented in PrismFeatures. */
 		if (t->kind == PPARSE_TK_IDENT &&
-		    (prev_was_dot || pparse_is_known_enum_const(t) || pparse_equal(t, "true") || pparse_equal(t, "false"))) {
+		    (prev_was_dot || pparse_is_known_enum_const(t))) {
 			prev_was_dot = false;
 			continue;
 		}
@@ -9255,6 +9394,20 @@ static void defer_body_populate_captures(
 			continue;
 		}
 		if ((t->kind == PPARSE_TK_IDENT || t->kind == PPARSE_TK_KEYWORD) && !(prev && (prev->tag & PPARSE_TT_MEMBER))) {
+			/* This capture pass runs while Phase 1D is still discovering the
+			 * declaration that contains the defer, so a real `orelse` operator
+			 * has not necessarily received P1_IS_ORELSE_KW yet.  Treating its
+			 * spelling as a captured identifier poisons defer_name_set and later
+			 * rejects an unrelated `int orelse` in the enclosing scope.  Use the
+			 * same positional classifier as Phase 1D instead of relying on the
+			 * later annotation.  `raw` is likewise a declaration prefix here,
+			 * not a captured identifier; preserve ordinary functions/variables
+			 * named raw by requiring an actual raw declaration/block context. */
+			PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, t));
+			if ((pparse_is_orelse_kw_shadow(t) && orelse_kw_at(t, prev)) ||
+			    ((t->flags & PPARSE_TF_RAW) && !pparse_is_known_typedef(t) &&
+			     (pparse_is_raw_declaration_context(t, after) || pparse_match_ch(after, '{'))))
+				continue;
 			char *name = pparse_loc(_pc, t);
 			int nlen = t->len;
 			void *val = pparse_hashmap_get(&local_decls, name, nlen);

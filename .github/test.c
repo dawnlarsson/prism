@@ -198,7 +198,7 @@ enum {
 	O_TRAP = 1u << 19,
 	O_REFERENCE_RUN = 1u << 20,
 	O_ALLOC_FAIL = 1u << 21,
-	/* A generated 2^5 power set.  Unlike the broad trichotomy grammar
+	/* A generated 2^7 power set.  Unlike the broad trichotomy grammar
 	 * product, every cell here has a concrete parse, emission, fixed-point,
 	 * and (where a host compiler is available) execution contract for the
 	 * five user-facing transformations. */
@@ -2308,9 +2308,15 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 		if (ok)
 			ok = terms_present(x.output, "static \nconst int __prism_matrix_static",
 					   (bits & FB_AS) != 0);
+		if (ok) {
+			int has_auto_unreachable = strstr(x.output, "__builtin_unreachable") != NULL ||
+						   strstr(x.output, "__assume(0)") != NULL;
+			ok = has_auto_unreachable == ((bits & FB_AUR) != 0);
+		}
+		if (ok) ok = terms_present(x.output, "#line", (bits & FB_LINE) != 0);
 		/* Every configuration must also reparse its generated C with every
 		 * transformation disabled.  The feature-specific runtime products
-		 * cover execution; keeping this 32-cell parser product in-process
+		 * cover execution; keeping this 512-cell parser product in-process
 		 * makes it cheap enough to run on every edit. */
 		if (ok) {
 			PrismFeatures fp = f;
@@ -2406,6 +2412,10 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 
 static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 	const char *filter = getenv("PRISM_RECIPE_FILTER");
+	/* Optional focused-shard selector.  Unlike PRISM_RECIPE_FILTER this matches
+	 * an axis value tag, so a large product can be bisected without changing
+	 * generator code or weakening its unfiltered gate. */
+	const char *axis_filter = getenv("PRISM_AXIS_FILTER");
 	for (size_t ri = 0; ri < count; ri++) {
 		const Recipe *r = &recipes[ri];
 		if (filter && *filter && !strstr(r->id, filter)) continue;
@@ -2451,11 +2461,17 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 		int done = 0;
 		while (!done) {
 			const AxisValue *sel[4] = {0};
-			for (size_t i = 0; i < dims; i++) sel[i] = &r->axes[i]->values[idx[i]];
-			long before = st->failed, skipped_before = st->skipped;
-			st->cells++;
-			run_source_cell(r, sel, st->cells, st);
-			if (st->failed == before && st->skipped == skipped_before) st->passed++;
+			bool selected = !axis_filter || !*axis_filter;
+			for (size_t i = 0; i < dims; i++) {
+				sel[i] = &r->axes[i]->values[idx[i]];
+				if (axis_filter && *axis_filter && strstr(sel[i]->tag, axis_filter)) selected = true;
+			}
+			if (selected) {
+				long before = st->failed, skipped_before = st->skipped;
+				st->cells++;
+				run_source_cell(r, sel, st->cells, st);
+				if (st->failed == before && st->skipped == skipped_before) st->passed++;
+			}
 			if (!dims) break;
 			for (size_t i = dims; i-- > 0;) {
 				if (++idx[i] < sizes[i]) break;
@@ -2607,12 +2623,13 @@ static const AxisValue feature_values[] = {
 static const Axis ax_features = {"features", feature_values, N(feature_values)};
 
 /* The ordinary feature axis deliberately focuses on useful public profiles.
- * This one is different: it enumerates the complete 2^5 state space for the
- * five language transformations.  Its source remains ISO-C when `defer` or
- * `orelse` are disabled, and opts into those constructs only in cells where
- * the corresponding transformation is enabled.  That lets every state have
- * a strict success/emission/fixed-point oracle—and, on POSIX, a runtime
- * oracle—rather than accepting an expected syntax error as coverage. */
+ * This family is different: it enumerates every 2^7 state of the five
+ * language transformations plus line directives and auto-unreachable. Each
+ * configuration is replayed in four statement/control layouts. Its source
+ * remains ISO-C when `defer` or `orelse` are disabled, so every one of the
+ * resulting 512 cells has a strict success/emission/fixed-point oracle—and,
+ * on POSIX, a runtime oracle—rather than counting an expected syntax error
+ * as coverage. */
 #define FM_DEFER_0 ""
 #define FM_DEFER_1 "defer __prism_matrix_mark();"
 #define FM_ORELSE_0 "int __prism_matrix_value=9;"
@@ -2621,53 +2638,86 @@ static const Axis ax_features = {"features", feature_values, N(feature_values)};
 #define FM_LOG_1 "1"
 #define FM_HEAD \
 	"static int __prism_matrix_log;" \
+	"void abort(void);" \
+	"static int __prism_matrix_dead(void){abort();return 0;}" \
 	"static int __prism_matrix_source(void){return 0;}" \
 	"static void __prism_matrix_mark(void){__prism_matrix_log++;}" \
-	"static int __prism_matrix_worker(void){" \
+	"static int __prism_matrix_worker(void){"
+#define FM_BODY(d, o) \
 	"int __prism_matrix_zero;" \
 	"int __prism_matrix_bounds[2]={4,5};" \
 	"const int __prism_matrix_static[2]={7,8};" \
-	"volatile int __prism_matrix_index=1;"
-#define FM_TAIL \
+	"volatile int __prism_matrix_index=1;" \
+	FM_DEFER_ ## d FM_ORELSE_ ## o \
 	"return __prism_matrix_bounds[__prism_matrix_index]+" \
-	"__prism_matrix_static[0]+__prism_matrix_value;}" \
-	"int main(void){return __prism_matrix_worker()==21&&__prism_matrix_log=="
-#define FM_SOURCE(d, o) FM_HEAD FM_DEFER_ ## d FM_ORELSE_ ## o FM_TAIL FM_LOG_ ## d "?0:1;}"
+	"__prism_matrix_static[0]+__prism_matrix_value;"
+#define FM_CONTEXT_0(body) body
+#define FM_CONTEXT_1(body) "{" body "}"
+#define FM_CONTEXT_2(body) "if(1){" body "}return 0;"
+#define FM_CONTEXT_3(body) "switch(0){default:{" body "}}return 0;"
+#define FM_CAT_INNER(a, b) a ## b
+#define FM_CAT(a, b) FM_CAT_INNER(a, b)
+#define FM_TAIL(d) \
+	"}" \
+	"int main(void){return __prism_matrix_worker()==21&&__prism_matrix_log==" FM_LOG_ ## d "?0:1;}"
+#define FM_SOURCE(d, o, c) FM_HEAD FM_CAT(FM_CONTEXT_, c)(FM_BODY(d, o)) FM_TAIL(d)
 #define FM_SET(d, o, z, b, s) \
 	((d) ? FB_DEFER : 0) | ((o) ? FB_ORELSE : 0) | ((z) ? FB_ZERO : 0) | \
 	((b) ? FB_BOUNDS : 0) | ((s) ? FB_AS : 0)
 #define FM_CLEAR(d, o, z, b, s) \
 	((d) ? 0 : FB_DEFER) | ((o) ? 0 : FB_ORELSE) | ((z) ? 0 : FB_ZERO) | \
 	((b) ? 0 : FB_BOUNDS) | ((s) ? 0 : FB_AS)
-#define FM_CELL(d, o, z, b, s) \
-	{.tag="d" #d "-o" #o "-z" #z "-b" #b "-s" #s, .text=FM_SOURCE(d, o), \
+#define FM_CELL(c, d, o, z, b, s) \
+	{.tag="ctx" #c "-d" #d "-o" #o "-z" #z "-b" #b "-s" #s, .text=FM_SOURCE(d, o, c), \
 	 .set_features=FM_SET(d, o, z, b, s), .clear_features=FM_CLEAR(d, o, z, b, s)}
-static const AxisValue feature_matrix_values[] = {
-	FM_CELL(0, 0, 0, 0, 0), FM_CELL(0, 0, 0, 0, 1),
-	FM_CELL(0, 0, 0, 1, 0), FM_CELL(0, 0, 0, 1, 1),
-	FM_CELL(0, 0, 1, 0, 0), FM_CELL(0, 0, 1, 0, 1),
-	FM_CELL(0, 0, 1, 1, 0), FM_CELL(0, 0, 1, 1, 1),
-	FM_CELL(0, 1, 0, 0, 0), FM_CELL(0, 1, 0, 0, 1),
-	FM_CELL(0, 1, 0, 1, 0), FM_CELL(0, 1, 0, 1, 1),
-	FM_CELL(0, 1, 1, 0, 0), FM_CELL(0, 1, 1, 0, 1),
-	FM_CELL(0, 1, 1, 1, 0), FM_CELL(0, 1, 1, 1, 1),
-	FM_CELL(1, 0, 0, 0, 0), FM_CELL(1, 0, 0, 0, 1),
-	FM_CELL(1, 0, 0, 1, 0), FM_CELL(1, 0, 0, 1, 1),
-	FM_CELL(1, 0, 1, 0, 0), FM_CELL(1, 0, 1, 0, 1),
-	FM_CELL(1, 0, 1, 1, 0), FM_CELL(1, 0, 1, 1, 1),
-	FM_CELL(1, 1, 0, 0, 0), FM_CELL(1, 1, 0, 0, 1),
-	FM_CELL(1, 1, 0, 1, 0), FM_CELL(1, 1, 0, 1, 1),
-	FM_CELL(1, 1, 1, 0, 0), FM_CELL(1, 1, 1, 0, 1),
-	FM_CELL(1, 1, 1, 1, 0), FM_CELL(1, 1, 1, 1, 1),
+#define FM_ROWS(c) \
+	FM_CELL(c, 0, 0, 0, 0, 0), FM_CELL(c, 0, 0, 0, 0, 1), \
+	FM_CELL(c, 0, 0, 0, 1, 0), FM_CELL(c, 0, 0, 0, 1, 1), \
+	FM_CELL(c, 0, 0, 1, 0, 0), FM_CELL(c, 0, 0, 1, 0, 1), \
+	FM_CELL(c, 0, 0, 1, 1, 0), FM_CELL(c, 0, 0, 1, 1, 1), \
+	FM_CELL(c, 0, 1, 0, 0, 0), FM_CELL(c, 0, 1, 0, 0, 1), \
+	FM_CELL(c, 0, 1, 0, 1, 0), FM_CELL(c, 0, 1, 0, 1, 1), \
+	FM_CELL(c, 0, 1, 1, 0, 0), FM_CELL(c, 0, 1, 1, 0, 1), \
+	FM_CELL(c, 0, 1, 1, 1, 0), FM_CELL(c, 0, 1, 1, 1, 1), \
+	FM_CELL(c, 1, 0, 0, 0, 0), FM_CELL(c, 1, 0, 0, 0, 1), \
+	FM_CELL(c, 1, 0, 0, 1, 0), FM_CELL(c, 1, 0, 0, 1, 1), \
+	FM_CELL(c, 1, 0, 1, 0, 0), FM_CELL(c, 1, 0, 1, 0, 1), \
+	FM_CELL(c, 1, 0, 1, 1, 0), FM_CELL(c, 1, 0, 1, 1, 1), \
+	FM_CELL(c, 1, 1, 0, 0, 0), FM_CELL(c, 1, 1, 0, 0, 1), \
+	FM_CELL(c, 1, 1, 0, 1, 0), FM_CELL(c, 1, 1, 0, 1, 1), \
+	FM_CELL(c, 1, 1, 1, 0, 0), FM_CELL(c, 1, 1, 1, 0, 1), \
+	FM_CELL(c, 1, 1, 1, 1, 0), FM_CELL(c, 1, 1, 1, 1, 1)
+static const AxisValue feature_matrix_top_values[] = {FM_ROWS(0)};
+static const AxisValue feature_matrix_block_values[] = {FM_ROWS(1)};
+static const AxisValue feature_matrix_if_values[] = {FM_ROWS(2)};
+static const AxisValue feature_matrix_switch_values[] = {FM_ROWS(3)};
+static const Axis ax_feature_matrix_top = {"configuration", feature_matrix_top_values, N(feature_matrix_top_values)};
+static const Axis ax_feature_matrix_block = {"configuration", feature_matrix_block_values, N(feature_matrix_block_values)};
+static const Axis ax_feature_matrix_if = {"configuration", feature_matrix_if_values, N(feature_matrix_if_values)};
+static const Axis ax_feature_matrix_switch = {"configuration", feature_matrix_switch_values, N(feature_matrix_switch_values)};
+
+static const AxisValue feature_matrix_emission_values[] = {
+	{"auto-unreachable-off/line-off", "", 0, FB_AUR | FB_LINE},
+	{"auto-unreachable-off/line-on", "", FB_LINE, FB_AUR},
+	{"auto-unreachable-on/line-off", "", FB_AUR, FB_LINE},
+	{"auto-unreachable-on/line-on", "", FB_AUR | FB_LINE, 0},
 };
-static const Axis ax_feature_matrix = {
-	"configuration", feature_matrix_values, N(feature_matrix_values)
+static const Axis ax_feature_matrix_emission = {
+	"emission", feature_matrix_emission_values, N(feature_matrix_emission_values)
 };
+#undef FM_ROWS
 #undef FM_CELL
 #undef FM_CLEAR
 #undef FM_SET
 #undef FM_SOURCE
 #undef FM_TAIL
+#undef FM_CAT
+#undef FM_CAT_INNER
+#undef FM_CONTEXT_3
+#undef FM_CONTEXT_2
+#undef FM_CONTEXT_1
+#undef FM_CONTEXT_0
+#undef FM_BODY
 #undef FM_HEAD
 #undef FM_LOG_1
 #undef FM_LOG_0
@@ -2675,6 +2725,21 @@ static const Axis ax_feature_matrix = {
 #undef FM_ORELSE_0
 #undef FM_DEFER_1
 #undef FM_DEFER_0
+
+/* Every unsupported array-address form has two public contracts: strict
+ * safety mode must stop before producing C, while -fno-safety must preserve
+ * valid host C and leave the unverifiable access uninstrumented. Keep both
+ * outcomes generated from the same hazard alphabet. */
+static const AxisValue safety_bounds_hazard_values[] = {
+	{"deref-add", "int f(int i){int a[4]={0};return *(a+i);}", 0, 0},
+	{"subscript-add", "int f(int i){int a[4]={0};return (a+i)[0];}", 0, 0},
+	{"reverse-subscript", "int f(int i){int a[4]={0};return i[a];}", 0, 0},
+	{"conditional-base",
+	 "int f(int choose,int i){int a[4]={0},b[2]={0};return (choose?a:b)[i];}", 0, 0},
+};
+static const Axis ax_safety_bounds_hazard = {
+	"hazard", safety_bounds_hazard_values, N(safety_bounds_hazard_values)
+};
 
 /* Library-facing count/pointer states and preprocessor argv shapes.  The
  * generic feature patcher above applies these directly to PrismFeatures. */
@@ -2872,6 +2937,55 @@ static const AxisValue runtime_truth_values[] = {
 };
 static const Axis ax_runtime_truth = {"truth", runtime_truth_values, N(runtime_truth_values)};
 
+/* C translation phase 2 joins a backslash-newline before Prism recognizes
+ * soft keywords. Cross every extension spelling with LF/CRLF and the two
+ * possible phase-2 backslash origins (literal and trigraph): a lexer that
+ * sees physical fragments instead of the joined token misses the rewrite. */
+static const AxisValue runtime_spliced_keyword_values[] = {
+	{"defer-lf",
+	 "static int calls;static void mark(void){calls++;}int main(void){de\\\nfer mark();return calls==0?0:1;}",
+	 0, 0},
+	{"defer-crlf",
+	 "static int calls;static void mark(void){calls++;}int main(void){de\\\r\nfer mark();return calls==0?0:1;}",
+	 0, 0},
+	/* Translation phase 1 converts ??/ to backslash before phase 2 removes
+	 * the resulting newline splice.  Split the spelling across C string
+	 * literals so compiling this test source cannot consume the trigraph. */
+	{"defer-trigraph-lf",
+	 "static int calls;static void mark(void){calls++;}int main(void){de?" "?/\nfer mark();return calls==0?0:1;}",
+	 0, 0},
+	{"defer-trigraph-crlf",
+	 "static int calls;static void mark(void){calls++;}int main(void){de?" "?/\r\nfer mark();return calls==0?0:1;}",
+	 0, 0},
+	{"orelse-lf",
+	 "static int src(void){return 0;}int main(void){int x=src() or\\\nelse 7;return x==7?0:1;}",
+	 0, 0},
+	{"orelse-crlf",
+	 "static int src(void){return 0;}int main(void){int x=src() or\\\r\nelse 7;return x==7?0:1;}",
+	 0, 0},
+	{"orelse-trigraph-lf",
+	 "static int src(void){return 0;}int main(void){int x=src() or?" "?/\nelse 7;return x==7?0:1;}",
+	 0, 0},
+	{"orelse-trigraph-crlf",
+	 "static int src(void){return 0;}int main(void){int x=src() or?" "?/\r\nelse 7;return x==7?0:1;}",
+	 0, 0},
+	{"raw-lf", "int main(void){raw\\\n int ignored;return 0;}", 0, 0},
+	{"raw-crlf", "int main(void){raw\\\r\n int ignored;return 0;}", 0, 0},
+	{"raw-trigraph-lf", "int main(void){raw?" "?/\n int ignored;return 0;}", 0, 0},
+	{"raw-trigraph-crlf", "int main(void){raw?" "?/\r\n int ignored;return 0;}", 0, 0},
+	/* Exercise every other phase-1 spelling as parser punctuation, plus the
+	 * trigraph directive introducer.  Each pair is split to keep this host C
+	 * source from translating it before the generated recipe sees it. */
+	{"trigraph-punctuation",
+	 "?" "?=define TRI 7\nint main(void)" "?" "?<int a" "?" "?(2" "?" "?)="
+	 "?" "?<1,2" "?" "?>;return(a" "?" "?(0" "?" "?)" "?" "?'a" "?" "?(1"
+	 "?" "?))==3&&" "?" "?-0==-1&&(0" "?" "?!1)&&TRI==7?0:1;" "?" "?>",
+	 0, 0},
+};
+static const Axis ax_runtime_spliced_keyword = {
+	"keyword", runtime_spliced_keyword_values, N(runtime_spliced_keyword_values)
+};
+
 static const AxisValue runtime_orelse_fallback_values[] = {
 	{"constant", "11", 0, 0},
 	{"call", "(__need_fb=1,fbc())", 0, 0},
@@ -3052,6 +3166,29 @@ static const Axis ax_runtime_defer_control_body = {
 	"control", runtime_defer_control_body_values, N(runtime_defer_control_body_values)
 };
 
+/* `emit_deferred_range` has its own statement-dispatch path.  Exercise all
+ * three orelse lowerings from inside a braced deferred body, on both truth
+ * paths, and require a fixed point as well as execution. */
+static const AxisValue runtime_deferred_orelse_body_values[] = {
+	{"declaration",
+	 "static int gc,fc;static int src(void){gc++;return @0@;}static int fb(void){fc++;return 9;}"
+	 "static int run(void){int got=0;{defer {int value=src() orelse fb();got=value;}}return got;}"
+	 "int main(void){int got=run();return got==(@0@?@0@:9)&&gc==1&&fc==(@0@?0:1)?0:1;}",
+	 0, 0},
+	{"bare-assignment",
+	 "static int gc,fc;static int src(void){gc++;return @0@;}static int fb(void){fc++;return 9;}"
+	 "static int run(void){int got=0;{defer {got=src() orelse fb();}}return got;}"
+	 "int main(void){int got=run();return got==(@0@?@0@:9)&&gc==1&&fc==(@0@?0:1)?0:1;}",
+	 0, 0},
+	{"bracket-vla",
+	 "static int run(int n){int got=0;{defer {int value[n orelse 3];got=(int)(sizeof(value)/sizeof(value[0]));}}return got;}"
+	 "int main(void){return run(@0@)==(@0@?@0@:3)?0:1;}",
+	 0, 0},
+};
+static const Axis ax_runtime_deferred_orelse_body = {
+	"lowering", runtime_deferred_orelse_body_values, N(runtime_deferred_orelse_body_values)
+};
+
 static const AxisValue runtime_zero_values[] = {
 	{"scalar", "int main(void){dirty();int v;return nz(&v,sizeof v);}", 0, 0},
 	{"pointer", "int main(void){dirty();char *v;return nz(&v,sizeof v);}", 0, 0},
@@ -3140,6 +3277,27 @@ static const Axis ax_runtime_zero_scope = {
 	"scope", runtime_zero_scope_values, N(runtime_zero_scope_values)
 };
 
+/* Declarations in a control initializer have no preceding statement where a
+ * delayed memset could be inserted.  Cross scalar and array declarators here
+ * so the recipe must choose initializer lowering, including typedef and
+ * parenthesized-array classification. */
+static const AxisValue runtime_zero_control_init_values[] = {
+	{"scalar",
+	 "int main(void){int pass=0;for(int v;pass++==0;){if(v)return 1;}return 0;}", 0, 0},
+	{"array",
+	 "int main(void){int pass=0;for(int v[3];pass++==0;){for(int i=0;i<3;i++)if(v[i])return 1;}return 0;}",
+	 0, 0},
+	{"parenthesized-array",
+	 "int main(void){int pass=0;for(int (v)[3];pass++==0;){for(int i=0;i<3;i++)if(v[i])return 1;}return 0;}",
+	 0, 0},
+	{"typedef-array",
+	 "typedef int Row[3];int main(void){int pass=0;for(Row v;pass++==0;){for(int i=0;i<3;i++)if(v[i])return 1;}return 0;}",
+	 0, 0},
+};
+static const Axis ax_runtime_zero_control_init = {
+	"declarator", runtime_zero_control_init_values, N(runtime_zero_control_init_values)
+};
+
 static const AxisValue defer_ident_next_op_values[] = {
 	{"lt", "<", 0, 0}, {"gt", ">", 0, 0}, {"mod", "%", 0, 0},
 	{"xor", "^", 0, 0}, {"or", "|", 0, 0}, {"div", "/", 0, 0},
@@ -3205,6 +3363,8 @@ static const AxisValue runtime_bounds_oob_values[] = {
 	{"write", "a[i]=1;return 0;", 0, 0},
 	{"reverse", "return i[a];", 0, 0, O_REJECT | O_DIAG},
 	{"paren", "return (a)[i];", 0, 0},
+	{"redundant-paren", "return ((a))[i];", 0, 0},
+	{"cast", "return (((int *)a))[i];", 0, 0},
 	{"cancel-address", "return *&a[i];", 0, 0},
 	{"cancel-address-paren", "return *(&a[i]);", 0, 0},
 	{"row", "return m[i][0];", 0, 0},
@@ -3285,6 +3445,17 @@ static const AxisValue runtime_bounds_matrix_access_values[] = {
 };
 static const Axis ax_runtime_bounds_matrix_access = {
 	"access", runtime_bounds_matrix_access_values, N(runtime_bounds_matrix_access_values)
+};
+
+/* Type-derived arrays take a different declaration/binding path from an
+ * ordinary or typedef-spelled array.  Keep both VLA ranks live: zero-init
+ * must choose memset while bounds emits the matching dynamic sizeof ratio. */
+static const AxisValue runtime_bounds_typeof_vla_values[] = {
+	{"outer", "return a[i][0];", 0, 0},
+	{"inner", "return a[0][i];", 0, 0},
+};
+static const Axis ax_runtime_bounds_typeof_vla = {
+	"rank", runtime_bounds_typeof_vla_values, N(runtime_bounds_typeof_vla_values)
 };
 
 static const AxisValue runtime_autostatic_values[] = {
@@ -3497,8 +3668,14 @@ static const Recipe recipes[] = {
 	{"declarations/product", "@1@", NULL, {&ax_decl, &ax_decl_ctx, &ax_features}, O_OK | O_FIXED, 0, FB_LINE, 0},
 	{"features/product", "int g(void);void c(void);int f(int i){int a[8];const int table[2]={1,2};defer c();int x=g() orelse 2;raw int y;return a[i]+table[0]+x+y;}",
 	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0},
-	{"features/power-set", "@0@", NULL, {&ax_feature_matrix}, O_FEATURE_MATRIX,
-	 0, FB_LINE | FB_AUR, 0},
+	{"features/power-set/top", "@0@", NULL,
+	 {&ax_feature_matrix_top, &ax_feature_matrix_emission}, O_FEATURE_MATRIX, 0, 0, 0},
+	{"features/power-set/block", "@0@", NULL,
+	 {&ax_feature_matrix_block, &ax_feature_matrix_emission}, O_FEATURE_MATRIX, 0, 0, 0},
+	{"features/power-set/if", "@0@", NULL,
+	 {&ax_feature_matrix_if, &ax_feature_matrix_emission}, O_FEATURE_MATRIX, 0, 0, 0},
+	{"features/power-set/switch", "@0@", NULL,
+	 {&ax_feature_matrix_switch, &ax_feature_matrix_emission}, O_FEATURE_MATRIX, 0, 0, 0},
 	{"api/feature-struct", "#ifdef RECIPE_DEF\nint v=RECIPE_DEF;\n#else\nint v;\n#endif\n",
 	 NULL, {&ax_api_features}, O_FILE | O_ANY_STATUS, 0, FB_LINE, CAP_POSIX},
 	{"api/define-last-wins", "@0@int f(void){return RECIPE_ORDER;}", NULL,
@@ -3518,9 +3695,19 @@ static const Recipe recipes[] = {
 	 "return ((2)+(3))", "#ifndef SUM"},
 	{"runtime/passthrough-equivalence", "@0@", NULL, {&ax_passthrough},
 	 O_OK | O_OUTPUT_EQ_OFF | O_REFERENCE_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/spliced-extension-keywords", "@0@", NULL, {&ax_runtime_spliced_keyword},
+	 O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, 0, CAP_POSIX},
+	{"runtime/spliced-line-marker",
+	 "static int calls;static void mark(void){calls++;}int main(void){de\\\nfer mark();return calls==0?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, 0, CAP_POSIX,
+	 "#line 2 \"recipe.c\""},
 	{"corpus/retired-regressions", "@0@", NULL, {&ax_corpus},
 	 O_ANY_STATUS | O_REPLAY, 0, FB_LINE, 0},
 	{"bounds/product", "@1@", NULL, {&ax_bounds, &ax_bounds_ctx}, O_TRICHOTOMY, FB_BOUNDS, FB_LINE, 0},
+	{"safety/bounds-strict", "@0@", NULL, {&ax_safety_bounds_hazard},
+	 O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
+	{"safety/bounds-warning", "@0@", NULL, {&ax_safety_bounds_hazard},
+	 O_OK | O_FIXED | O_COMPILE, FB_BOUNDS | FB_WARN, FB_LINE, CAP_POSIX},
 	{"runtime/orelse-product",
 	 "static int __lhs,__rhs,__value,__need_fb;static int src(void){__lhs++;return @0@;}"
 	 "static int fbc(void){__rhs++;return 11;}static void test(void){@3@}"
@@ -3544,6 +3731,9 @@ static const Recipe recipes[] = {
 	 {&ax_runtime_truth, &ax_runtime_bare_orelse_defer}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
 	{"runtime/defer-control-body-product", "@1@", NULL,
 	 {&ax_runtime_truth, &ax_runtime_defer_control_body}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/deferred-orelse-body-product", "@1@", NULL,
+	 {&ax_runtime_truth, &ax_runtime_deferred_orelse_body}, O_OK | O_RUN | O_FIXED,
+	 0, FB_LINE, CAP_POSIX | CAP_VLA},
 	{"runtime/orelse-chain-matrix", "@0@",
 	 "static int gc,fc;static int g(int v){gc++;return v;}static int fb(int v){fc++;return v;}",
 	 {&ax_runtime_chain}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
@@ -3593,6 +3783,8 @@ static const Recipe recipes[] = {
 	 "for(unsigned long q=0;q<n;q++)if(b[q])k++;return k;}",
 	 {&ax_runtime_zero_vla, &ax_runtime_zero_scope}, O_OK | O_RUN | O_FIXED,
 	 0, FB_LINE, CAP_POSIX | CAP_VLA, "__builtin_memset"},
+	{"runtime/zeroinit-control-init-product", "@0@", NULL,
+	 {&ax_runtime_zero_control_init}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX},
 	{"differential/defer-identifier-next-operator", "int f(int defer){return defer @0@ 1;}", NULL,
 	 {&ax_defer_ident_next_op}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"differential/defer-identifier-prev-operator", "int f(int defer){return 1 @0@ defer;}", NULL,
@@ -3623,6 +3815,10 @@ static const Recipe recipes[] = {
 	 "volatile unsigned long idx=4;@1@}",
 	 NULL, {&ax_runtime_bounds_matrix_base, &ax_runtime_bounds_matrix_access},
 	 O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"runtime/bounds-typeof-vla-rank-traps",
+	 "int main(void){int n=2;typeof(int[n][n]) a;volatile int i=n;@0@}", NULL,
+	 {&ax_runtime_bounds_typeof_vla}, O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE,
+	 CAP_POSIX | CAP_VLA, "__builtin_memset|__prism_bchk"},
 	{"runtime/auto-static-product", "@0@", NULL, {&ax_runtime_autostatic}, O_OK | O_RUN,
 	 FB_AS, FB_LINE, CAP_POSIX},
 
@@ -3688,9 +3884,46 @@ static const Recipe recipes[] = {
 	 "void f(void){typeof(int[2]) values={1,2};(void)values;}", NULL, {0},
 	 O_OK | O_FIXED | O_COMPILE, FB_AS, FB_LINE, CAP_POSIX,
 	 NULL, "static typeof(int[2]) values"},
+	/* In C99/C11 `true` and `false` are ordinary identifiers.  They may be
+	 * parameters or locals, so lexical spelling alone must never certify a
+	 * static initializer.  Registered enum constants with the same spellings
+	 * remain integer constant expressions and must still be promoted. */
+	{"runtime/auto-static-skip-shadowed-bool-identifiers",
+	 "static int f(int true,int false){const int values[2]={true,false};return values[0]*10+values[1];}"
+	 "int main(void){return f(4,7)==47?0:1;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE | O_RUN, FB_AS, FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
+	{"runtime/auto-static-enum-bool-identifiers",
+	 "enum{true=4,false=7};int main(void){const int values[2]={true,false};"
+	 "return values[0]*10+values[1]==47?0:1;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE | O_RUN, FB_AS, FB_LINE, CAP_POSIX,
+	 "static const int values[2]", NULL},
+	{"runtime/auto-static-enum-bool-identifiers-disabled",
+	 "enum{true=4,false=7};int main(void){const int values[2]={true,false};"
+	 "return values[0]*10+values[1]==47?0:1;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE | O_RUN, 0, FB_AS | FB_LINE, CAP_POSIX,
+	 NULL, "static const int values[2]"},
 
 	{"exact/defer-lifo", "void p(char);int main(void){defer p('A');{defer p('B');p('x');}return 0;}", NULL,
 	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0, "p('A')|p('B')", NULL},
+	/* Capture discovery precedes normal orelse/raw annotation.  The extension
+	 * spellings inside a deferred declaration must not enter defer_name_set;
+	 * otherwise the unrelated locals below are rejected as false shadows. */
+	{"runtime/defer-capture-ignores-orelse-operator",
+	 "static int result;static int g(void){return 0;}static void use(int x){result=x;}"
+	 "static void f(void){defer {int y=g() orelse 7;use(y);}int orelse=5;use(orelse);}"
+	 "int main(void){f();return result==7?0:1;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE | O_RUN, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-capture-ignores-raw-prefix",
+	 "static int result;static void f(void){defer {raw int y=3;result=y;}int raw=5;result=raw;}"
+	 "int main(void){f();return result==3?0:1;}", NULL, {0},
+	 O_OK | O_FIXED | O_COMPILE | O_RUN, 0, FB_LINE, CAP_POSIX},
+	/* The positional exclusion must not discard an ordinary parameter named
+	 * orelse: it is genuinely captured, so a nested shadow on return remains
+	 * unsafe and must be diagnosed. */
+	{"reject/defer-capture-soft-orelse-identifier",
+	 "void use(int);void f(int orelse){defer {use(orelse);}{int orelse=1;return;}}", NULL, {0},
+	 O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "shadows"},
 	{"reject/orelse-in-braceless-defer", "void cleanv(int);int g(void);void f(void){defer cleanv(g() orelse 1);}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0},
 	{"reject/declaration-in-braceless-defer", "void f(void){defer int x=1;}", NULL,
@@ -3877,6 +4110,9 @@ static const Recipe recipes[] = {
 	{"exact/generic-decl-cast-wrapped",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:(const char *)(memchr)(const void*,int,Z),default:(const char *)(memchr)(const void*,int,Z));", NULL,
 	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
+	{"reject/zeroinit-vla-for-init", "void f(int n){for(int v[n];0;)(void)v;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, CAP_VLA, NULL, NULL,
+	 "VLA in for/if/switch init-statement"},
 	{"exact/generic-decl-distinct-targets",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr,default:other)(const void*,int,Z);", NULL,
 	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "_Generic", NULL},
@@ -3940,6 +4176,17 @@ static const Recipe recipes[] = {
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
 	{"exact/bounds-parenthesized-reverse-address", "int*f(int i){int a[4]={0};return &(i[a]);}", NULL,
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
+	/* Keep the self-hosting lookup shape covered: recovering a tracked outer
+	 * array through a parenthesized member array is valid and must not be
+	 * rejected as a non-identifier base. */
+	{"runtime/bounds-parenthesized-member-array-base",
+	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
+	 "return (entries[1].name)[0]=='b'?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"reject/bounds-conditional-array-base",
+	 "int f(int choose,int i){int a[4]={0},b[2]={0};return (choose?a:b)[i];}", NULL,
+	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL,
+	 "conditional subscript base derived from tracked array"},
 	{"exact/special-wrapper-transitive",
 	 "#include <setjmp.h>\nstatic void inner(jmp_buf p){setjmp(p);}"
 	 "static void outer(jmp_buf p){int touched=1;inner(p);(void)touched;}"
