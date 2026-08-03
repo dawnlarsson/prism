@@ -561,6 +561,11 @@ typedef struct PParseContext {
 	PParseToken *tp_pool;	    // Hot: tag, parse_data, match_idx, len, kind, flags
 	char *token_source; // Shared backing buffer for match_idx source offsets
 	bool lex_only;	    // Tokenize for spellings only: do not require balanced delimiters
+	/* The input already went through translation phases 1-3 (a `.i` file, or
+	 * `cc -E` output). Re-running phase 1 over it would apply trigraph
+	 * translation a second time, changing string and character literals the
+	 * real preprocessor deliberately left alone. */
+	bool input_preprocessed;
 	uint32_t tp_count;  // Next free index. 0 reserved as NULL sentinel.
 	uint32_t tp_cap;
 	uint32_t pparse_token_tag_summary; // OR of PPARSE_TT_* tags in the current token stream
@@ -1908,8 +1913,20 @@ static uint32_t *pparse_splice_logical_lines(char *contents, size_t *contents_le
 	char *read = contents;
 	uint32_t count = 0;
 	bool has_trigraph = false;
+	/* Phase 1 belongs to whoever preprocesses. When `cc -E` already ran, it
+	 * applied the backend's trigraph policy -- off by default for GCC, Clang
+	 * and MSVC, and removed outright in C23 -- so every `??x` still present in
+	 * its output is one the compiler chose to keep. Translating it here turned
+	 * `"what??!"` into `"what|"` for a program the same compiler would have
+	 * left as `??!`. Splices still run: no preprocessor leaves those behind,
+	 * so the pass is a no-op on preprocessed input and stays correct on raw
+	 * source, where Prism is the only front end the text sees. */
+	const bool do_trigraphs = !pparse_ctx->input_preprocessed;
 	while (read < end) {
-		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' ?
+		/* `do_trigraphs` is loop-invariant but tested last: the `??` probe
+		 * almost never succeeds, so the flag is reached about as often as a
+		 * real trigraph and costs nothing per character. */
+		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' && do_trigraphs ?
 				   pparse_trigraph_char(read[2]) : 0;
 		if (tri == '\\' && read + 3 < end && read[3] == '\n') {
 			count++;
@@ -1939,7 +1956,10 @@ static uint32_t *pparse_splice_logical_lines(char *contents, size_t *contents_le
 	read = contents;
 	uint32_t i = 0;
 	while (read < end) {
-		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' ?
+		/* `do_trigraphs` is loop-invariant but tested last: the `??` probe
+		 * almost never succeeds, so the flag is reached about as often as a
+		 * real trigraph and costs nothing per character. */
+		char tri = read + 2 < end && read[0] == '?' && read[1] == '?' && do_trigraphs ?
 				   pparse_trigraph_char(read[2]) : 0;
 		if (tri == '\\' && read + 3 < end && read[3] == '\n') {
 			offsets[i++] = (uint32_t)(write - contents);
@@ -4208,9 +4228,16 @@ static PParseFunctionReturn pparse_function_return(PParseToken *tok) {
 	if (pparse_match_ch(pparse_next(_pc, inner), '(')) {
 		PParseToken *after_params = pparse_skip_balanced_group(pparse_next(_pc, inner));
 		if (after_params && pparse_match_ch(after_params, ')')) {
+			/* Trailing declarator suffixes belong to the returned type: `[N]`
+			 * for a returned array pointer and `(params)` for a returned
+			 * function pointer. The function's own parameter list was already
+			 * consumed as `after_params`, so a `(` here can only be the
+			 * returned function type's parameter list. Dropping it produced
+			 * `int (*)()` instead of `int (*)(int)` in the synthesized
+			 * return-type typedef. `{` is the body and never a suffix. */
 			PParseToken *decl_end = pparse_skip_balanced_group(outer_open);
 			while (decl_end && (decl_end->flags & PPARSE_TF_OPEN) && !pparse_match_ch(decl_end, '{') &&
-			       !pparse_match_ch(decl_end, '(') && !(decl_end->flags & PPARSE_TF_C23_ATTR))
+			       !(decl_end->flags & PPARSE_TF_C23_ATTR))
 				decl_end = pparse_skip_balanced_group(decl_end);
 			result.kind = is_void ? PPARSE_FUNC_RETURN_VOID : PPARSE_FUNC_RETURN_VALUE;
 			if (!is_void) {
@@ -9560,6 +9587,17 @@ p1d_validate_defer(PParseToken *tok, int p1d_cur_func, bool p1d_ctrl_pending, ui
 							  "`defer { ... }`");
 				}
 			}
+			/* A GNU label declaration carries no type tag, so the
+			 * declaration check below never saw it: the body scan ran past
+			 * the statement and emitted an unbalanced extra `}`. It could
+			 * not be valid anyway -- the body is copied to every exit path,
+			 * so the declaration would be duplicated exactly like the labels
+			 * that are already rejected inside braced defer bodies. */
+			if (pparse_is_gnu_label_decl_head(body))
+				pparse_error_tok(body,
+					  "a '__label__' declaration as a braceless defer body is "
+					  "not supported; wrap the defer body in braces: "
+					  "`defer { ... }`");
 			/* Braceless declarations either mis-scan or create a dead object. */
 			if ((body->tag &
 			     (PPARSE_TT_TYPE | PPARSE_TT_QUALIFIER | PPARSE_TT_SUE | PPARSE_TT_TYPEOF | PPARSE_TT_BITINT | PPARSE_TT_STORAGE)) ||
@@ -10462,15 +10500,26 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 					for (PParseToken *inner = pparse_next(_pc, t); inner != m;
 					     inner = pparse_next(_pc, inner)) {
 						if (pparse_match_ch(inner, ',')) p1d_inner_d0_comma = true;
-						if (p1d_try_annotate_init_orelse(inner,
+						int inner_ann = p1d_try_annotate_init_orelse(inner,
 										 prev_inner,
 										 pparse_is_expr_ending,
 										 false,
 										 0,
 										 out_has_orelse,
-										 out_first_orelse) == 1) {
+										 out_first_orelse);
+						if (inner_ann == 1) {
 							prev_inner = inner;
 							continue;
+						}
+						/* These wrap parens are stripped before emission, so an
+						 * empty action hidden inside them reaches Pass 2 as the
+						 * bare `x = a orelse;` form the outer loop already
+						 * rejects, and lowers to `x = x ? x :;`. The wrap's own
+						 * `)` closes the action too. */
+						if (inner_ann == 2) {
+							PParseToken *nx = pparse_next(_pc, inner);
+							if (nx == m || orelse_next_is_empty_action(nx))
+								pparse_error_tok(nx, PPARSE_ERR_ORELSE_EXPECT_STMT);
 						}
 						if (inner->flags & PPARSE_TF_OPEN) {
 							if (has_flow_ext &&
@@ -11683,8 +11732,14 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 					}
 					t = pparse_next(_pc, t);
 				}
-				if (pparse_match_ch(t, ';')) t = pparse_next(_pc, t);
-				ps->p1d_prev = ps->tok;
+				/* A label declaration is a complete statement. Leaving `__label__`
+				 * itself as the previous token made whatever followed look like a
+				 * continuation of an expression, so a `defer` directly after one was
+				 * rejected as expression context even though it is at statement
+				 * position. Hand on the terminating `;` instead. */
+				PParseToken *label_semi = pparse_match_ch(t, ';') ? t : NULL;
+				if (label_semi) t = pparse_next(_pc, t);
+				ps->p1d_prev = label_semi ? label_semi : ps->tok;
 				ps->tok = t;
 				ps->at_stmt_start = true;
 				ps->p1d_ctrl_pending = false;

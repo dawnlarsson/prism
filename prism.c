@@ -97,6 +97,10 @@ typedef struct {
 	char *last_filename;
 	int system_include_count;
 	int raw_block_depth; /* Pass 2: nest depth inside `raw { ... }` suppress blocks */
+	/* Tags emit_tok must stop on to enforce extension elimination: the
+	 * dialect tags whose feature is enabled, folded once per translation
+	 * unit so the hot path is a single masked test. */
+	uint32_t dialect_watch_tags;
 	unsigned long long ret_counter;
 	unsigned *bracket_oe_ids;	   // Pre-assigned temp IDs for bracket orelse hoisting (dynamic)
 	int bracket_oe_count;		   // Count of hoisted bracket orelse temps
@@ -599,6 +603,17 @@ static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
  * out_str fallback is what every build actually used.) */
 #define OUT_LIT(s) out_str_nonempty((s), (int)sizeof(s) - 1)
 
+/* Synthetic output — a spliced `{`, a copied defer body, a generated `;` — does
+ * not pass through emit_tok, so it never gets emit_tok's beginning-of-line
+ * newline. When the previous emitted token closed a surviving preprocessor
+ * directive, appending to that line puts the splice *inside* the directive, and
+ * a conforming preprocessor discards trailing tokens on a directive line: the
+ * statement is silently dropped. Call this before any synthetic splice that can
+ * follow arbitrary source. Costs one predictable branch per exit path. */
+static inline void out_end_directive_line(void) {
+	if (last_emitted && last_emitted->kind == PPARSE_TK_PREP_DIR) out_char('\n');
+}
+
 // Check if the effective compiler is MSVC, falling back to PRISM_DEFAULT_CC
 static inline bool target_is_msvc(void) {
 	return is_msvc_cached;
@@ -1011,6 +1026,34 @@ static PRISM_HOT void emit_tok(PParseToken *tok) {
 	PPARSE_CTX();
 	uint32_t feat = _pc->features;
 	if (__builtin_expect(!(feat & PPARSE_F_FLATTEN) && (tok->flags & PPARSE_TF_SYS_SKIP), 0)) return;
+	/* Extension elimination, enforced rather than assumed. A token Phase 1
+	 * classified as the keyword, whose feature is on and which is not inside a
+	 * `raw { ... }` suppress block, must be consumed by a lowering path.
+	 * Reaching raw emission means some path lost track of it and the backend
+	 * would be handed C containing `defer` or `orelse`. Malformed input that
+	 * stops Prism recognizing the enclosing function made that reachable, and
+	 * the failure was silent.
+	 *
+	 * Three things legitimately emit the spelling and are excluded by
+	 * construction: an identifier shadowing the keyword never gets the
+	 * annotation; `raw { defer f(); }` passes it through by design, which is
+	 * what `raw_block_depth` covers; and with `-fno-orelse` Phase 1 still
+	 * annotates the token because the classification is lexical, so the
+	 * watch mask carries the feature test per keyword rather than shared.
+	 *
+	 * The tag word is already loaded and the branch is never taken in a
+	 * well-formed translation. */
+	if (__builtin_expect((tok->tag & _ps->dialect_watch_tags) != 0, 0) &&
+	    _ps->raw_block_depth == 0) {
+		uint32_t ann = pparse_ann(tok);
+		if (((ann & P1_IS_DEFER_KW) && (tok->tag & PPARSE_TT_DEFER)) ||
+		    ((ann & P1_IS_ORELSE_KW) && (tok->tag & PPARSE_TT_ORELSE)))
+			pparse_error_tok(tok,
+				  "this Prism keyword was not lowered and would reach the C "
+				  "compiler as-is; Prism could not make sense of the statement "
+				  "around it (look just before for a missing ';', an unbalanced "
+				  "brace, or an attribute in a position C does not allow)");
+	}
 	PParseFile *f = _pc->input_files[tok->file_idx];
 	char *loc = pparse_loc(_pc, tok);
 	PParseToken *prev_emitted = last_emitted;
@@ -1127,9 +1170,24 @@ static void emit_prism_oe(unsigned oe) {
 static inline PParseToken *emit_gnu_label_decl(PParseToken *tok) {
 	PPARSE_CTX();
 	if (!emit_at_stmt_start || !pparse_is_gnu_label_decl_head(tok)) return NULL;
+	/* Returning NULL tells the caller "not handled", and the caller then
+	 * emits the same tokens itself. Emitting first and only afterwards
+	 * discovering there is no terminator therefore duplicated everything from
+	 * `__label__` to EOF. Locate the `;` before emitting anything, and stop
+	 * the search at a brace: a label declaration cannot span one, so a later
+	 * `;` is a different statement's. */
+	PParseToken *semi = NULL;
+	PPARSE_FOR_TAIL(t, tok) {
+		if (pparse_match_ch(t, ';')) {
+			semi = t;
+			break;
+		}
+		if (pparse_match_ch(t, '{') || pparse_match_ch(t, '}')) break;
+	}
+	if (!semi) return NULL;
 	PPARSE_FOR_TAIL(t, tok) {
 		emit_tok(t);
-		if (pparse_match_ch(t, ';')) {
+		if (t == semi) {
 			end_statement_after_semicolon();
 			return pparse_next(_pc, t);
 		}
@@ -1215,6 +1273,7 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 		} else {
 			if (scope->defer_start_idx < min_defer_idx) min_defer_idx = scope->defer_start_idx;
 			for (int i = current_defer; i >= scope->defer_start_idx; i--) {
+				out_end_directive_line();
 				out_char(' ');
 				emit_deferred_range(defer_stack[i].stmt, defer_stack[i].end);
 				out_char(';');
@@ -2319,6 +2378,14 @@ static PParseToken *emit_orelse_fallback_value(PParseToken *tok, PParseToken *st
 			continue;
 		}
 		if (pparse_match_ch(tok, ';') || (stop_comma && tok == stop_comma)) break;
+		/* Same shape as the `return` value walk: a `}` here closes the block
+		 * the orelse lives in, so the fallback had no terminating `;`. Every
+		 * brace that can legally appear inside a fallback -- compound literal,
+		 * statement expression, block-form action -- carries TF_OPEN and was
+		 * consumed by walk_balanced above, so this one is always the enclosing
+		 * block's. Walking past it emitted the rest of the translation unit
+		 * inside the fallback's parentheses. */
+		if (pparse_match_ch(tok, '}')) pparse_error_tok(tok, "missing ';' after orelse fallback value");
 		if (is_orelse_keyword(tok)) {
 			*chain_next = pparse_next(_pc, tok);
 			return tok;
@@ -2786,9 +2853,18 @@ static PParseToken *emit_expr_to_semicolon(PParseToken *tok) {
 		if (pparse_match_ch(tok, '{')) {
 			brace_depth++;
 			expr_at_stmt_start = true;
-		} else if (pparse_match_ch(tok, '}'))
+		} else if (pparse_match_ch(tok, '}')) {
+			/* A `}` at depth 0 closes the block the `return` lives in, so the
+			 * value expression had no terminating `;`. Walking past it copied
+			 * the rest of the translation unit into the return temporary's
+			 * initializer and emitted unbalanced C for invalid input. Every
+			 * brace that can legally appear inside a return expression --
+			 * compound literal, statement expression -- is balanced or already
+			 * consumed by walk_balanced, so depth 0 here is always malformed. */
+			if (brace_depth == 0)
+				pparse_error_tok(tok, "missing ';' after return value");
 			brace_depth--;
-		else if (brace_depth == 0 && pparse_match_ch(tok, ';'))
+		} else if (brace_depth == 0 && pparse_match_ch(tok, ';'))
 			break;
 		else if (pparse_match_ch(tok, '?'))
 			ternary_depth++;
@@ -3105,6 +3181,7 @@ static PParseToken *handle_control_exit_defer(PParseToken *tok) {
 	if (tok->tag & PPARSE_TT_RETURN) {
 		if (!has_active_defers()) return NULL;
 		tok = pparse_next(_pc, tok);
+		out_end_directive_line();
 		OUT_LIT(" {");
 		tok = emit_return_body(tok, NULL, true);
 		OUT_LIT(" }");
@@ -3123,6 +3200,7 @@ static PParseToken *handle_control_exit_defer(PParseToken *tok) {
 			need = control_flow_has_defers(is_break);
 		}
 		if (!need) return NULL;
+		out_end_directive_line();
 		OUT_LIT(" {");
 		tok = emit_break_continue_defer(tok, true);
 		OUT_LIT(" }");
@@ -3151,6 +3229,7 @@ static PParseToken *handle_goto_keyword(PParseToken *tok) {
 			if (target_depth < 0) target_depth = 0;
 
 			if (goto_has_defers(target_depth)) {
+				out_end_directive_line();
 				OUT_LIT(" {");
 				emit_goto_defers(target_depth);
 				OUT_LIT(" goto");
@@ -3342,19 +3421,31 @@ static int wait_for_child(pid_t pid) {
 	return -1;
 }
 
+/* posix_spawn fails transiently more often than the obvious EAGAIN: ETXTBSY
+ * under parallel builds, and ENOMEM on macOS whenever the system is briefly
+ * short of memory -- a plain `prism run` on a busy laptop lost five suite cells
+ * that way, because the preprocessor spawn reported "Cannot allocate memory"
+ * and gave up. Only one of the five spawn sites retried anything at all. Retry
+ * the transient set everywhere; a real failure such as ENOENT for a missing
+ * compiler still reports on the first attempt. */
+static int prism_spawn_retry(pid_t *pid, const char *file, const posix_spawn_file_actions_t *fa,
+			     char *const argv[], char *const envp[]) {
+	int err = 0;
+	for (int attempt = 0; attempt < 5; attempt++) {
+		err = posix_spawnp(pid, file, fa, NULL, argv, envp);
+		if ((err != EAGAIN) & (err != ETXTBSY) & (err != ENOMEM)) break;
+		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
+		nanosleep(&nap, NULL);
+	}
+	return err;
+}
+
 static int spawn_command(char **argv, posix_spawn_file_actions_t *actions) {
 	char **env = build_clean_environ();
 	if (!env) return -1;
 
-	/* Transient under parallel builds: retry EAGAIN/ETXTBSY briefly. */
 	pid_t pid;
-	int err = 0;
-	for (int attempt = 0; attempt < 5; attempt++) {
-		err = posix_spawnp(&pid, argv[0], actions, NULL, argv, env);
-		if ((err != EAGAIN) & (err != ETXTBSY)) break;
-		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
-		nanosleep(&nap, NULL);
-	}
+	int err = prism_spawn_retry(&pid, argv[0], actions, argv, env);
 	free(env);
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
@@ -5243,7 +5334,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
 	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 	char **env = build_clean_environ();
-	int err = env ? posix_spawnp(&pid, argv[0], &fa, NULL, argv, env) : ENOMEM;
+	int err = env ? prism_spawn_retry(&pid, argv[0], &fa, argv, env) : ENOMEM;
 	free(env);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pipefd[1]);
@@ -5313,7 +5404,7 @@ cleanup:
 		    &fa2, STDOUT_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 		char **env2 = build_clean_environ();
 		pid_t pid2 = 0;
-		int err2 = env2 ? posix_spawnp(&pid2, argv[0], &fa2, NULL, argv, env2) : ENOMEM;
+		int err2 = env2 ? prism_spawn_retry(&pid2, argv[0], &fa2, argv, env2) : ENOMEM;
 		free(env2);
 		posix_spawn_file_actions_destroy(&fa2);
 		if (err2)
@@ -5467,9 +5558,16 @@ bare_emit_fallback_expr(PParseToken *t, bool comma_term, PParseToken *lhs, PPars
 			continue;
 		}
 		if (t->flags & PPARSE_TF_OPEN) fd++;
-		else if (t->flags & PPARSE_TF_CLOSE)
+		else if (t->flags & PPARSE_TF_CLOSE) {
+			/* A `}` that closes nothing this walk opened is the enclosing
+			 * block's, so the fallback had no terminating `;`. `(` and `[`
+			 * groups already went through walk_balanced, and a compound
+			 * literal's own braces are counted in `fd`. Walking past it
+			 * emitted the rest of the block inside `LHS = ( ... )`. */
+			if (fd == 0 && pparse_match_ch(t, '}'))
+				pparse_error_tok(t, "missing ';' after orelse fallback value");
 			fd--;
-		else if (fd == 0 && bare_is_stmt_end(t, comma_term))
+		} else if (fd == 0 && bare_is_stmt_end(t, comma_term))
 			break;
 		if (restart_on_orelse && fd == 0 && is_orelse_keyword(t)) {
 			OUT_LIT(")) ? (void)0 : ");
@@ -5494,6 +5592,12 @@ static PParseToken *emit_bare_orelse_impl(PParseToken *t, PParseToken *end, bool
 	uint32_t recipe = pparse_ann(orelse_tok);
 	if (!(recipe & P1_OE_BARE_RECIPE)) return NULL;
 	PParseToken *bare_assign_eq = pparse_orelse_payload(orelse_tok);
+	/* Phase 1 records the assignment's `=` alongside the bare-orelse recipe.
+	 * Malformed input can leave the recipe bit set with no payload, and every
+	 * use below walks from it -- `pparse_next(NULL)` dereferenced a null token.
+	 * Refuse the construct instead of emitting from an incomplete recipe. */
+	if (!bare_assign_eq)
+		pparse_error_tok(orelse_tok, "internal: missing bare orelse assignment recipe");
 	PParseToken *last_comma = comma_term ? pparse_bare_orelse_last_comma(bare_assign_eq) : NULL;
 	PParseToken *post_comma_t = last_comma ? pparse_next(_pc, last_comma) : t;
 	PParseToken *bare_lhs_start = post_comma_t;
@@ -5704,6 +5808,8 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 	bool flatten = (feat & PPARSE_F_FLATTEN) != 0;
 	const bool has_orelse = (feat & PPARSE_F_ORELSE) != 0;
 	const bool has_defer = (feat & PPARSE_F_DEFER) != 0;
+	_ps->dialect_watch_tags = (uint32_t)((has_defer ? PPARSE_TT_DEFER : 0) |
+					     (has_orelse ? PPARSE_TT_ORELSE : 0));
 	const bool quiet = (feat & PPARSE_F_QUIET) != 0;
 	const bool auto_unreachable = (feat & PPARSE_F_AUTO_UNREACHABLE) != 0;
 	if (flatten) {
@@ -5974,6 +6080,8 @@ static PParseToken *preprocess_and_tokenize(char *input_file, double *pp_ms, dou
 		return NULL;
 	}
 	double t2 = prism_now_ms();
+	/* `cc -E` (or a `.i` input) already completed translation phases 1-3. */
+	pparse_ctx->input_preprocessed = true;
 	PParseToken *tok = pparse_tokenize_buffer(input_file, pp_buf);
 	double t3 = prism_now_ms();
 	*tok_ms = t3 - t2;
@@ -6059,6 +6167,56 @@ static bool output_path_is_stdout(const char *path) {
 
 static int transpile_to_stdout(char *input_file);
 
+#ifndef _WIN32
+/* mkstemp() creates at 0600 by POSIX, so an emitted file inherited neither the
+ * destination's old mode nor the mode any other tool would have produced. Keep
+ * an existing regular destination's permissions on replacement; otherwise
+ * publish what open(..., 0666) would have created.
+ *
+ * POSIX has no read-only umask query, so the mask has to be read back through
+ * a set. Doing that exactly once bounds the window in which a concurrent
+ * thread could observe umask 0 to the first published emit. */
+static mode_t publish_target_mode(const char *dst) {
+	static int cached_umask = -1;
+	struct stat st;
+	if (stat(dst, &st) == 0 && S_ISREG(st.st_mode)) return st.st_mode & 07777;
+	if (cached_umask < 0) {
+		mode_t um = umask(0);
+		umask(um);
+		cached_umask = (int)um;
+	}
+	return (mode_t)(0666 & ~(mode_t)cached_umask);
+}
+
+/* A destination that is not a regular file (/dev/null, a character device, a
+ * fifo) cannot be published by rename: rename would need write permission on
+ * its directory and would replace the special file with a regular one. The
+ * same applies when the sibling temporary had to fall back to $TMPDIR and the
+ * rename would cross a device. Copy the finished bytes instead. The
+ * destination is still only opened after translation and verification
+ * succeeded, so a failed run leaves it untouched. */
+static bool publish_by_copy(const char *temp, const char *dst) {
+	FILE *in = fopen(temp, "rb");
+	FILE *out = NULL;
+	char buf[8192];
+	size_t n;
+	bool ok;
+	if (!in) return false;
+	out = fopen(dst, "wb");
+	if (!out) {
+		fclose(in);
+		return false;
+	}
+	ok = true;
+	while (ok && (n = fread(buf, 1, sizeof buf, in)) > 0)
+		if (fwrite(buf, 1, n, out) != n) ok = false;
+	if (ferror(in)) ok = false;
+	if (fclose(out) != 0) ok = false;
+	fclose(in);
+	return ok;
+}
+#endif
+
 static int transpile(char *input_file, char *output_file) {
 	if (output_path_is_stdout(output_file)) return transpile_to_stdout(input_file);
 	if (paths_are_same_file(input_file, output_file)) {
@@ -6085,7 +6243,15 @@ static int transpile(char *input_file, char *output_file) {
 #ifdef _WIN32
 		ok = MoveFileExA(temp, output_file, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-		ok = rename(temp, output_file) == 0;
+		struct stat dst_st;
+		bool dst_special = stat(output_file, &dst_st) == 0 && !S_ISREG(dst_st.st_mode);
+		if (dst_special)
+			ok = publish_by_copy(temp, output_file);
+		else {
+			chmod(temp, publish_target_mode(output_file));
+			ok = rename(temp, output_file) == 0;
+			if (!ok && errno == EXDEV) ok = publish_by_copy(temp, output_file);
+		}
 #endif
 	}
 	if (ok) signal_temps_unregister(temp);
@@ -6179,6 +6345,13 @@ static bool prism_library_call_begin(void) {
 	PRISM_STATE();
 	if (!pparse_ctx_init()) return false;
 	prism_reset();
+	/* Which spelling line directives take -- GCC's `# N "f"` linemarker or
+	 * C99's `#line N "f"` -- is chosen by the CLI from the backend and flatten
+	 * mode, and nothing on the library path ever put it back. A library call
+	 * that followed one which had set it therefore emitted the other spelling,
+	 * silently, for the rest of the thread's life. The library path never wants
+	 * linemarkers, so pin it rather than inherit it. */
+	use_linemarkers = false;
 	free(_ps->active_membuf);
 	_ps->active_membuf = NULL;
 	_ps->active_memlen = 0;
@@ -6441,6 +6614,8 @@ static void prism_transpile_file_into(PrismResult *result, const char *input_fil
 	 * longjmp while interning the filename, before pparse_tokenize assigns
 	 * token_source itself; recovery must still be able to free the buffer. */
 	pparse_ctx->token_source = pp_buf;
+	/* `cc -E` (or a `.i` input) already completed translation phases 1-3. */
+	pparse_ctx->input_preprocessed = true;
 	tok = pparse_tokenize_buffer((char *)input_file, pp_buf);
 
 	*result = transpile_to_result(tok);
@@ -6499,6 +6674,9 @@ static void prism_transpile_source_into(PrismResult *result, const char *source,
 	 * before pparse_tokenize takes ownership. Publish the buffer first so the
 	 * library error-recovery path cannot leak it. */
 	_pc->token_source = buf;
+	/* Raw source: Prism is the only front end that sees this text, so it
+	 * still owns translation phases 1 and 2. */
+	_pc->input_preprocessed = false;
 	tok = pparse_tokenize_buffer((char *)fname, buf);
 
 	*result = transpile_to_result(tok);
@@ -7402,7 +7580,7 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		posix_spawn_file_actions_addclose(&vfa, in_fd);
 		char **venv = build_clean_environ();
 		pid_t vpid;
-		int verr = venv ? posix_spawnp(&vpid, compile_argv[0], &vfa, NULL, compile_argv, venv) : ENOMEM;
+		int verr = venv ? prism_spawn_retry(&vpid, compile_argv[0], &vfa, compile_argv, venv) : ENOMEM;
 		free(venv);
 		posix_spawn_file_actions_destroy(&vfa);
 		close(in_fd);
@@ -7434,7 +7612,7 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	posix_spawn_file_actions_addclose(&fa, pipefd[0]);
 	char **env = build_clean_environ();
 	pid_t pid;
-	int err = env ? posix_spawnp(&pid, compile_argv[0], &fa, NULL, compile_argv, env) : ENOMEM;
+	int err = env ? prism_spawn_retry(&pid, compile_argv[0], &fa, compile_argv, env) : ENOMEM;
 	free(env);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pipefd[0]);

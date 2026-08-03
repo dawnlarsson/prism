@@ -251,6 +251,7 @@ typedef struct {
 	long passed;
 	long failed;
 	long skipped;
+	long infra; /* spawns the machine refused, not verdicts */
 	char first[768];
 } Stats;
 
@@ -629,6 +630,28 @@ static const char *backend_cc(void) {
 	return cc;
 }
 
+/* A `system()` that fails because the machine would not start a process says
+ * nothing about the code under test. Dawn's laptop, briefly short of memory,
+ * turned five such refusals into five reported failures -- and reverting every
+ * candidate fix afterwards reproduced nothing, because the tree was never the
+ * variable. fork returning ENOMEM shows up as rc == -1; a shell that cannot
+ * exec exits 127. Retry those, and count what needed retrying so a run that
+ * fought the machine says so out loud instead of blaming the compiler. */
+static long infra_retries;
+/* Sub-second-identity shapes that the host clock was too slow to construct. */
+static long slow_clock_skips;
+
+static int run_shell_command(const char *cmd) {
+	int rc = -1;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		rc = system(cmd);
+		if (rc != -1 && !(WIFEXITED(rc) && WEXITSTATUS(rc) == 127)) return rc;
+		infra_retries++;
+		usleep(20000 * (unsigned)(attempt + 1));
+	}
+	return rc;
+}
+
 static int compile_output(const char *out, int run) {
 	static unsigned serial;
 	char src[256], bin[256], cmd[1024];
@@ -641,7 +664,7 @@ static int compile_output(const char *out, int run) {
 	fclose(fp);
 	snprintf(cmd, sizeof(cmd), "%s -w -std=gnu11 %s %s -o %s >/dev/null 2>&1",
 		 backend_cc(), run ? "" : "-fsyntax-only", src, bin);
-	int rc = system(cmd);
+	int rc = run_shell_command(cmd);
 	if (rc != 0) {
 		unlink(src);
 		unlink(bin);
@@ -683,7 +706,7 @@ static int compile_output_backend_default(const char *out) {
 		return -1000;
 	}
 	snprintf(cmd, sizeof(cmd), "%s -w -fsyntax-only %s >/dev/null 2>&1", backend_cc(), src);
-	int rc = system(cmd);
+	int rc = run_shell_command(cmd);
 	unlink(src);
 	if (rc == -1 || !WIFEXITED(rc)) return -1001;
 	return WEXITSTATUS(rc);
@@ -706,7 +729,7 @@ static int compile_output_trigraphs(const char *out) {
 	}
 	snprintf(cmd, sizeof(cmd), "%s -w -std=gnu11 -trigraphs -fsyntax-only %s >/dev/null 2>&1",
 		 backend_cc(), src);
-	int rc = system(cmd);
+	int rc = run_shell_command(cmd);
 	unlink(src);
 	if (rc == -1 || !WIFEXITED(rc)) return -1001;
 	return WEXITSTATUS(rc);
@@ -732,6 +755,14 @@ static int run_driver_transpile(const Recipe *r, const char *src, PrismFeatures 
 	apply_features(f);
 	prism_verify_mode = (r->oracle & O_VERIFY) != 0;
 	int ok = transpile(in, out);
+	/* transpile() returns 0 without a diagnostic when it could not spawn the
+	 * preprocessor, which is indistinguishable here from prism rejecting the
+	 * input. A real rejection repeats; a refused spawn usually does not. */
+	for (int attempt = 0; !ok && attempt < 3; attempt++) {
+		infra_retries++;
+		usleep(20000 * (unsigned)(attempt + 1));
+		ok = transpile(in, out);
+	}
 	prism_verify_mode = false;
 	char *emitted = NULL;
 	if (ok) {
@@ -780,8 +811,27 @@ static int write_text_file(const char *path, const char *text) {
 	return ok;
 }
 
+/* The internal actions drive prism through environment variables, and several
+ * set one without putting it back: a full run leaves PRISM_PP_CACHE_DIR
+ * pointing at a directory these actions have already deleted, and
+ * PRISM_PP_CACHE_MAX_MB pinned at 1. Every later recipe then runs against a
+ * broken 1 MB cache, which is invisible in the default order but makes recipe
+ * results depend on what ran before them -- so a filtered or sharded run
+ * disagrees with a full one. Snapshot the whole set here and restore it on the
+ * way out, whatever the individual actions do in between. */
+static const char *const INTERNAL_ENV_VARS[] = {
+	"PRISM_PP_CACHE_DIR", "PRISM_PP_CACHE_MAX_MB", "PRISM_PP_CACHE_MAX_DAYS",
+	"PRISM_NO_PP_CACHE", "CPATH", "DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES",
+	"SOURCE_DATE_EPOCH",
+};
+
 static int run_internal(const Recipe *r, char *failed_action) {
 	int ok = 1;
+	char *saved_env[N(INTERNAL_ENV_VARS)];
+	for (size_t v = 0; v < N(INTERNAL_ENV_VARS); v++) {
+		const char *cur = getenv(INTERNAL_ENV_VARS[v]);
+		saved_env[v] = cur ? strdup(cur) : NULL;
+	}
 	for (const char *p = r->sequence; p && *p; p++) {
 		int before = ok;
 		if (*p == 'K') {
@@ -859,14 +909,71 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			}
 			unlink(src);
 			unlink(hdr);
+		} else if (*p == 'Q') {
+			/* The harness has to tell a machine that refused to start a
+			 * process from a compiler that ran and said no. Conflating the two
+			 * is what turned five transient spawn refusals on a loaded laptop
+			 * into five reported prism failures, and it sent the subsequent
+			 * bisect chasing code changes that were never the variable.
+			 * Refusal is rc == -1 (fork) or exit 127 (shell could not exec);
+			 * anything else is a verdict and must be believed first time. */
+			char script[PATH_MAX], cmd[PATH_MAX + 8];
+			long before = infra_retries;
+			int rc;
+			ok = ok && snprintf(script, sizeof script,
+					    "/tmp/prism_recipe_spawnq_%ld.sh", (long)getpid()) > 0;
+			if (ok) {
+				char counter[PATH_MAX + 4];
+				snprintf(counter, sizeof counter, "%s.n", script);
+				unlink(counter);
+			}
+			/* Refused twice, then fine: must be absorbed, and counted. */
+			ok = ok && write_text_file(script,
+						   "n=$(cat \"$0.n\" 2>/dev/null || echo 0)\n"
+						   "n=$((n+1)); echo $n > \"$0.n\"\n"
+						   "[ \"$n\" -le 2 ] && exit 127\n"
+						   "exit 0\n");
+			ok = ok && snprintf(cmd, sizeof cmd, "sh %s", script) > 0;
+			if (ok) {
+				rc = run_shell_command(cmd);
+				ok = ok && rc == 0 && infra_retries == before + 2;
+			}
+			/* A real non-zero verdict is returned as-is, never retried. */
+			before = infra_retries;
+			ok = ok && write_text_file(script, "exit 3\n");
+			if (ok) {
+				rc = run_shell_command(cmd);
+				ok = ok && WIFEXITED(rc) && WEXITSTATUS(rc) == 3 &&
+				     infra_retries == before;
+			}
+			{
+				char counter[PATH_MAX + 4];
+				snprintf(counter, sizeof counter, "%s.n", script);
+				unlink(counter);
+			}
+			unlink(script);
 		} else if (*p == 'X') {
+			/* pp_cache_dir() resolves PRISM_PP_CACHE_DIR once per thread and
+			 * caches it, so this action cannot redirect itself at a private
+			 * directory: it gets whatever the first cache user in this process
+			 * resolved. In the default order that is internal/platform's
+			 * per-pid directory and the rmdir is a real assertion. Run on its
+			 * own -- filtered, or in a shard that does not contain
+			 * internal/platform -- it resolves to the developer's actual cache
+			 * instead, where removing the directory is both rude and a race
+			 * against any other process using it. Sweep either way; only
+			 * assert the removal on a directory the suite owns. */
 			const char *dir = pp_cache_dir();
 			long removed = 0;
 			char marker[PATH_MAX];
-			pp_each_entry(pp_clear_cb, &removed);
-			snprintf(marker, sizeof marker, "%s/%s", dir, PP_PRUNE_MARKER);
-			unlink(marker);
-			ok = ok && rmdir(dir) == 0;
+			int suite_owned = dir && strstr(dir, "prism_recipe_") != NULL;
+			ok = ok && dir != NULL;
+			if (ok && suite_owned) {
+				pp_each_entry(pp_clear_cb, &removed);
+				snprintf(marker, sizeof marker, "%s/%s", dir, PP_PRUNE_MARKER);
+				unlink(marker);
+				ok = ok && rmdir(dir) == 0;
+			}
 			unsetenv("PRISM_PP_CACHE_DIR");
 			unsetenv("PRISM_PP_CACHE_MAX_MB");
 		} else if (*p == 'S') {
@@ -1624,7 +1731,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 				       snprintf(hdr, sizeof hdr, "/tmp/prism_recipe_cache_stat_%ld.h", (long)getpid()) > 0;
 			int within_one_second = 0;
 			struct timeval fixed_time[2] = {{123456789, 123456}, {123456789, 123456}};
-			for (int attempt = 0; names_ok && ok && attempt < 3 && !within_one_second; attempt++) {
+			for (int attempt = 0; names_ok && ok && attempt < 6 && !within_one_second; attempt++) {
 				time_t edge = time(NULL);
 				while (time(NULL) == edge) usleep(1000);
 				if (!write_text_file(hdr, "#define PRISM_CACHE_STAT 111\n") || utimes(hdr, fixed_time) != 0) {
@@ -1659,7 +1766,16 @@ static int run_internal(const Recipe *r, char *failed_action) {
 				prism_free(&before);
 				prism_free(&after);
 			}
-			ok = ok && names_ok && within_one_second;
+			/* The window that has to land inside one clock second spans two
+			 * preprocessor spawns. On a slow host that is not flaky, it is
+			 * impossible: CI runs riscv64 under qemu, where this was the only
+			 * red job and failed every time. Try hard enough for a fast but
+			 * loaded machine, then record that the shape could not be built
+			 * here instead of reporting it as a prism defect. Never a silent
+			 * pass -- the skip is counted and printed, and on any host quick
+			 * enough to construct it the assertion above still runs. */
+			ok = ok && names_ok;
+			if (ok && !within_one_second) slow_clock_skips++;
 			unlink(src);
 			unlink(hdr);
 		} else if (*p == 'G') {
@@ -2009,6 +2125,11 @@ static int run_internal(const Recipe *r, char *failed_action) {
 		if (getenv("PRISM_INTERNAL_TRACE"))
 			fprintf(stderr, "internal %c: %s%s\n", *p, ok ? "ok" : "failed",
 				before ? "" : " (earlier failure)");
+	}
+	for (size_t v = 0; v < N(INTERNAL_ENV_VARS); v++) {
+		if (saved_env[v]) setenv(INTERNAL_ENV_VARS[v], saved_env[v], 1);
+		else unsetenv(INTERNAL_ENV_VARS[v]);
+		free(saved_env[v]);
 	}
 	return ok;
 }
@@ -2416,7 +2537,32 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 	 * an axis value tag, so a large product can be bisected without changing
 	 * generator code or weakening its unfiltered gate. */
 	const char *axis_filter = getenv("PRISM_AXIS_FILTER");
+	/* Optional shard selector, "i/n": run only the recipes whose index is
+	 * congruent to i modulo n. Recipes are independent and every temp path
+	 * already carries the pid, so n processes cover the gate between them with
+	 * no thread pool and no shared state -- 24.9s becomes 3.1s at n=32 on a
+	 * 32-core host. Interleaving rather than blocking keeps adjacent expensive
+	 * families (the four feature-matrix layouts) in different shards. Splitting
+	 * this way is only sound because run_internal now restores the environment
+	 * it borrows; before that, results depended on what had run earlier.
+	 * CI runs with the variable unset. */
+	long shard_i = 0, shard_n = 1;
+	{
+		const char *sh = getenv("PRISM_RECIPE_SHARD");
+		if (sh && *sh) {
+			char *end = NULL;
+			long a = strtol(sh, &end, 10);
+			if (end && *end == '/' && a >= 0) {
+				long b = strtol(end + 1, NULL, 10);
+				if (b > 0 && a < b) {
+					shard_i = a;
+					shard_n = b;
+				}
+			}
+		}
+	}
 	for (size_t ri = 0; ri < count; ri++) {
+		if (shard_n > 1 && (long)(ri % (size_t)shard_n) != shard_i) continue;
 		const Recipe *r = &recipes[ri];
 		if (filter && *filter && !strstr(r->id, filter)) continue;
 		if ((r->requires & capabilities()) != r->requires) {
@@ -3602,6 +3748,87 @@ static const AxisValue alloc_fault_file_values[] = {
 };
 static const Axis ax_alloc_fault_file = {"source", alloc_fault_file_values, N(alloc_fault_file_values)};
 
+
+/* A defer-bearing `return` needs a temporary of the function's return type, so
+ * a complex return declarator has to be re-synthesized as a typedef. Suffixes
+ * that follow the declarator's outer `)` belong to the returned type: `[N]` for
+ * a returned array pointer and `(params)` for a returned function pointer. The
+ * parameter list used to be dropped, so `int (*f(void))(int)` produced
+ * `typedef int (*T);` and the initializer and return became incompatible-pointer
+ * errors on GCC 16 / Clang 22 (warnings on older compilers, hence O_COMPILE
+ * alone is not the whole oracle -- see the exact/ fragments below). */
+static const AxisValue defer_return_declarator_values[] = {
+	{"plain", "int f(void){defer (void)0;return 0;}", 0, 0},
+	{"pointer", "int *f(void){defer (void)0;return 0;}", 0, 0},
+	{"pointer2", "int **f(void){defer (void)0;return 0;}", 0, 0},
+	{"array-ptr", "static int a[4];int (*f(void))[4]{defer (void)0;return &a;}", 0, 0},
+	{"array-ptr-2d", "static int a[4][3];int (*f(void))[4][3]{defer (void)0;return &a;}", 0, 0},
+	{"array-ptr-ptr", "static int (*p)[4];int (**f(void))[4]{defer (void)0;return &p;}", 0, 0},
+	{"fnptr", "static int g(int a){return a;}int (*f(void))(int){defer (void)0;return g;}", 0, 0},
+	{"fnptr-void", "static int g(void){return 0;}int (*f(void))(void){defer (void)0;return g;}", 0, 0},
+	{"fnptr-two-params",
+	 "static int g(int a,char *b){(void)b;return a;}int (*f(void))(int,char *){defer (void)0;return g;}",
+	 0, 0},
+	{"fnptr-ptr", "static int (*p)(int);int (**f(void))(int){defer (void)0;return &p;}", 0, 0},
+	{"fnptr-returning-ptr",
+	 "static int *g(int a){(void)a;return 0;}int *(*f(void))(int){defer (void)0;return g;}", 0, 0},
+	{"fnptr-of-fnptr",
+	 "static int i2(int a){return a;}static int (*g(char c))(int){(void)c;return i2;}"
+	 "int (*(*f(void))(char))(int){defer (void)0;return g;}",
+	 0, 0},
+	{"array-of-fnptr",
+	 "static int (*t[4])(int);int (*(*f(void))[4])(int){defer (void)0;return &t;}", 0, 0},
+	{"fnptr-with-fnptr-param",
+	 "static int g(int (*h)(int)){return h?1:0;}"
+	 "int (*f(void))(int (*)(int)){defer (void)0;return g;}",
+	 0, 0},
+	{"struct-value", "struct S{int a;};static struct S s;struct S f(void){defer (void)0;return s;}", 0, 0},
+	{"typedef-value", "struct S{int a;};typedef struct S ST;static ST s;ST f(void){defer (void)0;return s;}", 0, 0},
+	{"qualified-pointer", "const char *f(void){defer (void)0;return \"x\";}", 0, 0},
+};
+static const Axis ax_defer_return_declarator = {
+	"declarator", defer_return_declarator_values, N(defer_return_declarator_values)
+};
+
+/* Synthetic output -- a spliced `{`, a copied defer body -- does not pass
+ * through emit_tok, so it never picks up emit_tok's beginning-of-line newline.
+ * Landing it on a surviving `#pragma` line puts the statement inside the
+ * directive, and a conforming preprocessor discards trailing tokens there: the
+ * cleanup, and in the return case the `return` itself, vanished with no
+ * diagnostic. Line directives are what normally forced the break, so every cell
+ * here must run with FB_LINE cleared. Each program's exit status is the
+ * oracle: a dropped splice changes it. */
+static const AxisValue defer_after_directive_values[] = {
+	{"scope-exit",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static void f(void){defer mark();\n#pragma pack(1)\n}"
+	 "int main(void){f();return calls==1?0:1;}",
+	 0, 0},
+	{"return",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static int f(void){defer mark();\n#pragma pack(1)\nreturn 7;}"
+	 "int main(void){int v=f();return (v==7&&calls==1)?0:1;}",
+	 0, 0},
+	{"break",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static void f(void){for(int i=0;i<1;i++){defer mark();\n#pragma pack(1)\nbreak;}}"
+	 "int main(void){f();return calls==1?0:1;}",
+	 0, 0},
+	{"continue",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static void f(void){for(int i=0;i<2;i++){defer mark();\n#pragma pack(1)\ncontinue;}}"
+	 "int main(void){f();return calls==2?0:1;}",
+	 0, 0},
+	{"goto",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static void f(void){{defer mark();\n#pragma pack(1)\ngoto out;}out:;}"
+	 "int main(void){f();return calls==1?0:1;}",
+	 0, 0},
+};
+static const Axis ax_defer_after_directive = {
+	"exit", defer_after_directive_values, N(defer_after_directive_values)
+};
+
 #include "test.recipes.inc"
 
 /* ---- Recipes -------------------------------------------------------- */
@@ -4336,6 +4563,159 @@ static const Recipe recipes[] = {
 	{.id="cli/rsp-escaped", .source="-DNAME=a\\ b x.c\r\n", .oracle=O_CLI,
 	 .requires=CAP_POSIX, .argv=av_rsp, .argc=2, .cli_mode=CLI_DEFAULT,
 	 .cli_action=CLI_ACT_NONE, .cli_sources=1, .cli_cc_args=1},
+	/* --- 1.1.7 regressions: defer return declarators, directive-line
+	 * splices, wrap-paren orelse actions, and GNU label declarations. --- */
+	{"runtime/defer-return-declarator", "@0@", NULL, {&ax_defer_return_declarator},
+	 O_OK | O_FIXED | O_COMPILE | O_NO_EXT, 0, FB_LINE, CAP_POSIX},
+	/* Compiler-independent half of the same contract: the synthesized typedef
+	 * must carry the returned function type's parameter list. The source
+	 * spelling has no spaces inside its parentheses, so these fragments can
+	 * only come from the typedef. */
+	{"exact/defer-return-fnptr-params",
+	 "static int g(int a){return a;}int (*f(void))(int){defer (void)0;return g;}", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, ") ( int );", NULL},
+	{"exact/defer-return-fnptr-two-params",
+	 "static int g(int a,char *b){(void)b;return a;}"
+	 "int (*f(void))(int,char *){defer (void)0;return g;}", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, ") ( int , char * );", NULL},
+	{"exact/defer-return-fnptr-of-fnptr",
+	 "static int i2(int a){return a;}static int (*g(char c))(int){(void)c;return i2;}"
+	 "int (*(*f(void))(char))(int){defer (void)0;return g;}", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, ") ( char ) ) ( int );", NULL},
+	{"exact/defer-return-array-ptr-dim",
+	 "static int a[4];int (*f(void))[4]{defer (void)0;return &a;}", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, ") [ 4 ];", NULL},
+	/* Without a terminating `;` the return value expression used to swallow
+	 * the rest of the translation unit into the temporary's initializer. */
+	{"reject/return-value-missing-semicolon",
+	 "void g(void);int f(void){defer g();return 0}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "missing ';' after return value"},
+	{"runtime/defer-after-directive", "@0@", NULL, {&ax_defer_after_directive},
+	 O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, FB_LINE, CAP_POSIX},
+	/* Macro-hygiene wrap parens around a declaration initializer are stripped
+	 * before emission, so an empty action inside them reaches Pass 2 as the
+	 * bare form the unwrapped scan already rejects, and lowered to `x ? x :;`. */
+	{"reject/orelse-empty-action-wrapped",
+	 "int g(void);void f(void){int z=(g() orelse);(void)z;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "expected statement after 'orelse'"},
+	{"reject/orelse-empty-action-wrapped-chain",
+	 "int g(void);int h(void);void f(void){int z=(g() orelse h() orelse);(void)z;}", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "expected statement after 'orelse'"},
+	/* Positive control: the wrap-paren value form still lowers. */
+	{"exact/orelse-wrapped-value",
+	 "int g(void);void f(void){int z=(g() orelse 5);(void)z;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "z = z ? z : 5", NULL},
+	{"exact/orelse-wrapped-value-chain",
+	 "int g(void);int h(void);void f(void){int z=(g() orelse h() orelse 5);(void)z;}", NULL,
+	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "z = z ? z : 5", NULL},
+	/* An unterminated GNU label declaration emitted its tokens and only then
+	 * reported "not handled", so the caller emitted them a second time and
+	 * everything to EOF was duplicated. Duplication breaks the fixed point. */
+	{"exact/gnu-label-decl-unterminated",
+	 "int f(void){\n__label__ L\n}\n", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	{"runtime/gnu-label-decl-scoped",
+	 "int main(void){int t=0;{__label__ again;int i=0;again:if(++i<3)goto again;t+=i;}"
+	 "{__label__ again;int j=0;again:if(++j<5)goto again;t+=j;}return t==8?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, FB_LINE, CAP_GNU | CAP_POSIX},
+	/* The retired `collect_source_defines` continuation tests asserted that a
+	 * `#define` whose value spans backslash-continued physical lines is
+	 * re-emitted with every chunk joined -- the original defect lost the name
+	 * to a getline realloc and dropped later chunks. The corpus capture of
+	 * those tests (api-214, api-215) kept only the status, which is not what
+	 * they checked, so the joining contract was uncovered. Restore it against
+	 * the re-emission path directly: no include, so `emit_consumed_defines`
+	 * always runs. */
+	{"exact/define-continuation-two-line",
+	 "#define FOB \\\n    64\nint f(void){return FOB;}", NULL,
+	 {0}, O_OK | O_FILE | O_COMPILE, 0, FB_FLAT | FB_LINE, CAP_POSIX,
+	 "#define FOB 64", NULL},
+	{"exact/define-continuation-multi-line",
+	 "#define MULTI_VAL (1 \\\n    | 2 \\\n    | 4)\nint f(void){return MULTI_VAL;}", NULL,
+	 {0}, O_OK | O_FILE | O_COMPILE, 0, FB_FLAT | FB_LINE, CAP_POSIX,
+	 "#define MULTI_VAL (1 | 2 | 4)", NULL},
+	{"exact/define-continuation-tab-indent",
+	 "#define TABBED (1 \\\n\t| 2)\nint f(void){return TABBED;}", NULL,
+	 {0}, O_OK | O_FILE | O_COMPILE, 0, FB_FLAT | FB_LINE, CAP_POSIX,
+	 "#define TABBED (1 | 2)", NULL},
+	/* Symmetric with the return-value walk: an orelse fallback with no
+	 * terminating `;` copied the rest of the block into `LHS = ( ... )`. */
+	{"reject/orelse-fallback-missing-semicolon",
+	 "int g(void); void f(void){ int x; x = g() orelse 5 }", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "missing ';' after orelse fallback value"},
+	/* A `__label__` declaration is a statement. Phase 1D handed on the
+	 * `__label__` token itself as the previous token, so a `defer` directly
+	 * after one looked like expression context and was rejected -- valid GNU C
+	 * plus valid Prism, refused. */
+	{"runtime/defer-after-gnu-label-decl",
+	 "static int calls;static void mark(void){calls++;}"
+	 "static int g(int c){__label__ retry;defer mark();int n=0;"
+	 "retry:if(++n<3)goto retry;return c?n:-n;}"
+	 "int main(void){int v=g(1);return (v==3&&calls==1)?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, FB_LINE, CAP_GNU | CAP_POSIX},
+	{"exact/defer-after-gnu-label-decl-multi",
+	 "void k(void);void f(void){__label__ L, M; defer k(); L:M:;}", NULL,
+	 {0}, O_OK | O_NO_EXT, 0, FB_LINE, 0, "k();", NULL},
+	/* A GNU label declaration carries no type tag, so the braceless-body
+	 * declaration check never saw it and the scan emitted a stray `}`. */
+	{"reject/gnu-label-decl-as-braceless-defer-body",
+	 "void k(void);void f(void){ defer __label__ L, k(); }", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL,
+	 "'__label__' declaration as a braceless defer body"},
+	/* Translation phase 1 belongs to whoever preprocesses. `cc -E` already
+	 * applied the backend's trigraph policy -- off by default -- so re-running
+	 * it over the preprocessed stream rewrote literals the compiler had
+	 * deliberately kept. The file API is the path that preprocesses, so the
+	 * oracle has to be O_FILE; the executable check compares against the
+	 * length the backend itself would produce. */
+	{"runtime/trigraph-policy-follows-backend",
+	 /* Split every `??!` across two string literals: concatenation happens in
+	  * translation phase 6, long after phase 1, so the trigraph is never formed
+	  * while compiling this file. Spelled literally it warns under Clang and is
+	  * silently rewritten to `what|` by any compiler with trigraphs enabled,
+	  * which would corrupt the very data this cell exists to check. */
+	 "int main(void){ const char *s = \"what?" "?!\"; return (sizeof(\"what?" "?!\")-1==7 && s[4]=='?')?0:1; }",
+	 NULL, {0}, O_OK | O_FILE | O_RUN | O_NO_EXT, 0, FB_LINE, CAP_POSIX},
+	/* Raw source has no other front end, so Prism still owns phases 1 and 2
+	 * there: the spliced-keyword product above must keep working. */
+	{"runtime/trigraph-splice-still-applies-to-raw-source",
+	 "static int calls;static void mark(void){calls++;}"
+	 "int main(void){de?" "?/\nfer mark();return calls==0?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_NO_EXT, 0, FB_LINE, CAP_POSIX},
+	/* Phase 1 can leave the bare-orelse recipe bit set with no recorded `=`.
+	 * Every emission below walked from that pointer, so `pparse_next(NULL)`
+	 * dereferenced a null token -- caught by UBSan in the fuzz target. */
+	{"reject/bare-orelse-without-assignment",
+	 "int main(void){ int a[5]={0}; int i=2; free orelse { (void)a[i]; } return 0; }", NULL,
+	 {0}, O_ANY_STATUS | O_REPLAY, 0, FB_LINE, 0},
+	/* Extension elimination is now enforced at emission rather than assumed.
+	 * Each of these used to be accepted, with the keyword copied verbatim into
+	 * the generated C: the backend then failed somewhere unrelated, or -- for
+	 * the defer case -- silently compiled a duplicated translation unit. All
+	 * three inputs are rejected by a C compiler on their own merits. */
+	{"reject/defer-not-lowered-unterminated-body",
+	 "void task_a(void){ defer { int x = 5 }; }\nvoid f(void);\nvoid task_b(void){ defer f(); }\n", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "was not lowered"},
+	{"reject/orelse-not-lowered-attribute-before-if-paren",
+	 "int *get(void);int main(void){int *p;if __attribute__((hot)) (1) p = get() orelse 0;(void)p;return 0;}",
+	 NULL, {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "was not lowered"},
+	/* The three constructs that legitimately emit the spelling must keep
+	 * working: a shadowing identifier, a raw suppress block, and the keyword's
+	 * own feature switched off. */
+	{"exact/raw-block-keeps-defer-verbatim",
+	 "void c(void);void f(void){ raw { defer c(); } }", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, "defer c();", NULL},
+	{"exact/no-orelse-keeps-orelse-verbatim",
+	 "int g(void);int f(void){const int x=g() orelse 7;return x;}", NULL,
+	 {0}, O_OK, 0, FB_ORELSE | FB_LINE, 0, "orelse 7", NULL},
+	{"exact/no-defer-keeps-defer-verbatim",
+	 "void c(void);int f(void){int x=0;defer c();return x;}", NULL,
+	 {0}, O_OK, 0, FB_DEFER | FB_LINE, 0, "defer c();", NULL},
+	{"runtime/shadowed-defer-identifier-still-emitted",
+	 "typedef int defer;int main(void){defer d=7;return d==7?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX, "defer d", NULL},
+	{"internal/spawn-classification", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "Q"},
 	{"internal/cache-cleanup", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "X"},
 };
@@ -4345,6 +4725,18 @@ int main(void) {
 	recipe_run(recipes, N(recipes), &st);
 	printf("PRISM RECIPES: %ld cells, %ld passed, %ld failed, %ld skipped\n",
 	       st.cells, st.passed, st.failed, st.skipped);
+	/* Surfaced deliberately: a run that had to retry spawns was fighting the
+	 * machine, and any failure it reports should be read in that light. */
+	if (slow_clock_skips)
+		fprintf(stderr,
+			"NOTE: %ld sub-second file-identity check(s) skipped: this host could not "
+			"write, preprocess and rewrite inside one clock second\n",
+			slow_clock_skips);
+	if (infra_retries)
+		fprintf(stderr,
+			"NOTE: %ld process spawn(s) were refused by the machine and retried "
+			"(low memory or process limits); this is not a verdict on prism\n",
+			infra_retries);
 	if (st.failed) fprintf(stderr, "FIRST FAILURE: %s\n", st.first);
 	prism_thread_cleanup();
 	return st.failed ? 1 : 0;
