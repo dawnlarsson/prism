@@ -623,16 +623,14 @@ static int terms_present(const char *out, const char *terms, int present) {
 	return 1;
 }
 
-#ifndef _WIN32
-static const char *backend_cc(void) {
-	const char *cc = getenv("CC");
-	if (!cc || !*cc || strpbrk(cc, " \t\"'`$;&|<>()[]{}*?!#~\n")) return "cc";
-	return cc;
-}
+/* Both counters are read by the summary in main(), which is compiled on every
+ * platform, so they live outside the POSIX guard even though only POSIX code
+ * ever increments them. Declaring them beside their writers instead cost a
+ * Windows build. */
 
 /* A `system()` that fails because the machine would not start a process says
- * nothing about the code under test. Dawn's laptop, briefly short of memory,
- * turned five such refusals into five reported failures -- and reverting every
+ * nothing about the code under test. A laptop briefly short of memory turned
+ * five such refusals into five reported failures -- and reverting every
  * candidate fix afterwards reproduced nothing, because the tree was never the
  * variable. fork returning ENOMEM shows up as rc == -1; a shell that cannot
  * exec exits 127. Retry those, and count what needed retrying so a run that
@@ -640,6 +638,13 @@ static const char *backend_cc(void) {
 static long infra_retries;
 /* Sub-second-identity shapes that the host clock was too slow to construct. */
 static long slow_clock_skips;
+
+#ifndef _WIN32
+static const char *backend_cc(void) {
+	const char *cc = getenv("CC");
+	if (!cc || !*cc || strpbrk(cc, " \t\"'`$;&|<>()[]{}*?!#~\n")) return "cc";
+	return cc;
+}
 
 static int run_shell_command(const char *cmd) {
 	int rc = -1;
