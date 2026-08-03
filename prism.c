@@ -3428,14 +3428,29 @@ static int wait_for_child(pid_t pid) {
  * and gave up. Only one of the five spawn sites retried anything at all. Retry
  * the transient set everywhere; a real failure such as ENOENT for a missing
  * compiler still reports on the first attempt. */
-static int prism_spawn_retry(pid_t *pid, const char *file, const posix_spawn_file_actions_t *fa,
-			     char *const argv[], char *const envp[]) {
+/* `nanosleep` is POSIX and has no MSVC import. It survived here for a long
+ * time only because its one caller was unreachable on Windows, so the linker
+ * discarded the function whole; giving the retry four more call sites that are
+ * live on Windows made the missing symbol a link error. Sleep portably. */
+static void prism_nap_ms(long ms) {
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	struct timespec nap = {ms / 1000, (ms % 1000) * 1000000L};
+	nanosleep(&nap, NULL);
+#endif
+}
+
+/* Parameters match windows.c's `posix_spawnp` shim rather than the POSIX
+ * prototype: the shim is the stricter of the two, and a non-const argument
+ * converts implicitly to POSIX's const one but not the other way round. */
+static int prism_spawn_retry(pid_t *pid, const char *file, posix_spawn_file_actions_t *fa,
+			     char **argv, char **envp) {
 	int err = 0;
 	for (int attempt = 0; attempt < 5; attempt++) {
 		err = posix_spawnp(pid, file, fa, NULL, argv, envp);
 		if ((err != EAGAIN) & (err != ETXTBSY) & (err != ENOMEM)) break;
-		struct timespec nap = {0, 20L * 1000 * 1000 * (attempt + 1)};
-		nanosleep(&nap, NULL);
+		prism_nap_ms(20L * (attempt + 1));
 	}
 	return err;
 }

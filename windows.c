@@ -35,7 +35,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <setjmp.h>
-#include <BaseTsd.h>
+/* Lowercase: the MSVC SDK filesystem is case-insensitive so either spelling
+ * resolves there, but mingw-w64 ships `basetsd.h` and a case-sensitive host
+ * cannot find `BaseTsd.h`. Spelling it this way is what lets the `_WIN32`
+ * source path be compiled from Linux, which is how a Windows-only link error
+ * gets caught before CI. */
+#include <basetsd.h>
 
 typedef SSIZE_T ssize_t;
 typedef intptr_t pid_t;
