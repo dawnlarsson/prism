@@ -452,11 +452,15 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
   `(a + i)[0]`, `i[a]`, or `(pick ? a : b)[i]`. Strict safety mode diagnoses
   these rather than attaching one array's bound to another; `-fno-safety`
   leaves valid host C unwrapped.
-- Array parameters: `void f(int a[4])` declares a pointer, not an array (C11 §6.7.6.3p7), so there is no length to check against. This includes `int a[static 4]`, where C does promise at least 4 elements but Prism does not yet use that promise
-- Pointer-to-array dereference: `int (*p)[4]; (*p)[i]` and `p[0][i]` carry their length in the type but are not currently wrapped
+- Array parameters: `void f(int a[4])` declares a pointer, not an array (C11 §6.7.6.3p7), so there is no length to check against. `int a[static 4]` **is** checked: C promises at least 4 elements, and that promise is the bound
 - `raw { ... }` blocks (Prism transformations are fully suppressed)
 
 The check is a single predicted-not-taken branch per subscript; the backend compiler constant-folds the `sizeof` ratio for fixed arrays and often eliminates the whole check when it can prove the index is in range.
+
+Pointer-to-array dereference is checked on the dimension the type carries:
+`int (*p)[4]` bounds `(*p)[i]` and `p[0][i]` against the `[4]`. The pointer hop
+itself is not checked — nothing says how many arrays `p` points at — so `p[i]`
+is left alone.
 
 **Opt-out:** `prism -fno-bounds-check src.c`
 

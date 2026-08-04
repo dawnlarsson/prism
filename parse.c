@@ -472,6 +472,17 @@ typedef struct {
 	uint32_t token_index;
 	uint32_t scope_close_idx;
 	uint8_t array_rank;
+	/* Leading subscripts that traverse a pointer rather than an array
+	 * dimension. `int (*p)[4]` is rank 2 with one hop: `p[i]` has no extent to
+	 * check against, while `p[0][i]` and `(*p)[i]` both bound against the `[4]`.
+	 * Zero for every ordinary array, which is the common path. */
+	uint8_t ptr_hops;
+	/* Declarator `[` of an `int a[static N]` parameter, or 0. C11 6.7.6.3p7
+	 * promises at least N elements, which is the only extent an array
+	 * parameter has: it is a pointer, so `sizeof(a)/sizeof(a[0])` would be the
+	 * pointer's size over the element's. The bound has to be the literal N,
+	 * re-emitted from these tokens. */
+	uint32_t static_extent_tok;
 	bool array_dim_complete : 1;
 	bool is_vla_var : 1;
 	bool blocks_outer : 1;
@@ -2820,7 +2831,13 @@ typedef struct {
 	bool array_dim_complete : 1;
 	bool has_bracket_orelse : 1;
 	bool has_zero_dim : 1;
+	/* Dimensions that close a pointer-to-array declarator, `int (*p)[4]`. The
+	 * ordinary rank deliberately excludes them because `p` is a pointer, not
+	 * an array -- but the extent is still in the type and still bounds
+	 * `p[0][i]` and `(*p)[i]`, so count them separately. */
+	bool ptr_array_dim_complete : 1;
 	uint8_t array_rank;
+	uint8_t ptr_array_rank;
 } PParseDecl;
 
 /* Canonical declaration shape, stored verbatim in the Pass-2 recipe. */
@@ -3740,6 +3757,8 @@ static PRISM_PURE uint8_t pparse_array_rank_for_tok(PParseToken *t) {
 
 typedef struct {
 	uint8_t rank;
+	uint8_t ptr_hops;
+	uint32_t static_extent_tok;
 	bool tracked : 1;
 	bool dim_complete : 1;
 } PParseArrayBindingInfo;
@@ -3750,10 +3769,19 @@ static PRISM_PURE PParseArrayBindingInfo pparse_array_binding_info(PParseToken *
 	PPARSE_CTX();
 	PParseArrayBindingInfo info = {.dim_complete = true};
 	PParseTypedefEntry *binding = pparse_typedef_lookup(_pc, tok);
-	if (binding && (binding->is_param || binding->is_enum_const)) return info;
+	PParseBoundsArrayEntry *param_extent = NULL;
+	if (binding && (binding->is_param || binding->is_enum_const)) {
+		/* One exception: `int a[static N]` is a parameter whose extent C
+		 * guarantees, so it is checkable where an ordinary array parameter
+		 * is not. */
+		param_extent = pparse_bounds_array_lookup(_pc, tok);
+		if (!param_extent || !param_extent->static_extent_tok) return info;
+	}
 	PParseBoundsArrayEntry *array = pparse_bounds_array_lookup(_pc, tok);
 	if (array) {
 		info.rank = array->array_rank;
+		info.ptr_hops = array->ptr_hops;
+		info.static_extent_tok = array->static_extent_tok;
 		info.tracked = !array->blocks_outer;
 		info.dim_complete = array->array_dim_complete;
 		return info;
@@ -3767,7 +3795,8 @@ static PRISM_PURE PParseArrayBindingInfo pparse_array_binding_info(PParseToken *
 }
 
 static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, uint8_t array_rank,
-				     bool dim_complete, bool is_vla_var, bool blocks_outer) {
+				     bool dim_complete, bool is_vla_var, bool blocks_outer,
+				     uint8_t ptr_hops, uint32_t static_extent_tok) {
 	PPARSE_CTX();
 	uint32_t hash = pparse_fast_hash(name, len);
 	int existing = pparse_hashmap_index_hashed(&pparse_ba.table.name_map, name, len, hash);
@@ -3778,6 +3807,8 @@ static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, u
 			prev->array_dim_complete = dim_complete;
 			prev->is_vla_var = is_vla_var;
 			prev->blocks_outer = blocks_outer;
+			prev->ptr_hops = ptr_hops;
+			prev->static_extent_tok = static_extent_tok;
 			return;
 		}
 	}
@@ -3796,7 +3827,9 @@ static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, u
 					 .array_rank = array_rank,
 					 .array_dim_complete = dim_complete,
 					 .is_vla_var = is_vla_var,
-					 .blocks_outer = blocks_outer};
+					 .blocks_outer = blocks_outer,
+					 .ptr_hops = ptr_hops,
+					 .static_extent_tok = static_extent_tok};
 	pparse_hashmap_put_hashed(
 	    &pparse_ba.table.name_map, name, len, (void *)(intptr_t)(new_index + 1), hash);
 	pparse_ba.table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
@@ -3808,14 +3841,29 @@ static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, u
 		if (!pparse_ba.tl.timeline || since >= PPARSE_TL_REBUILD_CADENCE) pparse_ba_build_timelines();
 	}
 }
+static void pparse_register_array_binding_hops(PParseToken *tok,
+				     uint8_t rank,
+				     bool dim_complete,
+				     bool is_vla,
+				     bool blocks_outer,
+				     uint8_t ptr_hops) {
+	PPARSE_CTX();
+	pparse_bounds_array_add(pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, dim_complete,
+				is_vla, blocks_outer, ptr_hops, 0);
+}
+
+static void pparse_register_static_extent_param(PParseToken *tok, uint8_t rank, uint32_t bracket) {
+	PPARSE_CTX();
+	pparse_bounds_array_add(pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, true, false,
+				false, 0, bracket);
+}
+
 static void pparse_register_array_binding(PParseToken *tok,
 				     uint8_t rank,
 				     bool dim_complete,
 				     bool is_vla,
 				     bool blocks_outer) {
-	PPARSE_CTX();
-	pparse_bounds_array_add(
-	    pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, dim_complete, is_vla, blocks_outer);
+	pparse_register_array_binding_hops(tok, rank, dim_complete, is_vla, blocks_outer, 0);
 }
 
 static PRISM_PURE PParseBoundsArrayEntry *pparse_bounds_array_entry_for_token(PParseToken *t) {
@@ -4688,6 +4736,10 @@ typedef struct {
 	PParseToken *arr;	 /* array name the bound is taken from   */
 	PParseToken *close;	 /* ']' closing the subscript            */
 	PParseToken *cast_close; /* ')' of outermost (T *) cast, or NULL */
+	/* Literal extent of an `int a[static N]` parameter, or NULL. The parameter
+	 * is a pointer, so the usual sizeof ratio would measure the pointer, not
+	 * the promise; emit this token instead. */
+	PParseToken *static_extent;
 	int dim_depth;		 /* preceding [i] dimensions already peeled */
 } PParseBoundsPlan;
 
@@ -4786,6 +4838,49 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	if (!last_emitted) return false;
 	uint32_t ti = pparse_idx(_pc, tok);
 	PParseToken *rp_prev = (ti >= 1) ? &pparse_token_pool[ti - 1] : NULL;
+	/* `(*p)[i]` where `p` is a pointer to array. `*p` and `p[0]` denote the
+	 * same object, so the bound is `sizeof(p[0])/sizeof(p[0][0])` -- which the
+	 * emitter can already write, given the name and one peeled dimension.
+	 * Recognised here, ahead of the derived-pointer diagnostics: a `*` on a
+	 * tracked name otherwise looks like pointer arithmetic on an array, and
+	 * this is the one shape where the extent survives the dereference. */
+	if (rp_prev && pparse_match_ch(rp_prev, ')')) {
+		PParseToken *op = pparse_pair_known(rp_prev);
+		PParseToken *star = op ? pparse_next(_pc, op) : NULL;
+		if (star && pparse_match_ch(star, '*') && !(star->flags & PPARSE_TF_OPEN)) {
+			/* Strip redundant layers: `(*(p))[i]` is `(*p)[i]`. */
+			PParseToken *b = pparse_next(_pc, star), *e = rp_prev;
+			while (b && pparse_match_ch(b, '(') && (b->flags & PPARSE_TF_OPEN) &&
+			       pparse_pair_known(b) && pparse_next(_pc, pparse_pair_known(b)) == e) {
+				e = pparse_pair_known(b);
+				b = pparse_next(_pc, b);
+			}
+			if (b && pparse_is_value_name_token(b) && pparse_next(_pc, b) == e &&
+			    !pparse_is_known_typedef(b)) {
+				PParseArrayBindingInfo pa = pparse_array_binding_info(b);
+				if (pa.tracked && pa.ptr_hops == 1 && pa.dim_complete &&
+				    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL || pa.rank > 1)) {
+					out->arr = b;
+					out->close = rb;
+					out->cast_close = NULL;
+					out->dim_depth = 1;
+					out->static_extent = NULL;
+					return true;
+				}
+			}
+		}
+		/* Any other base built from a pointer-to-array name -- a second
+		 * dereference, arithmetic, a conditional -- has no extent this pass can
+		 * prove. Leave it unchecked rather than falling into the derived-pointer
+		 * diagnostics below, which exist for arrays and would now fire on a
+		 * pointer that was untracked until this release. */
+		if (op) {
+			for (PParseToken *t = pparse_next(_pc, op); t && t != rp_prev; t = pparse_next(_pc, t))
+				if (pparse_is_value_name_token(t) && !pparse_is_known_typedef(t) &&
+				    pparse_array_binding_info(t).ptr_hops > 0)
+					return false;
+		}
+	}
 	if (rp_prev && pparse_match_ch(rp_prev, ')')) {
 		PParseToken *rp = rp_prev;
 		PParseToken *op = pparse_pair_known(rp);
@@ -4880,6 +4975,7 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			name_tok = pool_prev;
 	}
 	int dim_depth = 0;
+	PParseToken *static_extent = NULL;
 	while (1) {
 		if (pparse_match_ch(name_tok, ')')) {
 			PParseToken *open = pparse_pair_known(name_tok);
@@ -4958,6 +5054,23 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		PParseArrayBindingInfo array = pparse_array_binding_info(name_tok);
 		if (!array.tracked) return false;
 		if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return false;
+		/* A leading pointer hop carries no extent: `int (*p)[4]` says nothing
+		 * about how many `int[4]`s `p` points at, so `p[i]` stays unchecked
+		 * while `p[0][i]` bounds against the `[4]`. */
+		if (dim_depth < array.ptr_hops) return false;
+		/* Only the outermost subscript is covered by the `static N` promise.
+		 * Deeper ones index a real array type, where the sizeof ratio is
+		 * correct: for `int a[static 4][3]`, `a[0]` is `int[3]`. */
+		if (array.static_extent_tok && dim_depth == 0) {
+			PParseToken *br = &pparse_token_pool[array.static_extent_tok];
+			PParseToken *num = pparse_skip_noise(_pc, pparse_next(_pc, br));
+			while (num && (num->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE)))
+				num = pparse_skip_noise(_pc, pparse_next(_pc, num));
+			if (!num || num->kind != PPARSE_TK_NUM) return false;
+			static_extent = num;
+		} else if (array.static_extent_tok) {
+			/* fall through: sizeof ratio on the decayed element type */
+		}
 		PParseToken *operand_start = name_tok;
 		/* Include this subscript in the operand span.  Otherwise `&(a[i])`
 		 * cannot peel the parentheses: the close follows `]`, not the bare
@@ -5071,6 +5184,7 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 	out->close = rb;
 	out->cast_close = cast_close;
 	out->dim_depth = dim_depth;
+	out->static_extent = static_extent;
 	return true;
 }
 
@@ -5320,6 +5434,11 @@ static PParseToken *pparse_declarator_array_dims(PParseToken *tok, PParseDecl *d
 				}
 				if (decl->array_rank < 15) decl->array_rank++;
 				else decl->array_rank = PPARSE_ARRAY_RANK_WRAP_ALL;
+			} else {
+				if (!decl->ptr_array_rank)
+					decl->ptr_array_dim_complete = first && !pparse_match_ch(first, ']');
+				if (decl->ptr_array_rank < 15) decl->ptr_array_rank++;
+				else decl->ptr_array_rank = PPARSE_ARRAY_RANK_WRAP_ALL;
 			}
 			if (pparse_array_size_is_vla(tok)) decl->is_vla = true;
 			tok = pparse_skip_balanced_group(tok);
@@ -8732,9 +8851,31 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			PParseToken *param_end = pparse_match_ch(t, ',') ? t : close;
 			/* Skip definite built-in scalar params; all ambiguous/array types need entries. */
 			bool param_has_bracket = false;
+			/* `int a[static N]` -- C11 6.7.6.3p7 promises the argument points
+			 * at at least N elements, and that promise is the only extent an
+			 * array parameter carries. Record the bracket so the subscript can
+			 * be bounded by the literal N; every other array parameter decays
+			 * to a pointer with nothing to check against. Only the first
+			 * dimension is promised, and only when it is a plain constant. */
+			PParseToken *static_dim = NULL;
 			PPARSE_FOR_RANGE(s, param_start, param_end)
 				if (pparse_match_ch(s, '[') && (s->flags & PPARSE_TF_OPEN) && !(s->flags & PPARSE_TF_C23_ATTR)) {
 					param_has_bracket = true;
+					if (!static_dim) {
+						PParseToken *q = pparse_skip_noise(_pc, pparse_next(_pc, s));
+						PParseToken *cl = pparse_pair_known(s);
+						/* `[static const N]` and `[const static N]` are both
+						 * legal; skip the qualifiers either side. */
+						bool saw_static = false;
+						while (q && q != cl &&
+						       (q->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE))) {
+							saw_static |= pparse_equal(q, "static") != 0;
+							q = pparse_skip_noise(_pc, pparse_next(_pc, q));
+						}
+						if (saw_static && q && q != cl && q->kind == PPARSE_TK_NUM &&
+						    pparse_skip_noise(_pc, pparse_next(_pc, q)) == cl)
+							static_dim = s;
+					}
 					break;
 				}
 			bool has_vol_qual = false;
@@ -8811,6 +8952,10 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 					  is_atomic_param * PPARSE_BIND_ATOMIC;
 			pparse_register_parameter_binding(
 			    last_ident, brace_depth, scope_id, param_needs_shadow, traits);
+			if (static_dim && pparse_feat(PPARSE_F_BOUNDS_CHECK) &&
+			    !(last_ident->flags & PPARSE_TF_RAW))
+				pparse_register_static_extent_param(last_ident, 1,
+								    pparse_idx(_pc, static_dim));
 		}
 		if (pparse_match_ch(t, ',')) t = pparse_next(_pc, t);
 	}
@@ -8940,12 +9085,28 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 	if (pparse_feat(PPARSE_F_BOUNDS_CHECK)) {
 		bool base_array = (!is_raw) & plain & type->is_array;
 		bool own_array = decl->is_array & (!decl->paren_pointer | decl->paren_array);
+		/* `int (*p)[4]`: a pointer whose target type carries an extent. The
+		 * dimensions sit outside the declarator parens, so `paren_array` is
+		 * clear and the ordinary array path skips it. Register it with one
+		 * leading pointer hop, which leaves `p[i]` unchecked -- nothing says
+		 * how many arrays `p` points at -- while `p[0][i]` and `(*p)[i]` bound
+		 * against the `[4]`. Function pointers and `raw` are excluded, and a
+		 * dimension that is not a constant is not an extent worth trusting. */
+		bool ptr_to_array = (!is_raw) & (decl->ptr_array_rank > 0) & (!decl->is_func_ptr) &
+				    (!decl->is_vla) & decl->ptr_array_dim_complete &
+				    (decl->ptr_array_rank != PPARSE_ARRAY_RANK_WRAP_ALL);
+		if (ptr_to_array) {
+			int prank = decl->ptr_array_rank + 1;
+			if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+			pparse_register_array_binding_hops(
+			    decl->var_name, (uint8_t)prank, true, false, false, 1);
+		}
 		bool complete = (own_array & (decl->array_dim_complete | pparse_match_ch(decl->end, '='))) |
 				((!own_array) & ((!base_array) | type->array_dim_complete));
 		bool register_array = (!is_raw) &
 			((brace_depth > 0) | ((brace_depth == 0) & (own_array | base_array))) &
 			complete & (own_array | base_array) & (!decl->is_func_ptr);
-		if (!register_array && pparse_bounds_is_tracked_array(decl->var_name))
+		if (!register_array && !ptr_to_array && pparse_bounds_is_tracked_array(decl->var_name))
 			pparse_register_array_binding(decl->var_name, 0, false, false, true);
 		if (register_array) {
 			int rank = decl->array_rank + type->type_array_rank;
@@ -10073,6 +10234,11 @@ static bool p1d_lhs_is_const_shadow(PParseToken *start, PParseToken *eq_tok) {
 
 // 0 = not orelse; 1 = skip (fn/label/typedef-as-name); 2 = annotated as
 // decl-init orelse
+/* Every rejection below is about how the `orelse` *operator* may be spelled.
+ * With the feature off there is no operator: `-fno-orelse` means the word is an
+ * ordinary identifier, and an undeclared one is the backend's to complain
+ * about, in its own words. Diagnosing it here also made Prism unable to reparse
+ * its own output whenever an input used the name as a plain identifier. */
 static int p1d_try_annotate_init_orelse(PParseToken *t,
 					PParseToken *prev,
 					bool (*ending)(PParseToken *),
@@ -10080,7 +10246,9 @@ static int p1d_try_annotate_init_orelse(PParseToken *t,
 					int ternary_depth,
 					bool *out_has_orelse,
 					PParseToken **out_first_orelse) {
+	PPARSE_CTX();
 	if (!(t->tag & PPARSE_TT_ORELSE)) return 0;
+	if (!pparse_feat(PPARSE_F_ORELSE)) return 1;
 	if (pparse_is_known_function_call(t)) return 1;
 	/* `.orelse` / `->orelse` — member name, not the operator. The following
 	 * `orelse` (if any) is classified on the next iteration. */

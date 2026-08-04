@@ -140,8 +140,11 @@ static void fault_free(void *ptr) {
 #include <stdarg.h>
 
 #ifndef _WIN32
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -638,6 +641,22 @@ static int terms_present(const char *out, const char *terms, int present) {
 static long infra_retries;
 /* Sub-second-identity shapes that the host clock was too slow to construct. */
 static long slow_clock_skips;
+/* Spawn-refusal shapes this host would not let the suite construct. */
+static long spawn_refusal_skips;
+/* Runs that could not find the suite source to lint its action letters. */
+static long action_lint_skips;
+
+/* A machine that will not start a process is not a verdict on prism, even when
+ * the refusal is relayed through prism rather than around it. Fix 28 covered the
+ * harness's own `system()` calls and the driver transpile; a library call whose
+ * internal preprocessor spawn was refused still arrived here as PRISM_ERR_IO and
+ * was reported as a failure. Prism now names that case in the message, so it can
+ * be told apart from the preprocessor having run and disagreed, and retried. */
+static int prism_result_is_spawn_refusal(const PrismResult *r) {
+	return r->status == PRISM_ERR_IO && r->error_msg &&
+	       strstr(r->error_msg, "could not start the C preprocessor") != NULL;
+}
+
 
 #ifndef _WIN32
 static const char *backend_cc(void) {
@@ -808,6 +827,20 @@ static PRISM_COLD void exercise_out_str_dispatch(const char *s, int len) {
 	out_str(s, opaque_len);
 }
 
+/* mkdir that tolerates an existing directory; the recipe owns its own tree. */
+static int pp_mkdir_p(const char *path) {
+	if (mkdir(path, 0700) == 0) return 1;
+	return errno == EEXIST;
+}
+
+/* Cross a wall-clock second boundary. The cache refuses to record a file whose
+ * mtime has no sub-second part and is younger than two seconds, and comparing
+ * identities needs the rewrite to be distinguishable from the original. */
+static void pp_wait_for_next_second(void) {
+	time_t edge = time(NULL);
+	while (time(NULL) == edge) usleep(1000);
+}
+
 static int write_text_file(const char *path, const char *text) {
 	FILE *fp = fopen(path, "wb");
 	if (!fp) return 0;
@@ -914,7 +947,187 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			}
 			unlink(src);
 			unlink(hdr);
-		} else if (*p == 'Q') {
+		} else if (*p == 's') {
+			/* Action letters are dispatched by an if/else chain, so a letter
+			 * used twice silently disables the later branch: the first match
+			 * wins and the second test stops running without anything saying
+			 * so. That happened here -- four actions added in 1.1.7 shadowed
+			 * four existing ones, and the only symptom was tests quietly not
+			 * executing. A switch would make it a compile error, but its cases
+			 * would capture the `break`s the surrounding loop owns, so the
+			 * check is done on the source instead.
+			 *
+			 * The suite is always invoked with its own source path, so that
+			 * file is normally at hand; where it is not, this records a skip
+			 * rather than passing. */
+			static const char *const candidates[] = {".github/test.c", "test.c",
+								 "../.github/test.c"};
+			FILE *tf = NULL;
+			for (size_t i = 0; i < N(candidates) && !tf; i++)
+				tf = fopen(candidates[i], "r");
+			if (!tf) {
+				action_lint_skips++;
+			} else {
+				char line[1024];
+				int seen[256] = {0};
+				int dupes = 0, in_chain = 0;
+				char first_dupe = 0;
+				/* Scoped to run_internal: other dispatchers spell their own
+				 * letters the same way and are allowed to reuse them. */
+				while (fgets(line, sizeof line, tf)) {
+					const char *m;
+					if (strstr(line, "run_internal(const Recipe")) {
+						in_chain = 1;
+						continue;
+					}
+					if (!in_chain) continue;
+					if (strncmp(line, "static ", 7) == 0) break;
+					m = strstr(line, "(*p == '");
+					if (!m) continue;
+					m += 8;
+					if (!m[0] || m[1] != '\'') continue;
+					if (seen[(unsigned char)m[0]]++) {
+						if (!dupes) first_dupe = m[0];
+						dupes++;
+					}
+				}
+				fclose(tf);
+				if (dupes) {
+					fprintf(stderr,
+						"action letter '%c' handled more than once "
+						"(%d duplicate branch(es)); the later one is dead\n",
+						first_dupe, dupes);
+					ok = 0;
+				}
+			}
+		} else if (*p == 'p') {
+			/* A define that follows a header and is named by a `#pragma` has
+			 * to be emitted *after* that header, not hoisted to the top with
+			 * the rest. Hoisting it would let it shadow or pre-empt what the
+			 * header sets up, and no compile-or-run oracle can see the
+			 * difference here: GCC and Clang never expand pragma operands, so
+			 * sizeof is identical either way. Position is the whole property,
+			 * so position is what this asserts -- the define must land after
+			 * the last line marker naming the system header. */
+			/* The header is written here rather than borrowed from libc:
+			 * a system header's own content varies enough between hosts to
+			 * decide the assertion by itself. <limits.h> contributes no line
+			 * marker at all under GCC 11, and <stddef.h> under GCC 16 defines
+			 * nullptr_t, which stops compiling once the flattened output is
+			 * handed back with -std=gnu11. Neither says anything about prism. */
+			char src[PATH_MAX], hdrp[PATH_MAX];
+			ok = ok && snprintf(src, sizeof src, "/tmp/prism_recipe_pragmapos_%ld.c",
+					    (long)getpid()) > 0;
+			ok = ok && snprintf(hdrp, sizeof hdrp,
+					    "/tmp/prism_recipe_pragmapos_%ld.h",
+					    (long)getpid()) > 0;
+			char body[PATH_MAX + 256];
+			ok = ok && snprintf(body, sizeof body,
+					    "#include \"%s\"\n"
+					    "#define PRISM_PK_POS 1\n"
+					    "#pragma pack(push, PRISM_PK_POS)\n"
+					    "struct prism_pk_pos { char c; int x; };\n"
+					    "#pragma pack(pop)\n"
+					    "int prism_pk_pos_f(void){ "
+					    "return (int)sizeof(struct prism_pk_pos) + "
+					    "(int)sizeof(prism_pk_pos_marker); }\n",
+					    hdrp) > 0;
+			if (ok && write_text_file(hdrp, "typedef int prism_pk_pos_marker;\n") &&
+			    write_text_file(src, body)) {
+				PrismResult r = prism_transpile_file(src, prism_defaults());
+				ok = ok && r.status == PRISM_OK && r.output;
+				if (ok) {
+					const char *def = strstr(r.output, "#define PRISM_PK_POS 1");
+					const char *hdr = NULL, *scan = r.output;
+					const char *prag = strstr(r.output,
+								  "#pragma pack(push, PRISM_PK_POS)");
+					const char *base = strrchr(hdrp, '/');
+					base = base ? base + 1 : hdrp;
+					while ((scan = strstr(scan, base)) != NULL) {
+						hdr = scan;
+						scan += strlen(base);
+					}
+					/* Present, after the header, before the pragma that
+					 * needs it, and on a line of its own. */
+					ok = ok && def && hdr && prag && def > hdr && def < prag &&
+					     def > r.output && def[-1] == '\n';
+					ok = ok && compile_output(r.output, 0) == 0;
+				}
+				prism_free(&r);
+			}
+			unlink(hdrp);
+			unlink(src);
+		} else if (*p == 'r') {
+			/* The other half of action Q. Q covers a refusal the harness sees
+			 * directly; this covers one relayed through prism, which is what a
+			 * library call does when its own preprocessor spawn is refused.
+			 * Until prism named that case, it arrived as a plain PRISM_ERR_IO
+			 * and every cell using the file API turned a memory-starved
+			 * machine into a prism failure -- observed on a Mac with 14.9 GB
+			 * paged out, which exhausted the retry budget outright.
+			 *
+			 * The refusal is provoked for real rather than simulated: a child
+			 * lowers RLIMIT_NPROC below its current process count, so the fork
+			 * behind posix_spawnp fails with EAGAIN. It runs in a child
+			 * because the limit is per-process and the suite is threaded. A
+			 * host that will not let the limit bite -- some containers ignore
+			 * it -- is recorded as a skip, not a pass. */
+			char src[PATH_MAX];
+			ok = ok && snprintf(src, sizeof src, "/tmp/prism_recipe_refusal_%ld.c",
+					    (long)getpid()) > 0;
+			if (ok && write_text_file(src, "int prism_refusal_f(void){ return 0; }\n")) {
+				int pipefd[2];
+				ok = ok && pipe(pipefd) == 0;
+				if (ok) {
+					pid_t kid = fork();
+					if (kid == 0) {
+						struct rlimit rl;
+						char verdict = 'S'; /* skipped */
+						close(pipefd[0]);
+						if (getrlimit(RLIMIT_NPROC, &rl) == 0) {
+							rl.rlim_cur = 1;
+							if (setrlimit(RLIMIT_NPROC, &rl) == 0) {
+								PrismResult r = prism_transpile_file(
+								    src, prism_defaults());
+								/* Which errno the limit produces is the
+								 * host's choice: Linux fork reports EAGAIN,
+								 * but a sandbox that denies the call outright
+								 * reports EPERM, which is not transient and
+								 * must not be retried. Assert only what this
+								 * cell is about -- that a refusal prism did
+								 * record is named in the message it returns. */
+								if (r.status == PRISM_OK || !prism_spawn_refused)
+									verdict = 'S';
+								else
+									verdict = prism_result_is_spawn_refusal(&r)
+										      ? 'Y'
+										      : 'N';
+								prism_free(&r);
+							}
+						}
+						ssize_t unused = write(pipefd[1], &verdict, 1);
+						(void)unused;
+						close(pipefd[1]);
+						_exit(0);
+					}
+					close(pipefd[1]);
+					if (kid < 0) {
+						ok = 0;
+					} else {
+						char verdict = 0;
+						ssize_t n = read(pipefd[0], &verdict, 1);
+						int status = 0;
+						waitpid(kid, &status, 0);
+						if (n != 1 || verdict == 'S')
+							spawn_refusal_skips++;
+						else
+							ok = ok && verdict == 'Y';
+					}
+					close(pipefd[0]);
+				}
+			}
+			unlink(src);
+		} else if (*p == 'q') {
 			/* The harness has to tell a machine that refused to start a
 			 * process from a compiler that ran and said no. Conflating the two
 			 * is what turned five transient spawn refusals on a loaded laptop
@@ -957,6 +1170,91 @@ static int run_internal(const Recipe *r, char *failed_action) {
 				unlink(counter);
 			}
 			unlink(script);
+		} else if (*p == 'h') {
+			/* Header-bearing cache entries. The three ways a recorded header
+			 * can stop being the file the next preprocess would pick: it is
+			 * edited, something shadows it earlier in the search path, or a
+			 * symlink on the way to it is retargeted. The first is caught by
+			 * the header's own identity, the second by the search directories'
+			 * identities, the third by re-resolving the spelling. A stale hit
+			 * here compiles the wrong code silently, so all three are asserted
+			 * against real files rather than a constructed entry. */
+			char root[PATH_MAX], inc_a[PATH_MAX], inc_b[PATH_MAX];
+			char src[PATH_MAX], hdr_a[PATH_MAX], hdr_b[PATH_MAX];
+			char real_a[PATH_MAX], real_b[PATH_MAX], link[PATH_MAX], lsrc[PATH_MAX];
+			int paths_ok =
+			    snprintf(root, sizeof root, "/tmp/prism_recipe_hdrcache_%ld", (long)getpid()) > 0 &&
+			    snprintf(inc_a, sizeof inc_a, "%s/a", root) > 0 &&
+			    snprintf(inc_b, sizeof inc_b, "%s/b", root) > 0 &&
+			    snprintf(src, sizeof src, "%s/m.c", root) > 0 &&
+			    snprintf(hdr_a, sizeof hdr_a, "%s/h.h", inc_a) > 0 &&
+			    snprintf(hdr_b, sizeof hdr_b, "%s/h.h", inc_b) > 0 &&
+			    snprintf(real_a, sizeof real_a, "%s/ra.h", root) > 0 &&
+			    snprintf(real_b, sizeof real_b, "%s/rb.h", root) > 0 &&
+			    snprintf(link, sizeof link, "%s/l.h", root) > 0 &&
+			    snprintf(lsrc, sizeof lsrc, "%s/ls.c", root) > 0;
+			ok = ok && paths_ok && pp_mkdir_p(root) && pp_mkdir_p(inc_a) && pp_mkdir_p(inc_b);
+			if (ok) {
+				const char *inc[] = {inc_a, inc_b};
+				PrismFeatures f = prism_defaults();
+				f.flatten_headers = false;
+				f.include_paths = inc;
+				f.include_count = 2;
+				ok = ok && write_text_file(hdr_b, "#define HDRCACHE 41\n") &&
+				     write_text_file(src, "#include <h.h>\nint hv = HDRCACHE;\n");
+				/* prime, then a reuse that must produce the same text */
+				PrismResult r1 = prism_transpile_file(src, f);
+				PrismResult r2 = prism_transpile_file(src, f);
+				ok = ok && r1.status == PRISM_OK && r2.status == PRISM_OK && r1.output && r2.output &&
+				     strstr(r1.output, "41") && !strcmp(r1.output, r2.output);
+				prism_free(&r1);
+				prism_free(&r2);
+				/* edited header */
+				pp_wait_for_next_second();
+				ok = ok && write_text_file(hdr_b, "#define HDRCACHE 42\n");
+				PrismResult r3 = prism_transpile_file(src, f);
+				ok = ok && r3.status == PRISM_OK && r3.output && strstr(r3.output, "42");
+				prism_free(&r3);
+				/* a shadowing header appears earlier in the search path */
+				pp_wait_for_next_second();
+				ok = ok && write_text_file(hdr_a, "#define HDRCACHE 43\n");
+				PrismResult r4 = prism_transpile_file(src, f);
+				ok = ok && r4.status == PRISM_OK && r4.output && strstr(r4.output, "43");
+				prism_free(&r4);
+				/* a symlink on the path to the header is retargeted */
+				PrismFeatures g = prism_defaults();
+				g.flatten_headers = false;
+				ok = ok && write_text_file(real_a, "#define LINKED 51\n") &&
+				     write_text_file(real_b, "#define LINKED 52\n");
+				if (ok) {
+					char inc_line[PATH_MAX + 32];
+					snprintf(inc_line, sizeof inc_line, "#include \"%s\"\nint lv = LINKED;\n", link);
+					unlink(link);
+					ok = ok && symlink(real_a, link) == 0 && write_text_file(lsrc, inc_line);
+					PrismResult s1 = prism_transpile_file(lsrc, g);
+					PrismResult s2 = prism_transpile_file(lsrc, g);
+					ok = ok && s1.status == PRISM_OK && s2.status == PRISM_OK && s1.output &&
+					     s2.output && strstr(s1.output, "51") && !strcmp(s1.output, s2.output);
+					prism_free(&s1);
+					prism_free(&s2);
+					pp_wait_for_next_second();
+					unlink(link);
+					ok = ok && symlink(real_b, link) == 0;
+					PrismResult s3 = prism_transpile_file(lsrc, g);
+					ok = ok && s3.status == PRISM_OK && s3.output && strstr(s3.output, "52");
+					prism_free(&s3);
+				}
+			}
+			unlink(hdr_a);
+			unlink(hdr_b);
+			unlink(src);
+			unlink(real_a);
+			unlink(real_b);
+			unlink(link);
+			unlink(lsrc);
+			rmdir(inc_a);
+			rmdir(inc_b);
+			rmdir(root);
 		} else if (*p == 'X') {
 			/* pp_cache_dir() resolves PRISM_PP_CACHE_DIR once per thread and
 			 * caches it, so this action cannot redirect itself at a private
@@ -1470,7 +1768,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 					ok = 0;
 				} else {
 					int wrote = fputs(PP_CACHE_MAGIC, fp) >= 0 &&
-						    fputs("deps 0\npayload 9223372036854775807\n", fp) >= 0;
+						    fputs("deps 0\ndirs 0\npayload 9223372036854775807\n", fp) >= 0;
 					if (fclose(fp) != 0) wrote = 0;
 					ok = ok && wrote;
 				}
@@ -1481,7 +1779,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 				if (!fp) {
 					ok = 0;
 				} else {
-					int wrote = fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 1\ninvalid dependency\npayload 0\n", fp) >= 0;
+					int wrote = fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 1\ninvalid dependency\ninvalid dependency\ndirs 0\npayload 0\n", fp) >= 0;
 					if (fclose(fp) != 0) wrote = 0;
 					ok = ok && wrote;
 				}
@@ -1500,7 +1798,7 @@ static int run_internal(const Recipe *r, char *failed_action) {
 					ok = 0;
 				} else {
 					FILE *fp = fopen(checked_path, "wb");
-					int wrote = fp && fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 0\n", fp) >= 0 &&
+					int wrote = fp && fputs(PP_CACHE_MAGIC, fp) >= 0 && fputs("deps 0\ndirs 0\n", fp) >= 0 &&
 						fprintf(fp, "payload %zu %016llx %016llx\n", sizeof checked_payload - 1,
 							(unsigned long long)checked_sum.a, (unsigned long long)checked_sum.b) > 0 &&
 						fwrite(checked_payload, 1, sizeof checked_payload - 1, fp) == sizeof checked_payload - 1;
@@ -2376,6 +2674,11 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 		fwrite(src, 1, strlen(src), fp);
 		fclose(fp);
 		x = prism_transpile_file(path, f);
+		for (int retry = 0; retry < 4 && prism_result_is_spawn_refusal(&x); retry++) {
+			prism_free(&x);
+			infra_retries++;
+			x = prism_transpile_file(path, f);
+		}
 		unlink(path);
 #else
 		st->skipped++;
@@ -2384,6 +2687,11 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 #endif
 	} else {
 		x = prism_transpile_source(src, "recipe.c", f);
+		for (int retry = 0; retry < 4 && prism_result_is_spawn_refusal(&x); retry++) {
+			prism_free(&x);
+			infra_retries++;
+			x = prism_transpile_source(src, "recipe.c", f);
+		}
 	}
 	int result_shape_ok = x.status == PRISM_OK
 		? x.output && x.output_len == strlen(x.output)
@@ -3878,7 +4186,7 @@ static const char *const av_run_sep[] = {"prism", "run", "x.c", "--", "--flag"};
 
 static const Recipe recipes[] = {
 	{"internal/platform", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
-	 NULL, NULL, NULL, 0, "KCSPODAFJTRMNYZWGILB"},
+	 NULL, NULL, NULL, 0, "KCSPODAFJTRMNYZWGILBH"},
 	{"internal/system-header-ordering", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "b"},
 	{"internal/api-reset", NULL, NULL, {0}, O_INTERNAL, 0, 0, 0, NULL, NULL, NULL, 0, "Q"},
@@ -4719,8 +5027,136 @@ static const Recipe recipes[] = {
 	{"runtime/shadowed-defer-identifier-still-emitted",
 	 "typedef int defer;int main(void){defer d=7;return d==7?0:1;}", NULL,
 	 {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX, "defer d", NULL},
+	/* `int (*p)[4]` carries its extent in the type, so the inner subscript is
+	 * checkable even though `p` is a pointer. `*p` and `p[0]` denote the same
+	 * object, so both spellings bound against `sizeof(p[0])/sizeof(p[0][0])`.
+	 * The outer subscript must stay unchecked: nothing says how many arrays
+	 * `p` points at. */
+	{"runtime/bounds-ptr-to-array-inbounds",
+	 "int main(void){int a[4]={10,20,30,40};int (*p)[4]=&a;volatile int i=3;"
+	 "return (p[0][i]==40 && (*p)[i]==40 && (*(p))[i]==40)?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-ptr-to-array-traps-subscript",
+	 "int main(void){int a[4]={0};int (*p)[4]=&a;volatile int i=4;return p[0][i];}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-ptr-to-array-traps-deref",
+	 "int main(void){int a[4]={0};int (*p)[4]=&a;volatile int i=4;return (*p)[i];}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-ptr-to-array-bound-shape",
+	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return p[0][i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(p[0])/sizeof(p[0][0])", NULL},
+	{"exact/bounds-ptr-to-array-deref-bound-shape",
+	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return (*p)[i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(p[0])/sizeof(p[0][0])", NULL},
+	/* The pointer hop itself has no extent, so `p[i]` must not be wrapped --
+	 * `sizeof(p)/sizeof(p[0])` would be 0 and trap on every access. */
+	{"exact/bounds-ptr-to-array-outer-unchecked",
+	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return p[i][0];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])"},
+	/* C11 6.7.6.3p7: `int a[static N]` promises the argument points at at least
+	 * N elements. That promise is the only extent an array parameter has -- it
+	 * decays to a pointer, so a sizeof ratio would measure the pointer. The
+	 * bound is the literal N. */
+	{"runtime/bounds-static-param-inbounds",
+	 "static int f(int a[static 4],int i){return a[i];}"
+	 "int main(void){int a[6]={1,2,3,4,5,6};volatile int i=3;return f(a,i)==4?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-static-param-traps",
+	 "static int f(int a[static 4],int i){return a[i];}"
+	 "int main(void){int a[6]={0};volatile int i=4;return f(a,i);}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-static-param-literal-extent",
+	 "int f(int a[static 4],int i){return a[i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", "sizeof(a)/sizeof(a[0])"},
+	{"exact/bounds-static-param-qualified",
+	 "int f(int a[static const 4],int i){return a[i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", NULL},
+	/* An array parameter without the promise has no extent at all and must stay
+	 * unwrapped: `sizeof(a)/sizeof(a[0])` would measure the pointer. */
+	{"exact/bounds-plain-array-param-unchecked",
+	 "int f(int a[4],int i){return a[i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
+	{"exact/bounds-pointer-param-unchecked",
+	 "int f(int *a,int i){return a[i];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
+	/* `-fno-orelse` means the word is an ordinary identifier. Every rejection
+	 * in the initializer scanner is about how the *operator* may be spelled, so
+	 * with the feature off none of them applies -- an undeclared identifier is
+	 * the backend's to complain about, in its own words. Diagnosing it here
+	 * also stopped Prism reparsing its own output whenever an input used the
+	 * name as a plain identifier. */
+	{"exact/no-orelse-identifier-passes-through",
+	 "int f(int w){ int j = w || orelse; return j; }", NULL,
+	 {0}, O_OK, 0, FB_ORELSE | FB_LINE, 0, "w || orelse", NULL},
+	{"runtime/no-orelse-declared-identifier",
+	 "int orelse = 7;int main(void){int j = 0 || orelse;return j==1?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, 0, FB_ORELSE | FB_LINE, CAP_POSIX},
+	/* With the feature on, the operator's placement rules still hold. */
+	{"reject/orelse-operator-still-diagnosed",
+	 "int g(void);void f(void){ int x = int orelse 1; (void)x; }", NULL,
+	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0},
+	/* No preprocessor expands a `#pragma`'s operands, so a macro named there is
+	 * the one define flattening cannot drop: the emitted pragma still says
+	 * `PRISM_PK`, and without the define a backend that does expand operands at
+	 * compile time sees a malformed pragma where the source had a working one.
+	 * A define that follows a header cannot be hoisted above it -- it may be
+	 * completing or shadowing what the header set up -- so it is emitted in
+	 * place, immediately before the pragma that needs it. That splice lands
+	 * between ordinary tokens, which is why the after-include cells carry
+	 * O_COMPILE: the first version of it glued `#define` onto the tail of the
+	 * preceding line and every one of these stopped compiling. */
+	{.id = "pragma/define-before-include-survives",
+	 .source = "#define PRISM_PK 1\n"
+		   "#pragma pack(push, PRISM_PK)\n"
+		   "struct prism_pk_s { char c; int x; };\n"
+		   "#pragma pack(pop)\n"
+		   "int f(void){ return (int)sizeof(struct prism_pk_s); }",
+	 .oracle = O_OK | O_FILE | O_COMPILE, .requires = CAP_POSIX,
+	 .must_have = "#define PRISM_PK 1"},
+	{.id = "pragma/define-after-include-survives",
+	 .source = "#include <limits.h>\n"
+		   "#define PRISM_PK 1\n"
+		   "#pragma pack(push, PRISM_PK)\n"
+		   "struct prism_pk_s { char c; int x; };\n"
+		   "#pragma pack(pop)\n"
+		   "int f(void){ return (int)sizeof(struct prism_pk_s); }",
+	 .oracle = O_OK | O_FILE | O_COMPILE, .requires = CAP_POSIX,
+	 .must_have = "#define PRISM_PK 1"},
+	{.id = "pragma/define-after-include-two-pragmas",
+	 .source = "#include <limits.h>\n"
+		   "#define PRISM_PK 1\n"
+		   "#pragma pack(push, PRISM_PK)\n"
+		   "struct prism_pk_s { char c; int x; };\n"
+		   "#pragma pack(pop)\n"
+		   "#pragma pack(push, PRISM_PK)\n"
+		   "struct prism_pk_t { char c; double d; };\n"
+		   "#pragma pack(pop)\n"
+		   "int f(void){ return (int)(sizeof(struct prism_pk_s) + "
+		   "sizeof(struct prism_pk_t)); }",
+	 .oracle = O_OK | O_FILE | O_COMPILE, .requires = CAP_POSIX,
+	 .must_have = "#define PRISM_PK 1"},
+	/* The narrowness is the point: flattening still drops every source define
+	 * no surviving pragma names. Without this cell the fix above could be
+	 * "hoist everything" and nothing would notice. */
+	{.id = "pragma/unreferenced-define-still-dropped",
+	 .source = "#include <limits.h>\n"
+		   "#define PRISM_UNREFERENCED_PK 1\n"
+		   "#pragma pack(push, 1)\n"
+		   "struct prism_pk_s { char c; int x; };\n"
+		   "#pragma pack(pop)\n"
+		   "int f(void){ return (int)sizeof(struct prism_pk_s); }",
+	 .oracle = O_OK | O_FILE | O_COMPILE, .requires = CAP_POSIX,
+	 .must_not_have = "PRISM_UNREFERENCED_PK"},
+	{"internal/action-letters-unique", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "s"},
+	{"internal/header-cache", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "h"},
+	{"internal/pragma-define-position", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "p"},
+	{"internal/spawn-refusal-relayed", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "r"},
 	{"internal/spawn-classification", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
-	 NULL, NULL, NULL, 0, "Q"},
+	 NULL, NULL, NULL, 0, "q"},
 	{"internal/cache-cleanup", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "X"},
 };
@@ -4737,6 +5173,16 @@ int main(void) {
 			"NOTE: %ld sub-second file-identity check(s) skipped: this host could not "
 			"write, preprocess and rewrite inside one clock second\n",
 			slow_clock_skips);
+	if (action_lint_skips)
+		fprintf(stderr,
+			"NOTE: %ld action-letter lint(s) skipped: the suite source was not "
+			"found relative to the working directory\n",
+			action_lint_skips);
+	if (spawn_refusal_skips)
+		fprintf(stderr,
+			"NOTE: %ld spawn-refusal check(s) skipped: this host would not let the "
+			"suite make a spawn fail\n",
+			spawn_refusal_skips);
 	if (infra_retries)
 		fprintf(stderr,
 			"NOTE: %ld process spawn(s) were refused by the machine and retried "

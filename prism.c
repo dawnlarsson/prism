@@ -73,6 +73,12 @@ typedef struct {
 	char *text;
 	char *guard;
 	int guard_depth;
+	/* Defined after the first top-level include, so it cannot be hoisted: a
+	 * define that follows a header may deliberately shadow or complete what the
+	 * header set up. Kept only so a `#pragma` naming it can have it emitted in
+	 * place, immediately before that pragma. */
+	bool post_include;
+	bool emitted;
 } SourceDefine;
 
 /* Thread-local driver/emitter state; parse.c owns language state. */
@@ -114,6 +120,7 @@ typedef struct {
 	int bracket_dim_cap;
 	int bracket_dim_next; // Next dim temp to consume during emit
 	SourceDefine *source_defines; // Preserved source macros and optional condition guards
+	bool source_defines_for_pragma_only;
 	int source_define_count;
 	int source_define_cap;
 	char *active_membuf; // open_memstream buffer; freed on longjmp recovery
@@ -834,6 +841,108 @@ static void free_consumed_defs(ConsumedDef *defs, int n) {
 	free(defs);
 }
 
+/* The macro name a stored define declares, or NULL. */
+static const char *pp_define_name(const char *text, size_t *out_len) {
+	/* Stored defines are `-D` specs (`NAME=value`, `NAME(args)=body`, or bare
+	 * `NAME`), not `#define` lines. The name is the leading identifier either
+	 * way; accept a `#define` prefix too so the shape cannot surprise us. */
+	const char *n = text;
+	size_t nlen = 0;
+	while (*n == ' ' || *n == '\t') n++;
+	if (*n == '#') {
+		n++;
+		while (*n == ' ' || *n == '\t') n++;
+		if (strncmp(n, "define", 6) == 0) {
+			n += 6;
+			while (*n == ' ' || *n == '\t') n++;
+		}
+	}
+	while (n[nlen] && (isalnum((unsigned char)n[nlen]) || n[nlen] == '_')) nlen++;
+	if (!nlen) return NULL;
+	*out_len = nlen;
+	return n;
+}
+
+/* True if `t` is a `#pragma` directive naming the macro `n` as a whole word. */
+static bool pp_dir_is_pragma_naming(PParseToken *t, const char *n, size_t nlen) {
+	PPARSE_CTX();
+	const char *l, *e;
+	if (t->kind != PPARSE_TK_PREP_DIR) return false;
+	l = pparse_loc(_pc, t);
+	e = l + t->len;
+	{
+		bool is_pragma = false;
+		for (const char *q = l; q + 6 <= e; q++)
+			if (strncmp(q, "pragma", 6) == 0) {
+				is_pragma = true;
+				break;
+			}
+		if (!is_pragma) return false;
+	}
+	for (const char *q = l; q + nlen <= e; q++) {
+		if (strncmp(q, n, nlen) != 0) continue;
+		if (q > l && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) continue;
+		if (q + nlen < e && (isalnum((unsigned char)q[nlen]) || q[nlen] == '_')) continue;
+		return true;
+	}
+	return false;
+}
+
+static bool pp_pragma_names_define(const char *text) {
+	PPARSE_CTX();
+	size_t nlen;
+	const char *n = pp_define_name(text, &nlen);
+	if (!n) return false;
+	for (uint32_t i = 1; i < pparse_token_count; i++)
+		if (pp_dir_is_pragma_naming(&pparse_token_pool[i], n, nlen)) return true;
+	return false;
+}
+
+/* Emit just the source defines a surviving pragma names. The flatten path does
+ * not re-emit defines at all -- it hands the preprocessed stream through -- but
+ * a pragma operand is the one thing the preprocessor leaves unexpanded, so
+ * dropping its define changes what the backend sees. */
+static void emit_pragma_referenced_defines(void) {
+	PRISM_STATE();
+	for (int i = 0; i < _ps->source_define_count; i++) {
+		if (_ps->source_defines[i].post_include) continue; /* emitted at its pragma */
+		if (!pp_pragma_names_define(_ps->source_defines[i].text)) continue;
+		_ps->source_defines[i].emitted = true;
+		const char *guard = _ps->source_defines[i].guard;
+		if (guard) out_str(guard, strlen(guard));
+		emit_define_guarded(_ps->source_defines[i].text);
+		if (guard)
+			for (int d = 0; d < _ps->source_defines[i].guard_depth; d++) OUT_LIT("#endif\n");
+	}
+}
+
+/* A define that follows a header cannot be hoisted, so if a `#pragma` names it
+ * the define is emitted right where that pragma is -- after the header, before
+ * the directive that needs it. Once per define: a second pragma naming the same
+ * macro sees the one already emitted. */
+static void emit_post_include_pragma_define(PParseToken *t) {
+	PRISM_STATE();
+	if (t->kind != PPARSE_TK_PREP_DIR) return;
+	for (int i = 0; i < _ps->source_define_count; i++) {
+		SourceDefine *sd = &_ps->source_defines[i];
+		size_t nlen;
+		const char *n;
+		if (!sd->post_include || sd->emitted) continue;
+		n = pp_define_name(sd->text, &nlen);
+		if (!n || !pp_dir_is_pragma_naming(t, n, nlen)) continue;
+		sd->emitted = true;
+		/* A directive has to start its own line and the token before this one
+		 * is ordinary code, so an unconditional newline is the only safe
+		 * choice; out_end_directive_line only covers a preceding directive.
+		 * The stream's own #line marker before the pragma restores position. */
+		out_char('\n');
+		if (sd->guard) out_str(sd->guard, strlen(sd->guard));
+		emit_define_guarded(sd->text);
+		if (sd->guard)
+			for (int d = 0; d < sd->guard_depth; d++) OUT_LIT("#endif\n");
+	}
+}
+
 static void emit_consumed_defines(void) {
 	PRISM_STATE();
 	bool user_undef_gnu = false;
@@ -879,6 +988,17 @@ static void emit_consumed_defines(void) {
 	free_consumed_defs(defs, def_n);
 
 	for (int i = 0; i < _ps->source_define_count; i++) {
+		/* In flatten mode only the defines a surviving pragma names are kept.
+		 * `#pragma pack(push, N)` is the case that matters: no preprocessor
+		 * expands a pragma's operands, so the emitted pragma still says `N`,
+		 * and without the define the backend sees a malformed pragma where the
+		 * original source had a working one. Whether a given backend expands
+		 * pragma operands at compile time stops mattering once the define is
+		 * there -- it does whatever it would have done with the original. */
+		if (_ps->source_defines[i].post_include) continue;
+		if (_ps->source_defines_for_pragma_only &&
+		    !pp_pragma_names_define(_ps->source_defines[i].text))
+			continue;
 		const char *guard = _ps->source_defines[i].guard;
 		if (!guard) {
 			emit_define_guarded(_ps->source_defines[i].text);
@@ -1433,6 +1553,11 @@ static PParseToken *emit_expr_to_stop(PParseToken *tok, PParseToken *stop) {
 			continue;
 		}
 		if (pparse_match_ch(tok, ';') || (stop && tok == stop)) break;
+		/* Same bound as the other expression walks: every brace that can
+		 * legally appear inside an expression is balanced and was consumed by
+		 * walk_balanced above, so a `}` here closes the block the expression
+		 * lives in and the statement had no terminator. */
+		if (pparse_match_ch(tok, '}')) pparse_error_tok(tok, "missing ';' after expression");
 		EMIT_TRY_TYPEOF_ORELSE(tok)
 		tok = emit_advance(tok);
 	}
@@ -1816,6 +1941,14 @@ static PParseToken *try_bounds_check_subscript(PParseToken *tok) {
 			}
 			t = emit_advance(t);
 		}
+	}
+	if (plan.static_extent) {
+		/* `int a[static N]`: the parameter is a pointer, so the bound is the
+		 * promised element count, not a sizeof ratio over the decayed type. */
+		OUT_LIT("), (__prism_bchk_size_t)(");
+		out_str(pparse_loc(_pc, plan.static_extent), plan.static_extent->len);
+		OUT_LIT("))]");
+		return pparse_next(_pc, close);
 	}
 	OUT_LIT("), sizeof(");
 	out_str(pparse_loc(_pc, plan.arr), plan.arr->len);
@@ -2274,6 +2407,12 @@ static void emit_noise_between_raws(PParseToken *first_raw, PParseToken *last_ra
 static void emit_typeof_memsets(PParseToken **vars, int count, bool has_volatile, bool has_const) {
 	PRISM_STATE();
 	PPARSE_CTX();
+	/* Both spellings are runtime statements -- a byte loop, or a memset call.
+	 * Neither is legal outside a function, and an object at file scope is
+	 * already zero-initialised by the language, so there is nothing to do.
+	 * Malformed input can reach here at file scope (a stray brace block), and
+	 * emitting the loop there produced C that Prism could not reparse. */
+	if (current_func_idx < 0) return;
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
 	bool use_loop = has_volatile || target_is_msvc();
@@ -3441,17 +3580,31 @@ static void prism_nap_ms(long ms) {
 #endif
 }
 
+/* Set to the errno when a spawn was refused by the machine (rather than the
+ * program running and failing), so a diagnostic can name the real cause. */
+static PRISM_THREAD_LOCAL int prism_spawn_refused;
+
 /* Parameters match windows.c's `posix_spawnp` shim rather than the POSIX
  * prototype: the shim is the stricter of the two, and a non-const argument
  * converts implicitly to POSIX's const one but not the other way round. */
 static int prism_spawn_retry(pid_t *pid, const char *file, posix_spawn_file_actions_t *fa,
 			     char **argv, char **envp) {
 	int err = 0;
-	for (int attempt = 0; attempt < 5; attempt++) {
+	prism_spawn_refused = 0;
+	/* Backoff totalling ~2.8s. The earlier budget was five tries over 0.2s,
+	 * which a machine deep in swap can refuse straight through: a run on a Mac
+	 * with 14.9 GB paged out exhausted it repeatedly, and each exhaustion is
+	 * reported as a translation failure. Waiting longer costs nothing on a
+	 * healthy machine, where the first attempt succeeds. */
+	for (int attempt = 0; attempt < 9; attempt++) {
 		err = posix_spawnp(pid, file, fa, NULL, argv, envp);
 		if ((err != EAGAIN) & (err != ETXTBSY) & (err != ENOMEM)) break;
-		prism_nap_ms(20L * (attempt + 1));
+		prism_nap_ms(20L * (1L << (attempt < 4 ? attempt : 4)));
 	}
+	/* Remember a refusal so the caller can say the machine would not start the
+	 * process, rather than reporting it as the preprocessor having run and
+	 * disagreed. The two need different responses and only one is about C. */
+	if (err == EAGAIN || err == ETXTBSY || err == ENOMEM) prism_spawn_refused = err;
 	return err;
 }
 
@@ -3999,7 +4152,11 @@ static void collect_source_defines(const char *input_file) {
 	PRISM_STATE();
 	PPARSE_CTX();
 	free_source_defines();
-	if (pparse_feat(PPARSE_F_FLATTEN)) return;
+	/* Flatten mode used to skip this entirely. It still emits none of these
+	 * defines by default, but a surviving `#pragma` may name one as an operand,
+	 * and the preprocessor does not expand those -- so the define has to
+	 * survive with it. See pp_pragma_names_define. */
+	_ps->source_defines_for_pragma_only = pparse_feat(PPARSE_F_FLATTEN) != 0;
 	FILE *f = fopen(input_file, "r");
 	if (!f) return;
 	char *line = NULL;
@@ -4011,6 +4168,7 @@ static void collect_source_defines(const char *input_file) {
 	char *raw_delim = NULL;		    // delimiter for the current raw string (malloc'd)
 	int raw_delim_len = 0;
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
+	bool post_include = false;
 	bool out_of_memory = false;
 
 	typedef struct {
@@ -4172,8 +4330,14 @@ static void collect_source_defines(const char *input_file) {
 			goto check_continuation;
 		}
 
-		/* Only the prefix before the first top-level include is safe to hoist. */
-		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
+		/* Only the prefix before the first top-level include is safe to hoist.
+		 * Scanning continues past it solely to catch a define a later `#pragma`
+		 * names; those entries are flagged and never hoisted. Continuing costs
+		 * nothing on the common file, which has no pragma at all. */
+		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) {
+			post_include = true;
+			goto check_continuation;
+		}
 		if (cond_depth > 0) {
 			bool can_extract = true;
 			for (int d = 0; d < cond_depth; d++) {
@@ -4418,7 +4582,8 @@ static void collect_source_defines(const char *input_file) {
 				_ps->source_defines = defs;
 				_ps->source_define_cap = (int)nc;
 			}
-			_ps->source_defines[_ps->source_define_count++] = (SourceDefine){def, guard, cond_depth};
+			_ps->source_defines[_ps->source_define_count++] =
+				(SourceDefine){def, guard, cond_depth, post_include, false};
 		}
 	check_continuation: {
 		char *end = source_newline_end(line);
@@ -4524,7 +4689,7 @@ static const char *prism_file_input_error(const char *path) {
 }
 
 /* Preprocessed-output cache: every validation uncertainty is a miss. */
-#define PP_CACHE_MAGIC "PRISMPPC3\n"
+#define PP_CACHE_MAGIC "PRISMPPC4\n"
 
 /* Zero means unavailable; recent second-resolution files are not cached. */
 #if defined(_WIN32)
@@ -4886,7 +5051,7 @@ static char *pp_cache_load(const PPKey *k) {
 	char *out = NULL;
 	FILE *f = NULL;
 	PPStat file_id;
-	long ndeps = 0;
+	long ndeps = 0, ndirs = 0;
 	unsigned long long plen = 0, sum_a = 0, sum_b = 0;
 	size_t payload_len = 0;
 	long i = 0;
@@ -4899,12 +5064,6 @@ static char *pp_cache_load(const PPKey *k) {
 	if (!fgets(line, sizeof line, f) || strcmp(line, PP_CACHE_MAGIC) != 0) goto done;
 	if (!fgets(line, sizeof line, f) || sscanf(line, "deps %ld", &ndeps) != 1) goto done;
 	if ((ndeps < 0) | (ndeps > 65536)) goto done;
-	/* A selected header alone is not a full model of header-search resolution:
-	 * a new earlier -I candidate or a retargeted symlink can change the next
-	 * preprocess without touching the recorded target. Persist only standalone
-	 * main-source output until cache entries can carry search-path snapshots. */
-	if (ndeps > 1) goto done;
-
 	for (i = 0; i < ndeps; i++) {
 		PPStat rec, now;
 		int off = 0;
@@ -4919,10 +5078,51 @@ static char *pp_cache_load(const PPKey *k) {
 		pl = strlen(p);
 		while (pl && (p[pl - 1] == '\n' || p[pl - 1] == '\r')) p[--pl] = '\0';
 		if ((pl == 0) | !pp_stat_id(p, &now)) goto done;
+		{
+			/* The spelling this dependency was reached by must still resolve
+			 * to the same file. A retargeted symlink leaves the recorded
+			 * target untouched and would otherwise read as unchanged. */
+			char rawline[PATH_MAX + 128], resolved[PATH_MAX], canon[PATH_MAX];
+			size_t rl;
+			if (!fgets(rawline, sizeof rawline, f)) goto done;
+			rl = strlen(rawline);
+			while (rl && (rawline[rl - 1] == '\n' || rawline[rl - 1] == '\r')) rawline[--rl] = '\0';
+			if (!rl) goto done;
+			if (!realpath(rawline, resolved)) goto done;
+			if (!realpath(p, canon)) goto done;
+			if (strcmp(resolved, canon) != 0) goto done;
+		}
 		if ((now.size != rec.size) | (now.mtime_sec != rec.mtime_sec) |
 		    (now.mtime_nsec != rec.mtime_nsec) | (now.ctime_sec != rec.ctime_sec) |
 		    (now.ctime_nsec != rec.ctime_nsec) | (now.device != rec.device) |
 		    (now.inode != rec.inode))
+			goto done;
+	}
+
+	/* Watched directories. A recorded header's identity says nothing about a
+	 * file that has since appeared ahead of it in the search path, or a
+	 * symlink retargeted beside it; both move the containing directory's
+	 * mtime. An entry naming headers is only reused if none of them moved. */
+	if (!fgets(line, sizeof line, f) || sscanf(line, "dirs %ld", &ndirs) != 1) goto done;
+	if ((ndirs < 0) | (ndirs > 4096)) goto done;
+	if ((ndeps > 1) & (ndirs == 0)) goto done;
+	for (i = 0; i < ndirs; i++) {
+		PPStat rec, now;
+		int off = 0;
+		char *p = NULL;
+		size_t pl = 0;
+		if (!fgets(line, sizeof line, f)) goto done;
+		if ((sscanf(line, "%lld %lld %lld %lld %lld %llu %llu %n", &rec.size, &rec.mtime_sec,
+			    &rec.mtime_nsec, &rec.ctime_sec, &rec.ctime_nsec, &rec.device, &rec.inode, &off) < 7) |
+		    (off <= 0))
+			goto done;
+		p = line + off;
+		pl = strlen(p);
+		while (pl && (p[pl - 1] == '\n' || p[pl - 1] == '\r')) p[--pl] = '\0';
+		if ((pl == 0) | !pp_stat_id(p, &now)) goto done;
+		if ((now.mtime_sec != rec.mtime_sec) | (now.mtime_nsec != rec.mtime_nsec) |
+		    (now.ctime_sec != rec.ctime_sec) | (now.ctime_nsec != rec.ctime_nsec) |
+		    (now.device != rec.device) | (now.inode != rec.inode))
 			goto done;
 	}
 
@@ -5083,11 +5283,138 @@ static void pp_cache_prune(void) {
 	free(s.v);
 }
 
-static void pp_cache_store(const PPKey *k, const char *input_file, const char *payload, size_t len) {
-	enum { MAX_DEPS = 4096 };
+#ifndef _WIN32
+/* Same shape as spawn_capture_stdout, but the interesting output of `-E -v` is
+ * on stderr; stdout (the preprocessed empty file) is discarded. */
+static ssize_t spawn_capture_stderr(char **argv, char *buf, size_t bufsize) {
+	int pipefd[2];
+	if (pipe(pipefd) != 0) return -1;
+	char **env = build_clean_environ();
+	if (!env) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull >= 0) {
+		posix_spawn_file_actions_adddup2(&actions, devnull, STDOUT_FILENO);
+		posix_spawn_file_actions_addclose(&actions, devnull);
+	}
+	pid_t pid;
+	int err = prism_spawn_retry(&pid, argv[0], &actions, argv, env);
+	free(env);
+	posix_spawn_file_actions_destroy(&actions);
+	close(pipefd[1]);
+	if (devnull >= 0) close(devnull);
+	if (err) {
+		close(pipefd[0]);
+		buf[0] = '\0';
+		return -1;
+	}
+	ssize_t total = 0;
+	for (;;) {
+		ssize_t r = read(pipefd[0], buf + total, bufsize - 1 - (size_t)total);
+		if (r < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (r == 0) break;
+		total += r;
+		if ((size_t)total >= bufsize - 1) break;
+	}
+	close(pipefd[0]);
+	buf[total] = '\0';
+	wait_for_child(pid);
+	return total;
+}
+
+#endif
+
+/* Directories whose contents can change which file an include resolves to.
+ *
+ * Recording a header's identity is not enough on its own: a file appearing in a
+ * directory that is searched *before* the one a header came from changes the
+ * next preprocess without touching anything recorded. Directory mtime moves
+ * when an entry is created, removed, renamed or retargeted, so watching the
+ * search path plus each dependency's own directory closes that hole for one
+ * stat per directory and no extra work on a hit.
+ *
+ * The list comes from the backend itself (`-E -v` on an empty input prints it
+ * between two fixed banners), with the same flags as the real preprocess so
+ * `-I`, `-isystem` and `-nostdinc` are all reflected. Every failure path
+ * returns -1, and the caller then declines to publish a header-bearing entry:
+ * an entry that cannot name what it depends on must not exist. */
+#ifndef _WIN32
+static int pp_search_dirs(char **argv, int argc, const char *input_file, char (*out)[PATH_MAX], int max) {
+	enum { PROBE_CAP = 1 << 16 };
+	char *buf = NULL, **probe = NULL;
+	const char *begin = "#include <...> search starts here:";
+	const char *end = "End of search list.";
+	char *b = NULL, *e = NULL, *l = NULL;
+	int n = 0, pargc = 0;
+	ssize_t got;
+
+	buf = malloc(PROBE_CAP);
+	probe = calloc((size_t)argc + 6, sizeof *probe);
+	if (!buf || !probe) goto fail;
+	for (int i = 0; i < argc && argv[i]; i++) {
+		/* Drop the translation unit: the search path is a function of the
+		 * flags, and re-preprocessing the real input here would cost as much
+		 * as the miss being recorded. An empty C file replaces it below --
+		 * spelled with `-x c`, since /dev/null has no recognised suffix. */
+		if (input_file && strcmp(argv[i], input_file) == 0) continue;
+		probe[pargc++] = argv[i];
+	}
+	probe[pargc++] = (char *)"-v";
+	probe[pargc++] = (char *)"-x";
+	probe[pargc++] = (char *)"c";
+	probe[pargc++] = (char *)"/dev/null";
+	probe[pargc] = NULL;
+	got = spawn_capture_stderr(probe, buf, PROBE_CAP);
+	if (got <= 0) goto fail;
+	buf[got] = '\0';
+	b = strstr(buf, begin);
+	e = b ? strstr(b, end) : NULL;
+	if (!b || !e) goto fail;
+	for (l = b + strlen(begin); l < e;) {
+		char *nl = strchr(l, '\n');
+		char *stop = (nl && nl < e) ? nl : e;
+		char raw[PATH_MAX];
+		size_t len;
+		while (l < stop && (*l == ' ' || *l == '\t')) l++;
+		len = (size_t)(stop - l);
+		while (len && (l[len - 1] == '\r' || l[len - 1] == ' ')) len--;
+		if (len && len < sizeof raw) {
+			memcpy(raw, l, len);
+			raw[len] = '\0';
+			if (n >= max) goto fail;
+			/* A directory that does not resolve cannot shadow anything. */
+			if (realpath(raw, out[n])) n++;
+		}
+		if (!nl || nl >= e) break;
+		l = nl + 1;
+	}
+	free(buf);
+	free(probe);
+	return n;
+fail:
+	free(buf);
+	free(probe);
+	return -1;
+}
+#endif
+
+static void pp_cache_store(const PPKey *k, const char *input_file, const char *payload, size_t len,
+			   char **argv, int argc) {
+	enum { MAX_DEPS = 4096, MAX_WATCH = 256 };
 	char path[PATH_MAX], tmp[PATH_MAX], abs[PATH_MAX];
-	char **deps = NULL;
-	int ndeps = 0, i = 0;
+	static PRISM_THREAD_LOCAL char watch[MAX_WATCH][PATH_MAX];
+	char **deps = NULL, **raws = NULL;
+	int ndeps = 0, nwatch = 0, i = 0;
 	long long now = (long long)time(NULL);
 	const char *end = payload + len;
 	const char *l = NULL;
@@ -5095,10 +5422,12 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 	bool ok = true;
 
 	deps = calloc(MAX_DEPS, sizeof *deps);
-	if (!deps) return;
+	raws = calloc(MAX_DEPS, sizeof *raws);
+	if (!deps || !raws) goto out;
 	if (!realpath(input_file, abs)) goto out;
+	raws[ndeps] = strdup(input_file);
 	deps[ndeps++] = strdup(abs);
-	if (!deps[0]) goto out;
+	if (!deps[0] || !raws[0]) goto out;
 
 	/* The dependency set is recovered from the output's own linemarkers, so no
 	 * -MD sidecar has to be produced or kept in sync. */
@@ -5117,8 +5446,9 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 				}
 			if (!seen) {
 				if (ndeps >= MAX_DEPS) goto out;
+				raws[ndeps] = strdup(buf);
 				deps[ndeps++] = strdup(can);
-				if (!deps[ndeps - 1]) goto out;
+				if (!deps[ndeps - 1] || !raws[ndeps - 1]) goto out;
 			}
 		}
 		nl = memchr(l, '\n', (size_t)(end - l));
@@ -5130,9 +5460,6 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 	 * before publishing an entry as well. */
 	for (i = 0; i < ndeps; i++)
 		if (!pp_file_is_time_stable(deps[i])) goto out;
-	/* See pp_cache_load: header-bearing entries need search-path and link-chain
-	 * identities, not just the file selected for this particular invocation. */
-	if (ndeps != 1) goto out;
 	if (!pp_cache_path(k, path, sizeof path)) goto out;
 	{
 		int fd = pp_cache_open_temp(path, tmp, sizeof tmp);
@@ -5143,6 +5470,23 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 			remove(tmp);
 			goto out;
 		}
+	}
+	/* Watched directories: the include search path plus every directory that
+	 * holds a dependency. Without them a header-bearing entry cannot be
+	 * trusted, so failing to determine them means not publishing one. */
+	if (ndeps > 1) {
+#ifdef _WIN32
+		goto out; /* no search-path probe here; keep single-source entries only */
+#else
+		nwatch = pp_search_dirs(argv, argc, input_file, watch, MAX_WATCH);
+		if (nwatch < 0) goto out;
+		/* Only the search path is watched. A dependency's own directory is
+		 * deliberately not: build output lands beside sources, and atomic
+		 * publication renames into place, which moves that directory's mtime on
+		 * every build and would make the cache never hit. Symlinks beside a
+		 * dependency are covered precisely instead, by re-resolving the
+		 * spelling the preprocessor reported. */
+#endif
 	}
 	ok = fputs(PP_CACHE_MAGIC, f) >= 0 && fprintf(f, "deps %d\n", ndeps) > 0;
 	for (i = 0; ok && i < ndeps; i++) {
@@ -5160,6 +5504,21 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 		}
 		ok = fprintf(f, "%lld %lld %lld %lld %lld %llu %llu %s\n", id.size, id.mtime_sec,
 			     id.mtime_nsec, id.ctime_sec, id.ctime_nsec, id.device, id.inode, deps[i]) > 0;
+		/* The spelling as the preprocessor reported it, on its own line so no
+		 * separator has to be reserved in a path. Re-resolving it on load is
+		 * what catches a symlink anywhere along the way being retargeted: the
+		 * recorded canonical file is then still there and unchanged. */
+		if (ok) ok = fprintf(f, "%s\n", raws[i] ? raws[i] : deps[i]) > 0;
+	}
+	if (ok) ok = fprintf(f, "dirs %d\n", nwatch) > 0;
+	for (i = 0; ok && i < nwatch; i++) {
+		PPStat id;
+		if (!pp_stat_id(watch[i], &id)) {
+			ok = false;
+			break;
+		}
+		ok = fprintf(f, "%lld %lld %lld %lld %lld %llu %llu %s\n", id.size, id.mtime_sec,
+			     id.mtime_nsec, id.ctime_sec, id.ctime_nsec, id.device, id.inode, watch[i]) > 0;
 	}
 	if (ok) {
 		PPKey sum = pp_payload_checksum(payload, len);
@@ -5171,7 +5530,11 @@ static void pp_cache_store(const PPKey *k, const char *input_file, const char *p
 	if (!ok || !pp_replace_file(tmp, path)) remove(tmp);
 	if (ok) pp_cache_prune();
 out:
-	for (i = 0; i < ndeps; i++) free(deps[i]);
+	for (i = 0; i < ndeps; i++) {
+		free(deps[i]);
+		if (raws) free(raws[i]);
+	}
+	free(raws);
 	free(deps);
 }
 
@@ -5402,7 +5765,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	buf = NULL; // ownership transferred
 	if (cacheable) {
 		if (prism_profile) fprintf(stderr, "[prism-prof] pp-cache=miss\n");
-		pp_cache_store(&key, input_file, result, strlen(result));
+		pp_cache_store(&key, input_file, result, strlen(result), (char **)args, argc);
 	}
 
 cleanup:
@@ -5830,6 +6193,7 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 	if (flatten) {
 		emit_system_header_diag_push();
 		out_char('\n');
+		emit_pragma_referenced_defines();
 	}
 
 	system_includes_reset();
@@ -5847,6 +6211,7 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 			flatten = true;
 			emit_system_header_diag_push();
 			out_char('\n');
+			emit_pragma_referenced_defines();
 		} else
 			emit_system_includes();
 	}
@@ -6051,6 +6416,7 @@ static PRISM_HOT bool transpile_tokens(PParseToken *tok, FILE *fp) {
 		}
 
 		if (__builtin_expect(tok->kind == PPARSE_TK_PREP_DIR, 0)) {
+			emit_post_include_pragma_define(tok);
 			tok = emit_advance(tok);
 			emit_at_stmt_start = true;
 			continue;
@@ -6091,7 +6457,13 @@ static PParseToken *preprocess_and_tokenize(char *input_file, double *pp_ms, dou
 	double t1 = prism_now_ms();
 	*pp_ms = t1 - t0;
 	if (!pp_buf) {
-		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
+		if (prism_spawn_refused)
+			fprintf(stderr,
+				"Could not start the C preprocessor: %s (the machine refused "
+				"to start the process; this is not a diagnostic about %s)\n",
+				strerror(prism_spawn_refused), input_file);
+		else
+			fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
 		return NULL;
 	}
 	double t2 = prism_now_ms();
@@ -6621,7 +6993,15 @@ static void prism_transpile_file_into(PrismResult *result, const char *input_fil
 	PParseToken *tok;
 	char *pp_buf = preprocess_with_cc((char *)input_file);
 	if (!pp_buf) {
-		prism_result_io_error(result, "Preprocessing failed");
+		if (prism_spawn_refused) {
+			char msg[128];
+			snprintf(msg, sizeof msg,
+				 "could not start the C preprocessor: %s",
+				 strerror(prism_spawn_refused));
+			prism_result_io_error(result, msg);
+		} else {
+			prism_result_io_error(result, "Preprocessing failed");
+		}
 		goto cleanup;
 	}
 
