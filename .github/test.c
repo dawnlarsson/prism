@@ -3017,12 +3017,18 @@ static const Axis ax_expr = {"payload", expr_values, N(expr_values)};
 
 static const AxisValue expr_wrappers[] = {
 	{"plain", "@0@", 0, 0}, {"paren", "(@0@)", 0, 0},
+	{"paren2", "((@0@))", 0, 0}, {"paren3", "(((@0@)))", 0, 0},
+	{"paren4", "((((@0@))))", 0, 0}, {"paren5", "(((((@0@)))))", 0, 0},
 	{"comma", "(0,@0@)", 0, 0}, {"ternary-then", "(i?@0@:1)", 0, 0},
 	{"ternary-else", "(i?1:@0@)", 0, 0}, {"cast", "((int)(@0@))", 0, 0},
+	{"cast2", "((int)((int)(@0@)))", 0, 0},
 	{"neg", "(-(@0@))", 0, 0}, {"not", "(!(@0@))", 0, 0},
 	{"binary", "((@0@)+1)", 0, 0}, {"call", "q(@0@)", 0, 0},
 	{"subscript", "a[(@0@)&7]", 0, 0},
 	{"stmt-expr", "({int t=(@0@);t;})", 0, 0},
+	{"stmt-expr2", "({({int t=(@0@);t;});})", 0, 0},
+	{"stmt-expr3", "({({({int t=(@0@);t;});});})", 0, 0},
+	{"stmt-expr4", "({({({({int t=(@0@);t;});});});})", 0, 0},
 };
 static const Axis ax_expr_wrap = {"wrapper", expr_wrappers, N(expr_wrappers)};
 
@@ -3042,7 +3048,7 @@ static const AxisValue expr_contexts[] = {
 	{"typeof", "int q(int);int f(int i){int x=0,a[8]={0},*p=a;struct{int v;}s={0};typeof(@1@)y=0;L:return !!y;}", 0, 0},
 	{"generic", "int q(int);int f(int i){int x=0,a[8]={0},*p=a;struct{int v;}s={0};int y=_Generic(@1@,int:1,default:0);L:return y;}", 0, 0},
 	{"array-dim", "int q(int);int f(int i){int x=0,a[8]={0},*p=a;struct{int v;}s={0};int z[(@1@)+1];L:return sizeof(z);}", 0, 0},
-	{"stmt-expr", "int q(int);int f(int i){int x=0,a[8]={0},*p=a;struct{int v;}s={0};int y=(@1@);L:return y;}", 0, 0},
+	{"stmt-expr", "int q(int);int f(int i){int x=0,a[8]={0},*p=a;struct{int v;}s={0};int y=({@1@;});L:return y;}", 0, 0},
 };
 static const Axis ax_expr_ctx = {"context", expr_contexts, N(expr_contexts)};
 
@@ -3062,6 +3068,7 @@ static const Axis ax_stmt = {"payload", stmt_values, N(stmt_values)};
 static const AxisValue stmt_contexts[] = {
 	{"top", "void clean(void);void cleanv(int);int g(void);void f(int x){ @0@ }", 0, 0},
 	{"block", "void clean(void);void cleanv(int);int g(void);void f(int x){{{ @0@ }}}", 0, 0},
+	{"block5", "void clean(void);void cleanv(int);int g(void);void f(int x){{{{{ @0@ }}}}}", 0, 0},
 	{"if-brace", "void clean(void);void cleanv(int);int g(void);void f(int x){if(x){ @0@ }}", 0, 0},
 	{"else-brace", "void clean(void);void cleanv(int);int g(void);void f(int x){if(x){}else{ @0@ }}", 0, 0},
 	{"while", "void clean(void);void cleanv(int);int g(void);void f(int x){while(x){ @0@ break;}}", 0, 0},
@@ -3070,8 +3077,42 @@ static const AxisValue stmt_contexts[] = {
 	{"switch", "void clean(void);void cleanv(int);int g(void);void f(int x){switch(x){case 0:{ @0@ }break;}}", 0, 0},
 	{"label", "void clean(void);void cleanv(int);int g(void);void f(int x){L:{ @0@ }if(x)goto L;}", 0, 0},
 	{"stmt-expr", "void clean(void);void cleanv(int);int g(void);void f(int x){(void)({ @0@ 0;});}", 0, 0},
+	{"stmt-expr2", "void clean(void);void cleanv(int);int g(void);void f(int x){(void)({({ @0@ 0;});});}", 0, 0},
+	{"stmt-expr3", "void clean(void);void cleanv(int);int g(void);void f(int x){(void)({({({ @0@ 0;});});});}", 0, 0},
 };
 static const Axis ax_stmt_ctx = {"context", stmt_contexts, N(stmt_contexts)};
+
+/* Defer body nesting depth × enclosing context — compile/fixed product. */
+static const AxisValue defer_nest_bodies[] = {
+	{"call", "defer clean();", 0, 0},
+	{"block", "defer { clean(); }", 0, 0},
+	{"block2", "defer { { clean(); } }", 0, 0},
+	{"block3", "defer { { { clean(); } } }", 0, 0},
+	{"if", "defer { if(x) clean(); }", 0, 0},
+	{"if-else", "defer { if(x) clean(); else cleanv(1); }", 0, 0},
+	{"while", "defer { while(0) clean(); }", 0, 0},
+	{"for", "defer { for(int i=0;i<0;i++) clean(); }", 0, 0},
+	{"do", "defer { do clean(); while(0); }", 0, 0},
+	{"switch", "defer { switch(x){default:clean();break;} }", 0, 0},
+	{"oe-in-block", "defer { int t=g() orelse 1; cleanv(t); }", 0, 0},
+};
+static const Axis ax_defer_nest_body = {"body", defer_nest_bodies, N(defer_nest_bodies)};
+
+static const AxisValue defer_nest_contexts[] = {
+	{"top", "void clean(void);void cleanv(int);int g(void);void f(int x){ @0@ }", 0, 0},
+	{"block3", "void clean(void);void cleanv(int);int g(void);void f(int x){{{ @0@ }}}", 0, 0},
+	{"block5", "void clean(void);void cleanv(int);int g(void);void f(int x){{{{{ @0@ }}}}}", 0, 0},
+	{"if", "void clean(void);void cleanv(int);int g(void);void f(int x){if(x){ @0@ }}", 0, 0},
+	{"else", "void clean(void);void cleanv(int);int g(void);void f(int x){if(x){}else{ @0@ }}", 0, 0},
+	{"while", "void clean(void);void cleanv(int);int g(void);void f(int x){while(x){ @0@ break;}}", 0, 0},
+	{"for", "void clean(void);void cleanv(int);int g(void);void f(int x){for(;x;){ @0@ break;}}", 0, 0},
+	{"do", "void clean(void);void cleanv(int);int g(void);void f(int x){do{ @0@ }while(0);}", 0, 0},
+	{"switch", "void clean(void);void cleanv(int);int g(void);void f(int x){switch(x){case 0:{ @0@ }break;}}", 0, 0},
+	{"stmt-expr", "void clean(void);void cleanv(int);int g(void);void f(int x){(void)({ { @0@ } 0;});}", 0, 0},
+	{"stmt-expr2", "void clean(void);void cleanv(int);int g(void);void f(int x){(void)({({ { @0@ } 0;});});}", 0, 0},
+	{"label", "void clean(void);void cleanv(int);int g(void);void f(int x){L:{ @0@ }if(x)goto L;}", 0, 0},
+};
+static const Axis ax_defer_nest_ctx = {"context", defer_nest_contexts, N(defer_nest_contexts)};
 
 static const AxisValue decl_values[] = {
 	{"int", "int x;", 0, 0}, {"ptr", "int *p;", 0, 0},
@@ -3118,8 +3159,377 @@ static const AxisValue bounds_contexts[] = {
 	{"typeof", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;typeof(@0@)y=0;return !!y;}", 0, 0},
 	{"generic", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return _Generic(@0@,int:1,default:0);}", 0, 0},
 	{"stmt", "void f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;(void)(@0@);}", 0, 0},
+	{"stmt-expr", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return ({(@0@);});}", 0, 0},
+	{"stmt-expr-nest", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return ({({(@0@);});});}", 0, 0},
 };
 static const Axis ax_bounds_ctx = {"context", bounds_contexts, N(bounds_contexts)};
+
+/* Maximalist recursive bounds shapes: pointer hops, static/multi-dim params.
+ * Crossed with an index axis that flips the oracle between in-range execute
+ * and out-of-range trap. Member-array paren depth is a separate recipe: those
+ * subscripts are intentionally unchecked, so a trap axis would be wrong. */
+static const AxisValue bounds_depth_index[] = {
+	{"in", "3", 0, 0, O_OK | O_RUN | O_FIXED},
+	{"trap", "8", 0, 0, O_OK | O_TRAP},
+};
+static const Axis ax_bounds_depth_index = {"index", bounds_depth_index, N(bounds_depth_index)};
+
+static const AxisValue bounds_depth_shapes[] = {
+	{"ptr1-deref",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return (*p)[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-deref-p2",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((*p))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-deref-p3",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return (((*p)))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-deref-p4",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((((*p))))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-deref-p5",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return (((((*p)))))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-index0",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return p[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-index0-p2",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((p[0]))[@0@]==9?0:1;}", 0, 0},
+	{"ptr2-index",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return p[0][0][@0@]==9?0:1;}", 0, 0},
+	{"ptr2-deref-mix",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return (*p)[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr2-deref-p3",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return (((*p)))[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr3-index",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**r)[16]=&q;int (***p)[16]=&r;return p[0][0][0][@0@]==9?0:1;}", 0, 0},
+	{"ptr3-deref-mix",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**r)[16]=&q;int (***p)[16]=&r;return (*(*p))[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-multi-deref",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;return (*p)[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-multi-index",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;return p[0][0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-multi-deref-p3",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;return (((*p)))[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-triple-deref",
+	 "int main(void){int t[2][4][16]={{{0}}};t[0][0][3]=9;int (*p)[2][4][16]=&t;return (*p)[0][0][@0@]==9?0:1;}", 0, 0},
+	{"param-static-inner",
+	 "static int f(int a[static 4][16],int j){return a[0][j];}"
+	 "int main(void){int a[4][16]={{0}};a[0][3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"param-static-inner-p2",
+	 "static int f(int a[static 4][16],int j){return ((a[0]))[j];}"
+	 "int main(void){int a[4][16]={{0}};a[0][3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"param-const-ptr",
+	 "static int f(int (*const p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-const-ptr-p3",
+	 "static int f(int (*const p)[16],int j){return (((*p)))[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-volatile-ptr",
+	 "static int f(int (*volatile p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-array-inner",
+	 "static int f(int a[4][16],int j){return a[0][j];}"
+	 "int main(void){int a[4][16]={{0}};a[0][3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"param-static-triple",
+	 "static int f(int a[static 2][4][16],int j){return a[0][0][j];}"
+	 "int main(void){int a[2][4][16]={{{0}}};a[0][0][3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"local-multi-p2",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ((m[0]))[@0@]==9?0:1;}", 0, 0},
+	{"local-multi-p4",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ((((m[0]))))[@0@]==9?0:1;}", 0, 0},
+	{"stmt-expr-ptr1",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ({(*p)[@0@];})==9?0:1;}", 0, 0},
+	{"stmt-expr2-ptr1",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ({({(*p)[@0@];});})==9?0:1;}", 0, 0},
+	{"ptr1-deref-p6",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((((((*p))))))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-deref-p7",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((((((((*p))))))))[@0@]==9?0:1;}", 0, 0},
+	{"ptr1-cancel-addr",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return *&((*p)[@0@])==9?0:1;}", 0, 0},
+	{"ptr2-index-p3",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return (((p[0])))[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr3-deref-p3",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**r)[16]=&q;int (***p)[16]=&r;return (((*(*p))))[0][@0@]==9?0:1;}", 0, 0},
+	{"ptr1-triple-index",
+	 "int main(void){int t[2][4][16]={{{0}}};t[0][0][3]=9;int (*p)[2][4][16]=&t;return p[0][0][0][@0@]==9?0:1;}", 0, 0},
+	{"param-restrict-ptr",
+	 "static int f(int (*restrict p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-restrict-ptr-p3",
+	 "static int f(int (*restrict p)[16],int j){return (((*p)))[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-static-const-inner",
+	 "static int f(int a[static const 4][16],int j){return a[0][j];}"
+	 "int main(void){int a[4][16]={{0}};a[0][3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"param-volatile-ptr-p3",
+	 "static int f(int (*volatile p)[16],int j){return (((*p)))[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"local-multi-p5",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return (((((m[0])))))[@0@]==9?0:1;}", 0, 0},
+	{"local-multi-p6",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ((((((m[0]))))))[@0@]==9?0:1;}", 0, 0},
+	{"stmt-expr-multi",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ({m[0][@0@];})==9?0:1;}", 0, 0},
+	{"stmt-expr2-multi",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ({({m[0][@0@];});})==9?0:1;}", 0, 0},
+	{"stmt-expr3-ptr1",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ({({({(*p)[@0@];});});})==9?0:1;}", 0, 0},
+};
+static const Axis ax_bounds_depth_shape = {"shape", bounds_depth_shapes, N(bounds_depth_shapes)};
+
+/* Member paren depth: index past the *outer* array extent (2) but inside the
+ * member (16). Must not trap — that was the wrong-extent bug. */
+static const AxisValue bounds_member_paren[] = {
+	{"p0", "(e[1].name)", 0, 0},
+	{"p1", "((e[1].name))", 0, 0},
+	{"p2", "(((e[1].name)))", 0, 0},
+	{"p3", "((((e[1].name))))", 0, 0},
+	{"p4", "(((((e[1].name)))))", 0, 0},
+	{"p5", "((((((e[1].name))))))", 0, 0},
+	{"p6", "(((((((e[1].name)))))))", 0, 0},
+	{"arrow-p0", "(q->name)", 0, 0},
+	{"arrow-p1", "((q->name))", 0, 0},
+	{"arrow-p2", "(((q->name)))", 0, 0},
+	{"arrow-p3", "((((q->name))))", 0, 0},
+	{"arrow-p4", "(((((q->name)))))", 0, 0},
+	{"arrow-p5", "((((((q->name))))))", 0, 0},
+	{"dot-via-paren", "((*(q)).name)", 0, 0},
+	{"dot-via-paren-p2", "((((*(q)).name)))", 0, 0},
+	{"p7", "((((((((e[1].name))))))))", 0, 0},
+	{"p8", "(((((((((e[1].name)))))))))", 0, 0},
+	{"arrow-p6", "(((((((q->name)))))))", 0, 0},
+	{"arrow-p7", "((((((((q->name))))))))", 0, 0},
+	{"elem-paren", "(((e)[1].name))", 0, 0},
+	{"elem-paren-p3", "(((((e)[1].name))))", 0, 0},
+	{"dot-via-paren-p4", "((((((*(q)).name)))))", 0, 0},
+	{"mix-dot-arrow", "((*q).name)", 0, 0},
+	{"mix-dot-arrow-p3", "(((((*q).name))))", 0, 0},
+};
+static const Axis ax_bounds_member_paren = {"paren", bounds_member_paren, N(bounds_member_paren)};
+
+/* Ptr-to-array runtime shapes × feature toggles (bounds must stay on). */
+static const AxisValue bounds_ptr_features[] = {
+	{"default", "", 0, 0},
+	{"no-defer", "", 0, FB_DEFER},
+	{"no-orelse", "", 0, FB_ORELSE},
+	{"no-zero", "", 0, FB_ZERO},
+	{"bounds-on", "", FB_BOUNDS, 0},
+	{"auto-static", "", FB_AS, 0},
+	{"auto-unreach", "", FB_AUR, 0},
+	{"safety-warn", "", FB_WARN, 0},
+	{"no-flatten", "", 0, FB_FLAT},
+};
+static const Axis ax_bounds_ptr_features = {"features", bounds_ptr_features, N(bounds_ptr_features)};
+
+static const AxisValue bounds_ptr_shapes[] = {
+	{"deref",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return (*p)[@0@]==9?0:1;}", 0, 0},
+	{"deref-p4",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((((*p))))[@0@]==9?0:1;}", 0, 0},
+	{"index0-p2",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((p[0]))[@0@]==9?0:1;}", 0, 0},
+	{"dbl-hop",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return (*p)[0][@0@]==9?0:1;}", 0, 0},
+	{"dbl-hop-p3",
+	 "int main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;return (((*p)))[0][@0@]==9?0:1;}", 0, 0},
+	{"const-param",
+	 "static int f(int (*const p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"restrict-param",
+	 "static int f(int (*restrict p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"volatile-param",
+	 "static int f(int (*volatile p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"multi-dim",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;return (*p)[0][@0@]==9?0:1;}", 0, 0},
+	{"stmt-expr",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ({(*p)[@0@];})==9?0:1;}", 0, 0},
+	{"cancel-addr",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return *&((*p)[@0@])==9?0:1;}", 0, 0},
+	{"triple-dim",
+	 "int main(void){int t[2][4][16]={{{0}}};t[0][0][3]=9;int (*p)[2][4][16]=&t;return (*p)[0][0][@0@]==9?0:1;}", 0, 0},
+};
+static const Axis ax_bounds_ptr_shape = {"shape", bounds_ptr_shapes, N(bounds_ptr_shapes)};
+
+/* Cast / compound-literal / sizeof nesting — grammar disambiguation product. */
+static const AxisValue parse_cl_shapes[] = {
+	{"cast-scalar", "return (int)@0@;", 0, 0},
+	{"cast-paren", "return ((int)(@0@));", 0, 0},
+	{"cast-nest2", "return (((int)(@0@)));", 0, 0},
+	{"cast-nest3", "return ((((int)(@0@))));", 0, 0},
+	{"cast-nest4", "return (((((int)(@0@)))));", 0, 0},
+	{"compound-scalar", "return ((int){@0@});", 0, 0},
+	{"compound-nest2", "return ((((int){@0@})));", 0, 0},
+	{"compound-nest3", "return (((((int){@0@}))));", 0, 0},
+	{"compound-nest4", "return ((((((int){@0@})))));", 0, 0},
+	{"sizeof-compound", "return (int)sizeof (int){@0@};", 0, 0},
+	{"sizeof-compound-nest", "return (int)sizeof(((int){@0@}));", 0, 0},
+	{"sizeof-cast", "return (int)sizeof((int)@0@);", 0, 0},
+	{"sizeof-cast-nest", "return (int)sizeof((((int)(@0@))));", 0, 0},
+	{"cast-of-compound", "return (int)((int){@0@});", 0, 0},
+	{"generic-ctrl", "return _Generic(@0@,int:1,default:0);", 0, 0},
+	{"generic-paren", "return _Generic((@0@),int:1,default:0);", 0, 0},
+	{"stmt-expr-nest2", "return ({({@0@;});});", 0, 0},
+	{"stmt-expr-nest3", "return ({({({@0@;});});});", 0, 0},
+	{"stmt-expr-nest4", "return ({({({({@0@;});});});});", 0, 0},
+	{"stmt-expr-cast", "return ({(int)(@0@);});", 0, 0},
+	{"sizeof-cast-compound", "return (int)sizeof((int)((int){@0@}));", 0, 0},
+	{"sizeof-compound-cast", "return (int)sizeof((int){(int)@0@});", 0, 0},
+	{"cast-sizeof-compound", "return (int)((int)sizeof (int){@0@});", 0, 0},
+	{"nest-cast-sizeof-compound", "return (((int)sizeof ((int){@0@})));", 0, 0},
+	{"sizeof-stmt-expr", "return (int)sizeof({@0@;});", 0, 0},
+	{"cast-stmt-expr", "return (int)({@0@;});", 0, 0},
+	{"generic-cast", "return _Generic((int)@0@,int:1,default:0);", 0, 0},
+	{"generic-stmt-expr", "return _Generic(({@0@;}),int:1,default:0);", 0, 0},
+	{"alignof-compound", "return (int)__alignof__((int){@0@});", 0, 0},
+};
+static const Axis ax_parse_cl_shape = {"shape", parse_cl_shapes, N(parse_cl_shapes)};
+
+static const AxisValue parse_cl_payloads[] = {
+	{"zero", "0", 0, 0},
+	{"one", "1", 0, 0},
+	{"add", "1+1", 0, 0},
+	{"call", "g()", 0, 0},
+	{"paren-call", "(g())", 0, 0},
+	{"comma", "(0,g())", 0, 0},
+};
+static const Axis ax_parse_cl_payload = {"payload", parse_cl_payloads, N(parse_cl_payloads)};
+
+/* orelse must be assigned first; only top-level declaration forms (no paren
+ * wrap around the oe expression — that is diagnosed). */
+static const AxisValue parse_oe_assign_shapes[] = {
+	{"plain", "int x=@0@;return x;", 0, 0},
+	{"stmt-expr", "int x=({int t=@0@;t;});return x;", 0, 0},
+	{"stmt-expr2", "int x=({({int t=@0@;t;});});return x;", 0, 0},
+	{"stmt-expr3", "int x=({({({int t=@0@;t;});});});return x;", 0, 0},
+	{"stmt-expr4", "int x=({({({({int t=@0@;t;});});});});return x;", 0, 0},
+	{"assign-stmt", "int x=0;x=@0@;return x;", 0, 0},
+	{"assign-block", "int x=0;{x=@0@;}return x;", 0, 0},
+	{"assign-block3", "int x=0;{{{x=@0@;}}}return x;", 0, 0},
+	{"assign-then-stmt-expr", "int x=0;x=({int t=@0@;t;});return x;", 0, 0},
+	{"nested-decl-block", "{{int x=@0@;return x;}}", 0, 0},
+	{"nested-block-assign", "int x=0;{int y=0;{x=@0@;y=x;}}return x;", 0, 0},
+	{"assign-chain", "int x=0,y=0;x=@0@;y=x;return y;", 0, 0},
+	{"block-stmt-expr", "int x=0;{x=({int t=@0@;t;});}return x;", 0, 0},
+	{"init-nested", "int x=({int a=0;{int t=@0@;a=t;}a;});return x;", 0, 0},
+};
+static const Axis ax_parse_oe_assign_shape = {"shape", parse_oe_assign_shapes, N(parse_oe_assign_shapes)};
+
+static const AxisValue parse_oe_payloads[] = {
+	{"oe", "g() orelse 3", 0, 0},
+	{"oe-nest", "g() orelse h() orelse 3", 0, 0},
+	{"oe-call-chain", "g() orelse g() orelse h() orelse 3", 0, 0},
+	{"oe-deep4", "g() orelse h() orelse g() orelse h() orelse 3", 0, 0},
+	{"oe-deep5", "g() orelse h() orelse g() orelse h() orelse g() orelse 3", 0, 0},
+};
+static const Axis ax_parse_oe_payload = {"payload", parse_oe_payloads, N(parse_oe_payloads)};
+
+static const AxisValue parse_cl_features[] = {
+	{"default", "", 0, 0},
+	{"no-orelse", "", 0, FB_ORELSE},
+	{"no-defer", "", 0, FB_DEFER},
+	{"minimal", "", 0, FB_DEFER | FB_ORELSE | FB_ZERO | FB_BOUNDS | FB_AS | FB_AUR},
+};
+static const Axis ax_parse_cl_features = {"features", parse_cl_features, N(parse_cl_features)};
+
+/* Feature profiles that keep `defer` enabled (for defer-body products). */
+static const AxisValue parse_keep_defer_features[] = {
+	{"default", "", 0, 0},
+	{"no-zero", "", 0, FB_ZERO},
+	{"no-bounds", "", 0, FB_BOUNDS},
+};
+static const Axis ax_parse_keep_defer_features = {"features", parse_keep_defer_features, N(parse_keep_defer_features)};
+
+/* Nested declarator spellings — FIXED+COMPILE product. */
+static const AxisValue decl_nest_values[] = {
+	{"ptr", "int *x;(void)x;", 0, 0},
+	{"paren-ptr", "int (*x);(void)x;", 0, 0},
+	{"ptr-array", "int (*x)[4];(void)x;", 0, 0},
+	{"ptr-array2", "int (*x)[4][3];(void)x;", 0, 0},
+	{"ptr-array3", "int (*x)[4][3][2];(void)x;", 0, 0},
+	{"ptr-ptr-array", "int (**x)[4];(void)x;", 0, 0},
+	{"ptr-ptr-array2", "int (**x)[4][3];(void)x;", 0, 0},
+	{"ptr3-array", "int (***x)[4];(void)x;", 0, 0},
+	{"const-ptr-array", "int (*const x)[4];(void)x;", 0, 0},
+	{"volatile-ptr-array", "int (*volatile x)[4];(void)x;", 0, 0},
+	{"const-ptr-ptr-array", "int (*const *x)[4];(void)x;", 0, 0},
+	{"ptr-const-array", "int (*x)[4];(void)x;", 0, 0},
+	{"func-ptr", "int (*fp)(int);(void)fp;", 0, 0},
+	{"func-ptr-array", "int (*fp[2])(int);(void)fp;", 0, 0},
+	{"func-ptr-array2", "int (*fp[2][3])(int);(void)fp;", 0, 0},
+	{"nested-func-ptr", "void (*signal_like(int,void(*)(int)))(int);(void)signal_like;", 0, 0},
+	{"triple-ptr", "int ***x;(void)x;", 0, 0},
+	{"quad-ptr", "int ****x;(void)x;", 0, 0},
+	{"array-ptr-func", "int (*(*x)[3])(char);(void)x;", 0, 0},
+	{"array-ptr-func2", "int (*(*x)[3][2])(char);(void)x;", 0, 0},
+	{"triple-ptr-array2d", "int (**(*x)[3])[4][5];(void)x;", 0, 0},
+	{"array-ptr-array", "int (*x[2])[4];(void)x;", 0, 0},
+	{"array-ptr-ptr-array", "int (*(*x[2])[3])[4];(void)x;", 0, 0},
+	{"ptr-to-array-of-ptr", "int (*(*x)[2])[3][4];(void)x;", 0, 0},
+	{"const-volatile-ptr-array", "const volatile int (*x)[4];(void)x;", 0, 0},
+	{"volatile-const-ptr-ptr", "volatile const int (**x)[4];(void)x;", 0, 0},
+	{"ptr-const-volatile-array", "int (*const volatile x)[4];(void)x;", 0, 0},
+	{"ptr-const-ptr-array", "int *const (*x)[4];(void)x;", 0, 0},
+	{"func-ptr-nest2", "int (*(*fp)(int))[4];(void)fp;", 0, 0},
+	{"array-func-ptr", "int (*fp[3])(char,short);(void)fp;", 0, 0},
+};
+static const Axis ax_decl_nest = {"decl", decl_nest_values, N(decl_nest_values)};
+
+static const AxisValue decl_nest_contexts[] = {
+	{"local", "void f(void){ @0@ }", 0, 0},
+	{"block3", "void f(void){{{ @0@ }}}", 0, 0},
+	{"block5", "void f(void){{{{{ @0@ }}}}}", 0, 0},
+	{"loop", "void f(int c){while(c){ @0@ break;}}", 0, 0},
+	{"for", "void f(int c){for(;c;){ @0@ break;}}", 0, 0},
+	{"do", "void f(int c){do{ @0@ }while(0);}", 0, 0},
+	{"switch", "void f(int c){switch(c){case 0:{ @0@ }break;}}", 0, 0},
+	{"stmt-expr", "void f(void){(void)({ @0@ 0;});}", 0, 0},
+	{"stmt-expr2", "void f(void){(void)({({ @0@ 0;});});}", 0, 0},
+	{"if", "void f(int c){if(c){ @0@ }}", 0, 0},
+	{"else", "void f(int c){if(c){}else{ @0@ }}", 0, 0},
+	{"label", "void f(int c){L:{ @0@ }if(c)goto L;}", 0, 0},
+};
+static const Axis ax_decl_nest_ctx = {"context", decl_nest_contexts, N(decl_nest_contexts)};
+
+/* Soft-keyword identifiers in nested expression wrappers — parse disambiguation. */
+static const AxisValue parse_soft_kw_names[] = {
+	{"defer", "defer", 0, 0},
+	{"orelse", "orelse", 0, 0},
+};
+static const Axis ax_parse_soft_kw_name = {"keyword", parse_soft_kw_names, N(parse_soft_kw_names)};
+
+static const AxisValue parse_soft_kw_wrappers[] = {
+	{"plain", "@0@", 0, 0},
+	{"paren", "(@0@)", 0, 0},
+	{"paren2", "((@0@))", 0, 0},
+	{"paren3", "(((@0@)))", 0, 0},
+	{"paren4", "((((@0@))))", 0, 0},
+	{"cast", "((int)(@0@))", 0, 0},
+	{"cast2", "((int)((int)(@0@)))", 0, 0},
+	{"neg", "(-(@0@))", 0, 0},
+	{"not", "(!(@0@))", 0, 0},
+	{"binary", "((@0@)+1)", 0, 0},
+	{"stmt-expr", "({int t=(@0@);t;})", 0, 0},
+	{"stmt-expr2", "({({int t=(@0@);t;});})", 0, 0},
+	{"stmt-expr3", "({({({int t=(@0@);t;});});})", 0, 0},
+	{"generic", "_Generic(@0@,int:1,default:0)", 0, 0},
+	{"generic-paren", "_Generic((@0@),int:1,default:0)", 0, 0},
+};
+static const Axis ax_parse_soft_kw_wrap = {"wrapper", parse_soft_kw_wrappers, N(parse_soft_kw_wrappers)};
+
+/* Defer body nesting depth — parse paths through nested blocks/stmt-exprs. */
+static const AxisValue parse_defer_body_shapes[] = {
+	{"plain", "defer c();", 0, 0},
+	{"block", "defer {c();}", 0, 0},
+	{"block3", "defer {{{c();}}}", 0, 0},
+	{"block5", "defer {{{{{c();}}}}}", 0, 0},
+	{"stmt-expr", "defer ({c();});", 0, 0},
+	{"stmt-expr2", "defer ({({c();});});", 0, 0},
+	{"stmt-expr3", "defer ({({({c();});});});", 0, 0},
+	{"if-nest", "defer if(g()){if(g())c();}", 0, 0},
+	{"while-nest", "defer while(g()){while(g())break;}", 0, 0},
+	{"for-nest", "defer for(int i=0;i<1;i++){for(int j=0;j<1;j++)c();}", 0, 0},
+	{"cast-body", "defer (void)(int)g();", 0, 0},
+	{"compound-body", "defer (void)((int){g()});", 0, 0},
+};
+static const Axis ax_parse_defer_body_shape = {"shape", parse_defer_body_shapes, N(parse_defer_body_shapes)};
 
 static const AxisValue feature_values[] = {
 	{"default", "", 0, 0},
@@ -4260,6 +4670,43 @@ static const Recipe recipes[] = {
 	{"contexts/expression", "@2@", PRE, {&ax_expr, &ax_expr_wrap, &ax_expr_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"contexts/statement", "@1@", NULL, {&ax_stmt, &ax_stmt_ctx, &ax_features}, O_TRICHOTOMY, 0, FB_LINE, 0},
 	{"declarations/product", "@1@", NULL, {&ax_decl, &ax_decl_ctx, &ax_features}, O_OK | O_FIXED, 0, FB_LINE, 0},
+	/* Recursive bounds depth × in-range/trap. Pointer hops, static/qualified
+	 * params, multi-dim locals — every shape must either return 0 on index 3
+	 * or trap on index 8. */
+	{"bounds/depth-product", "@1@", NULL,
+	 {&ax_bounds_depth_index, &ax_bounds_depth_shape}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	/* Member paren depth 0..8 at an index past the outer array (2) but inside
+	 * the member (16). Must run, never trap — wrong outer extent was the bug. */
+	{"bounds/member-paren-depth",
+	 "typedef struct{char name[16];}E;int main(void){E e[2]={{\"abcdefghijklmnop\"},{\"ABCDEFGHIJKLMNOP\"}};E *q=&e[1];"
+	 "return @0@[8]=='I'?0:1;}", NULL,
+	 {&ax_bounds_member_paren}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk",
+	 "name)[__prism_bchk|name))[__prism_bchk|name)))[__prism_bchk|name))))[__prism_bchk|name)))))[__prism_bchk"
+	 "|name))))))[__prism_bchk|name)))))))[__prism_bchk"},
+	/* Ptr-to-array depth × in-range/trap × feature toggles (bounds stays on). */
+	{"bounds/ptr-array-feature-product", "@1@", NULL,
+	 {&ax_bounds_depth_index, &ax_bounds_ptr_shape, &ax_bounds_ptr_features},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	/* Cast vs compound-literal vs sizeof nesting (no top-level orelse). */
+	{"parse/cast-compound-product", "int g(void);int h(void);int main(void){ @1@ }", NULL,
+	 {&ax_parse_cl_payload, &ax_parse_cl_shape, &ax_parse_cl_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	/* orelse must be assigned first — nesting depth × oe spelling. Feature
+	 * polarity that disables orelse is out of scope here (would reject). */
+	{"parse/orelse-assign-nest-product", "int g(void);int h(void);int main(void){ @1@ }", NULL,
+	 {&ax_parse_oe_payload, &ax_parse_oe_assign_shape}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	/* Deep nested declarators in every statement context. */
+	{"parse/declarator-nest-product", "@1@", NULL,
+	 {&ax_decl_nest, &ax_decl_nest_ctx, &ax_parse_cl_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	/* Soft-keyword identifiers as locals inside nested expression wrappers. */
+	{"parse/soft-keyword-wrap-product", "int main(void){int @0@=2;return @1@;}", NULL,
+	 {&ax_parse_soft_kw_name, &ax_parse_soft_kw_wrap, &ax_parse_cl_features},
+	 O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	/* Defer body nesting — blocks, stmt-exprs, control inside a single defer. */
+	{"parse/defer-body-nest-product", "void c(void);int g(void);int main(void){ @0@ return 0;}", NULL,
+	 {&ax_parse_defer_body_shape, &ax_parse_keep_defer_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	/* Defer bodies × enclosing context depth (complementary to body-shape product). */
+	{"parse/defer-context-nest-product", "@1@", NULL,
+	 {&ax_defer_nest_body, &ax_defer_nest_ctx, &ax_parse_keep_defer_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"features/product", "int g(void);void c(void);int f(int i){int a[8];const int table[2]={1,2};defer c();int x=g() orelse 2;raw int y;return a[i]+table[0]+x+y;}",
 	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0},
 	{"features/power-set/top", "@0@", NULL,
@@ -4534,7 +4981,8 @@ static const Recipe recipes[] = {
 	 "int main(void){f();return n==321?0:1;}",
 	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
 	{"exact/defer-lifo", "void p(char);int main(void){defer p('A');{defer p('B');p('x');}return 0;}", NULL,
-	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0, "p('A')|p('B')", NULL},
+	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0,
+	 "p('B');} { int __prism_ret_0 = ( 0);  p('A')", NULL},
 	/* Capture discovery precedes normal orelse/raw annotation.  The extension
 	 * spellings inside a deferred declaration must not enter defer_name_set;
 	 * otherwise the unrelated locals below are rejected as false shadows. */
@@ -4726,7 +5174,7 @@ static const Recipe recipes[] = {
 	{"exact/user-setjmp-definition", "int setjmp(void*p){(void)p;return 0;}void c(void);void f(void){defer c();(void)setjmp(0);}", NULL,
 	 {0}, O_OK | O_NO_EXT, 0, FB_LINE, 0},
 	{"exact/user-exit-definition", "int exit(void){return 7;}int f(void){return exit();}", NULL,
-	 {0}, O_OK, FB_AUR, FB_LINE, 0, NULL, "__builtin_unreachable"},
+	 {0}, O_OK, FB_AUR, FB_LINE, 0, NULL, "__builtin_unreachable|__assume(0)"},
 	{"exact/generic-decl-plain",
 	 "typedef unsigned long Z;extern _Generic((char*)0,char*:memchr,default:memchr)(const void*,int,Z);", NULL,
 	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, NULL, "_Generic"},
@@ -4827,16 +5275,100 @@ static const Recipe recipes[] = {
 	 "typedef struct{char name[8];}Entry;static Entry entries[2];"
 	 "char f(int i){return (entries[i].name)[3];}", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "name)[__prism_bchk"},
+	/* Nested parentheses around the same member must peel too: looking only
+	 * one token back at `))` saw a `)` and recovered `entries` again. */
+	{"runtime/bounds-nested-paren-member-array",
+	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
+	 "return ((entries[1].name))[3]=='a'&&(((entries[1].name)))[0]=='b'?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"exact/bounds-nested-paren-member-unwrapped",
+	 "typedef struct{char name[8];}Entry;static Entry entries[2];"
+	 "char f(int i){return ((entries[i].name))[3];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "name))[__prism_bchk"},
+	/* `int a[static 4][3]`: the static promise covers a[i]; a[i][j] indexes a
+	 * real int[3] and must use the sizeof ratio. Rank 1 made the inner index
+	 * bail out before that fallthrough. */
+	{"runtime/bounds-static-param-inner-dim-traps",
+	 "static int f(int a[static 4][3],int i,int j){return a[i][j];}"
+	 "int main(void){int a[4][3]={{0}};volatile int j=3;return f(a,0,j);}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-static-param-inner-dim-inbounds",
+	 "static int f(int a[static 4][3],int i,int j){return a[i][j];}"
+	 "int main(void){int a[4][3]={{0}};a[0][2]=9;volatile int j=2;return f(a,0,j)==9?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"exact/bounds-static-param-inner-dim-shape",
+	 "int f(int a[static 4][3],int i,int j){return a[i][j];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0,
+	 "(__prism_bchk_size_t)(4)|sizeof(a[0])/sizeof(a[0][0])", NULL},
+	/* Qualifiers between `*` and the name, and multi-dim pointer-to-array
+	 * locals/params, must match the bare `int (*p)[N]` path. */
+	{"runtime/bounds-const-ptr-to-array-param-traps",
+	 "static int g(int (*const p)[4],int i){return (*p)[i];}"
+	 "int main(void){int b[4]={0};volatile int i=4;return g(&b,i);}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-volatile-ptr-to-array-param-inbounds",
+	 "static int g(int (*volatile p)[4],int i){return (*p)[i];}"
+	 "int main(void){int b[4]={0,0,0,7};volatile int i=3;return g(&b,i)==7?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"runtime/bounds-local-ptr-to-multi-array-traps-deref",
+	 "int main(void){int m[4][3]={{0}};int (*p)[4][3]=&m;volatile int j=3;return (*p)[0][j];}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-local-ptr-to-multi-array-traps-index",
+	 "int main(void){int m[4][3]={{0}};int (*p)[4][3]=&m;volatile int j=3;return p[0][0][j];}", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"runtime/bounds-local-ptr-to-multi-array-inbounds",
+	 "int main(void){int m[4][3]={{0}};m[0][2]=9;int (*p)[4][3]=&m;"
+	 "volatile int j=2;return (*p)[0][j]==9&&p[0][0][j]==9?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	/* `int (**p)[N]` has two pointer hops: only the array dim is checkable. */
+	{"runtime/bounds-double-ptr-to-array-inbounds",
+	 "int main(void){int r[4]={1,2,3,4};int (*q)[4]=&r;int (**p)[4]=&q;"
+	 "return p[0][0][0]==1&&(*p)[0][3]==4?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"exact/bounds-double-ptr-to-array-outer-unchecked",
+	 "int f(void){int r[4]={0};int (*q)[4]=&r;int (**p)[4]=&q;return p[0][0][0];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])|sizeof(p[0])/sizeof(p[0][0])"},
+	/* A pointer to a VLA is not a VLA object: sizeof(p)/sizeof(p[0]) is a
+	 * pointer division and must not wrap. */
+	{"runtime/bounds-ptr-to-vla-local-unchecked",
+	 "int main(void){int n=4;int a[n];a[0]=7;int (*p)[n]=&a;return p[0][0]==7?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_VLA, NULL, "sizeof(p)/sizeof(p[0])"},
+	/* File-scope compound literals are initializers, not function bodies. */
+	{"runtime/filescope-compound-literal-init",
+	 "int *p=(int[]){1,2,3};struct S{int a;}s=(struct S){.a=5};"
+	 "int main(void){return p[1]+s.a==7?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"exact/filescope-compound-literal-keeps-init",
+	 "int *p=(int[]){1,2,3};", NULL,
+	 {0}, O_OK | O_FIXED, 0, FB_LINE, 0, "(int[]){1,2,3}", NULL},
+	/* The compound-literal fix must not steal bodies from definitions whose
+	 * return type is a typedef or tagged type: those spellings fail the
+	 * stricter parameter-list helper at scope-build time, but the name still
+	 * sits before the param paren. */
+	{"runtime/typedef-return-defer-body",
+	 "typedef void (*callback_t)(void);static void my_fn(void){}"
+	 "callback_t get_cb(void){defer (void)0;return my_fn;}"
+	 "int main(void){get_cb()();return 0;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
+	{"runtime/struct-return-defer-body",
+	 "struct S{int a;};struct S make(void){defer (void)0;return (struct S){.a=4};}"
+	 "int main(void){return make().a==4?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	/* A braceless `defer die();` stores the body as `[die, ';')` and synthesizes
 	 * the `;` at emit, so emit_statements never sees the semicolon that normally
 	 * triggers auto-unreachable; the deferred call re-detects it. Removing that
-	 * re-detection failed no cell of 46,353, which is how it was found. */
+	 * re-detection failed no cell of 46,353, which is how it was found.
+	 * MSVC gets `__assume(0)` via PLATFORM_TEXT; requiring the GNU spelling alone
+	 * is what made windows-x86_64 fail CI while every other job passed. */
 	{"exact/auto-unreachable-after-deferred-noreturn",
 	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
-	 {0}, O_OK, 0, FB_LINE, 0, "die(); __builtin_unreachable();", NULL},
+	 {0}, O_OK, 0, FB_LINE, CAP_POSIX, "die(); __builtin_unreachable();", NULL},
+	{"exact/auto-unreachable-after-deferred-noreturn-msvc",
+	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
+	 {&ax_msvc_target}, O_OK, 0, FB_LINE, CAP_WINDOWS, "die(); __assume(0);", NULL},
 	{"exact/no-auto-unreachable-after-deferred-noreturn",
 	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
-	 {0}, O_OK, 0, FB_LINE | FB_AUR, 0, NULL, "__builtin_unreachable"},
+	 {0}, O_OK, 0, FB_LINE | FB_AUR, 0, NULL, "__builtin_unreachable|__assume(0)"},
 	/* `int a[4][3]`, `int a[][3]` and `int (*a)[3]` are the same type. Only the
 	 * first dimension decays; the rest belong to the pointed-at type and are as
 	 * checkable as they are on a local. Found by mutation: raising the rank
