@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.7"
+#define PRISM_VERSION "1.1.8"
 
 /* Required by the preprocessing cache on every platform. */
 #include <time.h>

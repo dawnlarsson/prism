@@ -617,6 +617,21 @@ static PParseToken *pparse_prev_sibling(PParseContext *_pc, PParseToken *from);
 
 static PRISM_THREAD_LOCAL PParseContext *pparse_ctx = NULL;
 
+/* One bit per Phase-1 walk that scans for a terminator and now stops on a stray
+ * `}` as well. The walks are latent: four of the five change no output on any
+ * input found so far, so there is nothing downstream for a cell to assert.
+ * Recording the stop makes the bound itself testable, which is the property
+ * being fixed. Set only on malformed input; the release path never reads it. */
+enum {
+	PPARSE_WALK_TYPEDEF_DECLARATORS = 1u << 0, /* pparse_typedef_declaration */
+	PPARSE_WALK_DECL_INITIALIZER = 1u << 1,	   /* p1d_scan_init_orelse */
+	PPARSE_WALK_BITFIELD_WIDTH = 1u << 2,	   /* p1d_probe_declaration */
+	PPARSE_WALK_TYPEDEF_PRESCAN = 1u << 3,	   /* p1_full_depth_prescan, typedef/enum */
+	PPARSE_WALK_LABEL_LIST = 1u << 4,	   /* p1_full_depth_prescan, __label__ */
+};
+static PRISM_THREAD_LOCAL uint32_t pparse_walk_stops;
+
+
 /* Resolve TLS once at each cold boundary and thread `_pc` through hot calls. */
 #define PPARSE_CTX() PParseContext *const _pc = pparse_ctx
 
@@ -1088,6 +1103,14 @@ static inline PRISM_ALWAYS_INLINE PRISM_PURE bool pparse_equal_1(PParseToken *to
 }
 
 #define pparse_match_ch pparse_equal_1
+
+/* True exactly when a terminator-seeking walk is ending because it met a `}`
+ * instead of its own terminator, recording which walk it was. */
+static inline bool pparse_walk_stops_at_close(PParseToken *t, uint32_t bit) {
+	if (!t || !pparse_match_ch(t, '}')) return false;
+	pparse_walk_stops |= bit;
+	return true;
+}
 
 #define pparse_CH(c) (1ULL << ((c) - 32))
 #define pparse_match_set(tok, mask)                                                                                 \
@@ -3771,11 +3794,15 @@ static PRISM_PURE PParseArrayBindingInfo pparse_array_binding_info(PParseToken *
 	PParseTypedefEntry *binding = pparse_typedef_lookup(_pc, tok);
 	PParseBoundsArrayEntry *param_extent = NULL;
 	if (binding && (binding->is_param || binding->is_enum_const)) {
-		/* One exception: `int a[static N]` is a parameter whose extent C
-		 * guarantees, so it is checkable where an ordinary array parameter
-		 * is not. */
+		/* Two exceptions, for different reasons. `int a[static N]` is a
+		 * parameter whose extent C guarantees. `int (*p)[N]` is a parameter
+		 * whose extent is in the type: the array is not the parameter, it is
+		 * what the parameter points at, so it survives the decay that leaves
+		 * every other array parameter with nothing to check against. */
 		param_extent = pparse_bounds_array_lookup(_pc, tok);
-		if (!param_extent || !param_extent->static_extent_tok) return info;
+		bool ptr_to_array_param = param_extent && binding->is_param && param_extent->ptr_hops &&
+					  param_extent->array_dim_complete;
+		if (!param_extent || (!param_extent->static_extent_tok && !ptr_to_array_param)) return info;
 	}
 	PParseBoundsArrayEntry *array = pparse_bounds_array_lookup(_pc, tok);
 	if (array) {
@@ -5025,6 +5052,20 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 			PParseToken *op = pparse_pair_known(probe);
 			if (pparse_bounds_paren_has_array_arithmetic(op))
 				PPARSE_BOUNDS_DIAG(tok, PPARSE_ERR_BOUNDS_PTR_ARITH_SUB);
+			/* A parenthesized member expression is not the array the scan
+			 * below would find. `(entries[i].name)[j]` subscripts `name`, but
+			 * find_tracked_array skips names introduced by `.` or `->` and
+			 * returns `entries`, so the bound became the extent of the wrong
+			 * array: `(entries[0].name)[3]` on `char name[8]` was checked
+			 * against 2 and trapped on a valid read. Prism does not track
+			 * member extents, so the answer here is no check at all. */
+			if (pparse_idx(_pc, probe) >= 2) {
+				PParseToken *inner_last = &pparse_token_pool[pparse_idx(_pc, probe) - 1];
+				if (pparse_is_value_name_token(inner_last) &&
+				    (pparse_token_pool[pparse_idx(_pc, inner_last) - 1].tag &
+				     PPARSE_TT_MEMBER))
+					return false;
+			}
 			PParseToken *hit = pparse_bounds_find_tracked_array(pparse_next(_pc, op), probe);
 			if (hit && pparse_bounds_is_tracked_array(hit)) {
 				if (pparse_bounds_recovered_base_has_conditional(probe))
@@ -6254,7 +6295,12 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 			}
 		}
 	}
-	while (tok && !(pparse_match_ch(tok, ';')) && tok->kind != PPARSE_TK_EOF) {
+	/* pparse_skip_to_set below already returns on a `}`, but the loop condition
+	 * did not, so the next iteration ran pparse_declarator on it and carried on
+	 * past the end of the block. Groups are skipped whole, so a `}` here is
+	 * always stray. */
+	while (tok && !pparse_match_ch(tok, ';') && !pparse_walk_stops_at_close(tok, PPARSE_WALK_TYPEDEF_DECLARATORS) &&
+	       tok->kind != PPARSE_TK_EOF) {
 		PParseDecl decl = pparse_declarator(tok);
 		if (decl.var_name) {
 			pparse_ann(decl.var_name) |= P1_DEFER_SHADOW_NAME;
@@ -8956,6 +9002,76 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			    !(last_ident->flags & PPARSE_TF_RAW))
 				pparse_register_static_extent_param(last_ident, 1,
 								    pparse_idx(_pc, static_dim));
+			/* `int (*p)[4]` as a parameter carries its extent in the type
+			 * exactly as the local declaration does, but the local path reads
+			 * it off a parsed declarator and this loop walks tokens, so the
+			 * shape went unregistered and `(*p)[i]` in the body was unchecked
+			 * while the same pointer declared locally was checked. Match on
+			 * the declarator itself: `(` `*` name `)` followed by one or more
+			 * constant dimensions. */
+			if (pparse_feat(PPARSE_F_BOUNDS_CHECK) && !(last_ident->flags & PPARSE_TF_RAW) &&
+			    !static_dim && pparse_idx(_pc, last_ident) >= 2) {
+				PParseToken *star = &pparse_token_pool[pparse_idx(_pc, last_ident) - 1];
+				PParseToken *lp = &pparse_token_pool[pparse_idx(_pc, last_ident) - 2];
+				PParseToken *rp = pparse_next(_pc, last_ident);
+				if (pparse_match_ch(star, '*') && !(star->flags & PPARSE_TF_OPEN) &&
+				    pparse_match_ch(lp, '(') && (lp->flags & PPARSE_TF_OPEN) &&
+				    pparse_match_ch(rp, ')') && pparse_pair_known(lp) == rp) {
+					int prank = 0;
+					PParseToken *d = pparse_next(_pc, rp);
+					while (d && d != param_end && pparse_match_ch(d, '[') &&
+					       (d->flags & PPARSE_TF_OPEN) &&
+					       !(d->flags & PPARSE_TF_C23_ATTR)) {
+						PParseToken *cl = pparse_pair_known(d);
+						PParseToken *n = pparse_skip_noise(_pc, pparse_next(_pc, d));
+						/* Only a plain constant is an extent worth
+						 * trusting; `[]` and `[n]` are not. */
+						if (!n || n == cl || n->kind != PPARSE_TK_NUM ||
+						    pparse_skip_noise(_pc, pparse_next(_pc, n)) != cl) {
+							prank = 0;
+							break;
+						}
+						prank++;
+						d = pparse_next(_pc, cl);
+					}
+					if (prank > 0 && prank < 15)
+						pparse_register_array_binding_hops(
+						    last_ident, (uint8_t)(prank + 1), true, false, false, 1);
+				}
+			}
+			/* `int a[4][3]` and `int a[][3]` are `int (*a)[3]`, the same type
+			 * the block above registers when it is spelled with a star. Only
+			 * the first dimension decays; every later one is part of the
+			 * pointed-at type and is as checkable here as it is on a local.
+			 * Prism was checking `(*a)[j]` and leaving `a[i][j]` alone on
+			 * declarations that differ only in spelling. The first subscript
+			 * stays unchecked -- an array parameter carries no count -- unless
+			 * `static N` promises one, and that path owns the whole entry, so
+			 * it is left to it. */
+			if (pparse_feat(PPARSE_F_BOUNDS_CHECK) && !(last_ident->flags & PPARSE_TF_RAW) &&
+			    !static_dim && param_has_bracket) {
+				PParseToken *d = pparse_next(_pc, last_ident);
+				int seen = 0, trailing = 0;
+				bool ok_dims = true;
+				while (d && d != param_end && pparse_match_ch(d, '[') &&
+				       (d->flags & PPARSE_TF_OPEN) && !(d->flags & PPARSE_TF_C23_ATTR)) {
+					PParseToken *cl = pparse_pair_known(d);
+					PParseToken *n = pparse_skip_noise(_pc, pparse_next(_pc, d));
+					bool constant = n && n != cl && n->kind == PPARSE_TK_NUM &&
+							pparse_skip_noise(_pc, pparse_next(_pc, n)) == cl;
+					if (seen > 0) {
+						/* A later dimension that is not a constant leaves
+						 * nothing to check against, here or after it. */
+						if (!constant) { ok_dims = false; break; }
+						trailing++;
+					}
+					seen++;
+					d = pparse_next(_pc, cl);
+				}
+				if (ok_dims && trailing > 0 && trailing < 14)
+					pparse_register_array_binding_hops(
+					    last_ident, (uint8_t)(trailing + 1), true, false, false, 1);
+			}
 		}
 		if (pparse_match_ch(t, ',')) t = pparse_next(_pc, t);
 	}
@@ -10608,7 +10724,13 @@ static PParseToken *p1d_scan_init_orelse(PParseToken *t, bool *out_has_orelse, P
 	int init_td = 0;
 	PParseToken *eq = t; // chain predecessor of the first init token (for wrap-paren strip)
 	t = pparse_next(_pc, t); // skip '='
-	while (t && !pparse_match_ch(t, ';') && t->kind != PPARSE_TK_EOF) {
+	/* Same stop as `;`: a brace initializer is jumped whole through
+	 * PPARSE_TF_OPEN below, so a `}` reaching the condition closes the block the
+	 * declaration lives in and the initializer had no terminator. Scanning on
+	 * ran to end of input, which pulled an `orelse` from a later function into
+	 * this declaration's recipe and reported it as unlowerable there. */
+	while (t && !pparse_match_ch(t, ';') && !pparse_walk_stops_at_close(t, PPARSE_WALK_DECL_INITIALIZER) &&
+	       t->kind != PPARSE_TK_EOF) {
 		if (init_td == 0 && pparse_match_ch(t, ',')) {
 			if (!*out_has_orelse || pparse_comma_starts_declarator(t)) break;
 			prev_init_tok = t;
@@ -11040,7 +11162,11 @@ static void p1d_probe_declaration(PParseToken *tok,
 		 * get shadow registration above, then skip the width expr. */
 		if (pparse_match_ch(t, ':')) {
 			t = pparse_next(_pc, t);
-			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
+			/* Bit-field width, scanned to its `;`. `struct S { int a : 3 }`
+			 * has none, and without the `}` stop the scan left the struct
+			 * body and kept classifying tokens as members. */
+			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';') &&
+			       !pparse_walk_stops_at_close(t, PPARSE_WALK_BITFIELD_WIDTH)) {
 				if (t->flags & PPARSE_TF_OPEN) {
 					t = pparse_next(_pc, pparse_pair_known(t));
 					continue;
@@ -11644,7 +11770,16 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			}
 			pparse_typedef_declaration(ps->tok, ps->brace_depth);
 			if (td_saved_close) pparse_td_scope_close = td_saved_close;
-			while (ps->tok->kind != PPARSE_TK_EOF && !pparse_match_ch(ps->tok, ';')) {
+			/* A stray `}` ends the declaration as surely as `;` does, and this
+			 * loop drives the prescan's own cursor: without the stop,
+			 * `void g(void){ typedef int T }` ran ps->tok to end of input and
+			 * every statement after it was never seen as a statement. The
+			 * visible symptom was a `defer` two lines later reported as
+			 * "cannot be used in expression context" -- a diagnostic on
+			 * correct code, pointing away from the missing `;`. A `{` is
+			 * jumped whole below, so a `}` arriving here is always stray. */
+			while (ps->tok->kind != PPARSE_TK_EOF && !pparse_match_ch(ps->tok, ';') &&
+			       !pparse_walk_stops_at_close(ps->tok, PPARSE_WALK_TYPEDEF_PRESCAN)) {
 				p1d_register_enum_at(ps->tok, ps->brace_depth, CUR_SID(), ps->p1d_cur_func);
 				if (pparse_match_ch(ps->tok, '{')) {
 					PParseToken *close = pparse_pair_known(ps->tok);
@@ -11873,7 +12008,12 @@ static PRISM_HOT void p1_full_depth_prescan(PParseToken *tok) {
 			if (ps->tok->kind == PPARSE_TK_IDENT && ps->tok->len == 9 &&
 			    prism_memeq_static(pparse_loc(_pc, ps->tok), "__label__", 9)) {
 				PParseToken *t = pparse_next(_pc, ps->tok);
-			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';')) {
+			/* GNU `__label__` name list. Fix 49 stopped the emitter
+			 * duplicating tokens when the `;` is missing; this stops the
+			 * registration walk itself from leaving the block and taking
+			 * later identifiers for local labels. */
+			while (t->kind != PPARSE_TK_EOF && !pparse_match_ch(t, ';') &&
+			       !pparse_walk_stops_at_close(t, PPARSE_WALK_LABEL_LIST)) {
 					if (pparse_is_identifier_like(t)) {
 						PPARSE_ARENA_ENSURE_CAP(&_pc->main_arena,
 								 ps->local_labels,
@@ -12628,6 +12768,10 @@ static unsigned pparse_context_intro(PParseToken *t) {
 static bool pparse_analyze(PParseToken *tok) {
 	PPARSE_CTX();
 	pparse_reset();
+	/* Cleared per analysis, not per reset: the library entry points call
+	 * prism_reset() on the way out, so clearing it there would leave nothing
+	 * for a caller to read after the call returns. */
+	pparse_walk_stops = 0;
 	pparse_build_scopes(tok);
 	p1_full_depth_prescan(tok);
 	bool has_bounds_helper =

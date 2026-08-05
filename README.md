@@ -458,9 +458,11 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 The check is a single predicted-not-taken branch per subscript; the backend compiler constant-folds the `sizeof` ratio for fixed arrays and often eliminates the whole check when it can prove the index is in range.
 
 Pointer-to-array dereference is checked on the dimension the type carries:
-`int (*p)[4]` bounds `(*p)[i]` and `p[0][i]` against the `[4]`. The pointer hop
-itself is not checked — nothing says how many arrays `p` points at — so `p[i]`
-is left alone.
+`int (*p)[4]` bounds `(*p)[i]` and `p[0][i]` against the `[4]`, whether `p` is a
+local or a parameter. The array is what the pointer points at, so the extent
+survives the decay that leaves ordinary array parameters unbounded. The pointer
+hop itself is not checked — nothing says how many arrays `p` points at — so
+`p[i]` is left alone, and `int (*p)[n]` carries no constant to check against.
 
 **Opt-out:** `prism -fno-bounds-check src.c`
 
@@ -602,7 +604,7 @@ immediately overwrite a variable. Suppress that id or read it as intentional.
 Prism uses a GCC-compatible interface. Most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.7 - Robust C transpiler
+Prism v1.1.8 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
        prism [options] run src.c [-- prog_args...]

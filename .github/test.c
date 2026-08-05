@@ -947,6 +947,60 @@ static int run_internal(const Recipe *r, char *failed_action) {
 			}
 			unlink(src);
 			unlink(hdr);
+		} else if (*p == 'w') {
+			/* Five Phase-1 walks scan for a terminator. Each now stops on a
+			 * stray `}` as well, because without it the walk leaves the block
+			 * and keeps classifying tokens that belong to whatever follows.
+			 * One of the five is visible in the output: before the bound,
+			 * `void g(void){ typedef int T }` ran the prescan cursor to end of
+			 * input, so a `defer` two lines later was never seen at statement
+			 * level and was reported as "cannot be used in expression context"
+			 * -- an error on correct code. The other four change no output on
+			 * any input found so far, which is exactly why the bound itself is
+			 * what gets asserted: each shape must set its own bit, so a cell
+			 * cannot pass because some other walk happened to stop. */
+			static const struct {
+				uint32_t bit;
+				const char *src;
+			} shapes[] = {
+				{PPARSE_WALK_TYPEDEF_PRESCAN, "void g(void){ typedef int T }\n"},
+				{PPARSE_WALK_TYPEDEF_DECLARATORS, "void g(void){ typedef int T, U }\n"},
+				{PPARSE_WALK_DECL_INITIALIZER, "void g(void){ int x = 1 }\n"},
+				{PPARSE_WALK_BITFIELD_WIDTH, "struct S { int a : 3 }\nint h(void){ return 0; }\n"},
+				{PPARSE_WALK_LABEL_LIST,
+				 "void free(void*);\n"
+				 "void g(void){ __label__ L }\n"
+				 "void h(void){ int *p=0; defer free(p); (void)p; }\n"},
+			};
+			for (size_t i = 0; i < N(shapes); i++) {
+				PrismResult r =
+				    prism_transpile_source(shapes[i].src, "walk.c", prism_defaults());
+				PPARSE_CTX();
+				(void)_pc;
+				if (!(pparse_walk_stops & shapes[i].bit)) {
+					fprintf(stderr,
+						"walk bound %u did not stop at `}` for: %s",
+						(unsigned)shapes[i].bit, shapes[i].src);
+					ok = 0;
+				}
+				prism_free(&r);
+			}
+			/* Well-formed input must not trip any of them. */
+			{
+				PrismResult r = prism_transpile_source(
+				    "typedef struct { int x; } S;\n"
+				    "typedef int T, U;\n"
+				    "struct B { int a : 3; int b; };\n"
+				    "void g(void){ int x = 1; __label__ L; L: (void)x; }\n",
+				    "walk-ok.c", prism_defaults());
+				ok = ok && r.status == PRISM_OK;
+				if (pparse_walk_stops) {
+					fprintf(stderr, "walk bound fired on well-formed input: 0x%x\n",
+						(unsigned)pparse_walk_stops);
+					ok = 0;
+				}
+				prism_free(&r);
+			}
 		} else if (*p == 's') {
 			/* Action letters are dispatched by an if/else chain, so a letter
 			 * used twice silently disables the later branch: the first match
@@ -4444,6 +4498,41 @@ static const Recipe recipes[] = {
 	 O_OK | O_FIXED | O_COMPILE | O_RUN, 0, FB_AS | FB_LINE, CAP_POSIX,
 	 NULL, "static const int values[2]"},
 
+	/* Defer's ordering rules, one cell per rule, each checked against GNU
+	 * __attribute__((cleanup)) rather than against a hand-written expectation.
+	 * Mutation testing found the suite could not see any of these: emitting
+	 * defers FIFO instead of LIFO failed one cell of 46,343, stopping `break`
+	 * at the loop instead of the switch failed one, and running `continue`
+	 * only to the innermost block failed none at all. `exact/defer-lifo` above
+	 * asserts both calls appear and never their order, which is how a cell
+	 * named for LIFO passed a FIFO build. */
+	{"runtime/defer-order-continue-to-loop-body",
+	 "static int n;static void a(void){n=n*10+1;}static void b(void){n=n*10+2;}"
+	 "int main(void){for(int i=0;i<2;i++){defer a();{defer b();continue;}}return n==2121?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-order-break-stops-at-switch",
+	 "static int n;static void a(void){n=n*10+3;}static void b(void){n=n*10+4;}"
+	 "int main(void){for(int i=0;i<1;i++){defer a();switch(1){case 1:{defer b();break;}}"
+	 "n=n*10+5;}return n==453?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
+	/* The `break` sits in a block nested inside the switch, so unwinding to the
+	 * first enclosing scope and unwinding to the switch give different answers.
+	 * The cell above cannot tell them apart: its `break` is already innermost. */
+	{"runtime/defer-order-break-from-nested-block",
+	 "static int n;static void a(void){n=n*10+1;}static void b(void){n=n*10+2;}"
+	 "static void c(void){n=n*10+3;}"
+	 "int main(void){for(int i=0;i<1;i++){defer a();switch(1){case 1:{defer b();"
+	 "{defer c();break;}}}n=n*10+9;}return n==3291?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-order-three-deep-same-scope",
+	 "static int n;static void a(void){n=n*10+6;}static void b(void){n=n*10+7;}"
+	 "static void c(void){n=n*10+8;}int main(void){{defer a();defer b();defer c();}return n==876?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
+	{"runtime/defer-order-return-unwinds-every-scope",
+	 "static int n;static void a(void){n=n*10+1;}static void b(void){n=n*10+2;}"
+	 "static void c(void){n=n*10+3;}static void f(void){defer a();{defer b();{defer c();return;}}}"
+	 "int main(void){f();return n==321?0:1;}",
+	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
 	{"exact/defer-lifo", "void p(char);int main(void){defer p('A');{defer p('B');p('x');}return 0;}", NULL,
 	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0, "p('A')|p('B')", NULL},
 	/* Capture discovery precedes normal orelse/raw annotation.  The extension
@@ -4723,6 +4812,80 @@ static const Recipe recipes[] = {
 	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
 	 "return (entries[1].name)[0]=='b'?0:1;}", NULL,
 	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	/* The same shape at an index the outer array does not have. The cell above
+	 * only ever asks for element 0, which is in bounds for both extents, so it
+	 * passed while the member subscript was being checked against the *outer*
+	 * array: `char name[8]` inside `Entry entries[2]` bounded element 3 against
+	 * 2 and trapped on a valid read. The outer subscript keeps its check; the
+	 * member subscript gets none, because prism does not track member extents
+	 * and a bound taken from the wrong array is worse than no bound. */
+	{"runtime/bounds-member-array-index-past-outer-extent",
+	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
+	 "return (entries[1].name)[3]=='a'?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"exact/bounds-member-subscript-unwrapped",
+	 "typedef struct{char name[8];}Entry;static Entry entries[2];"
+	 "char f(int i){return (entries[i].name)[3];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "name)[__prism_bchk"},
+	/* A braceless `defer die();` stores the body as `[die, ';')` and synthesizes
+	 * the `;` at emit, so emit_statements never sees the semicolon that normally
+	 * triggers auto-unreachable; the deferred call re-detects it. Removing that
+	 * re-detection failed no cell of 46,353, which is how it was found. */
+	{"exact/auto-unreachable-after-deferred-noreturn",
+	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
+	 {0}, O_OK, 0, FB_LINE, 0, "die(); __builtin_unreachable();", NULL},
+	{"exact/no-auto-unreachable-after-deferred-noreturn",
+	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
+	 {0}, O_OK, 0, FB_LINE | FB_AUR, 0, NULL, "__builtin_unreachable"},
+	/* `int a[4][3]`, `int a[][3]` and `int (*a)[3]` are the same type. Only the
+	 * first dimension decays; the rest belong to the pointed-at type and are as
+	 * checkable as they are on a local. Found by mutation: raising the rank
+	 * recorded for an array parameter failed no cell at all, and the "mutant"
+	 * turned out to check more than the original correctly did. */
+	{"runtime/bounds-array-param-inner-dim-in-range",
+	 "static int f(int a[4][3], int i, int j){ return a[i][j]; }"
+	 "int main(void){ int m[4][3]={{0}}; m[2][2]=9; return f(m,2,2)==9?0:1; }", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"runtime/bounds-array-param-inner-dim-traps",
+	 "static int f(int a[4][3], int i, int j){ return a[i][j]; }"
+	 "int main(void){ int m[4][3]={{0}}; return f(m,0,3); }", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	{"exact/bounds-array-param-unsized-first-dim",
+	 "int f(int a[][3], int i, int j){ return a[i][j]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(a[0])/sizeof(a[0][0])", NULL},
+	{"exact/bounds-array-param-three-dims",
+	 "int f(int a[4][3][2], int i, int j, int k){ return a[i][j][k]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0,
+	 "sizeof(a[0])/sizeof(a[0][0])|sizeof(a[0][0])/sizeof(a[0][0][0])", NULL},
+	/* The first subscript still has nothing to check against, and a VLA
+	 * dimension is not a constant extent. */
+	{"exact/bounds-array-param-first-dim-unwrapped",
+	 "int f(int a[4][3], int i, int j){ return a[i][j]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
+	{"exact/bounds-array-param-vla-dim-unwrapped",
+	 "int f(int n, int a[][n], int i, int j){ return a[i][j]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, CAP_VLA, NULL, "[__prism_bchk"},
+	/* `int (*p)[N]` as a parameter. The extent is in the type, not in a
+	 * promise, so it survives the decay that leaves every other array
+	 * parameter unbounded -- but the local-declaration path reads it off a
+	 * parsed declarator and the parameter path walks tokens, so the same
+	 * pointer was checked as a local and unchecked as a parameter. */
+	{"runtime/bounds-ptr-to-array-param-in-range",
+	 "static int g(int (*p)[4], int i){ return (*p)[i]; }"
+	 "int main(void){ int b[4]={0,0,0,7}; return g(&b,3)==7?0:1; }", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	{"runtime/bounds-ptr-to-array-param-traps",
+	 "static int g(int (*p)[4], int i){ return (*p)[i]; }"
+	 "int main(void){ int b[4]={0}; return g(&b,4); }", NULL,
+	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	/* An ordinary array parameter still has nothing to check against, and a
+	 * dimension that is not a constant is not an extent worth trusting. */
+	{"exact/bounds-plain-array-param-unwrapped",
+	 "int f(int a[4], int i){ return a[i]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
+	{"exact/bounds-ptr-to-vla-param-unwrapped",
+	 "int f(int n, int (*p)[n], int i){ return (*p)[i]; }", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, CAP_VLA, NULL, "[__prism_bchk"},
 	{"reject/bounds-conditional-array-base",
 	 "int f(int choose,int i){int a[4]={0},b[2]={0};return (choose?a:b)[i];}", NULL,
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL,
@@ -5147,6 +5310,26 @@ static const Recipe recipes[] = {
 		   "int f(void){ return (int)sizeof(struct prism_pk_s); }",
 	 .oracle = O_OK | O_FILE | O_COMPILE, .requires = CAP_POSIX,
 	 .must_not_have = "PRISM_UNREFERENCED_PK"},
+	/* The one walk bound with a symptom in the output. A declaration with no
+	 * `;` before its closing brace used to run the Phase-1 cursor to end of
+	 * input, so nothing after it was seen at statement level: the `defer` two
+	 * lines down was reported as "cannot be used in expression context", an
+	 * error naming correct code and pointing away from the real mistake. The
+	 * input is still not valid C; the point is that prism now passes it to the
+	 * backend, which says so at the right line, instead of inventing a
+	 * diagnostic of its own. */
+	{.id = "walk/typedef-without-semicolon-keeps-later-defer",
+	 .source = "void free(void*);void use(void*);\n"
+		   "void g(void){ typedef int T }\n"
+		   "void h(void){ int *p=0; defer free(p); use(p); }",
+	 .oracle = O_OK, .must_not_have = "defer free"},
+	{.id = "walk/enum-without-semicolon-keeps-later-defer",
+	 .source = "void free(void*);void use(void*);\n"
+		   "void g(void){ enum E { A, B } }\n"
+		   "void h(void){ int *p=0; defer free(p); use(p); }",
+	 .oracle = O_OK, .must_not_have = "defer free"},
+	{"internal/phase1-walk-bounds", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
+	 NULL, NULL, NULL, 0, "w"},
 	{"internal/action-letters-unique", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
 	 NULL, NULL, NULL, 0, "s"},
 	{"internal/header-cache", NULL, NULL, {0}, O_INTERNAL, 0, 0, CAP_POSIX,
