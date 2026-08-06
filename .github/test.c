@@ -2791,8 +2791,10 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 		if (ok && (bits & FB_ORELSE)) ok = count_kw(x.output, "orelse") == 0;
 		if (ok)
 			ok = terms_present(x.output, "__prism_matrix_zero = 0", (bits & FB_ZERO) != 0);
+		/* Call site, not the helper definition: `__prism_bchk(` alone matches
+		 * the injected static function even when no index is wrapped. */
 		if (ok)
-			ok = terms_present(x.output, "__prism_bchk", (bits & FB_BOUNDS) != 0);
+			ok = terms_present(x.output, "__prism_bchk((", (bits & FB_BOUNDS) != 0);
 		if (ok)
 			ok = terms_present(x.output, "static \nconst int __prism_matrix_static",
 					   (bits & FB_AS) != 0);
@@ -2848,6 +2850,20 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 				ok = y.status == PRISM_OK && y.output && !strcmp(x.output, y.output);
 				prism_free(&y);
 			}
+			/* Trichotomy used to ignore must_have/must_not_have, so a
+			 * successful fixed-point with zero instrumentation still
+			 * counted as coverage (bounds/product false greens).
+			 * `__prism_bchk((` is gated on the cell's bounds bit so
+			 * features/product can require a wrap when bounds is on
+			 * and forbid one when an axis clears it. */
+			if (ok && r->must_have) {
+				if (strstr(r->must_have, "__prism_bchk(("))
+					ok = terms_present(x.output, "__prism_bchk((",
+							   f.bounds_check != 0);
+				else
+					ok = terms_present(x.output, r->must_have, 1);
+			}
+			if (ok && !terms_present(x.output, r->must_not_have, 0)) ok = 0;
 		}
 	} else {
 		if (oracle & O_OK) ok = x.status == PRISM_OK && x.output;
@@ -2857,8 +2873,13 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 		if ((oracle & O_NO_EXT) && x.output &&
 		    (count_kw(x.output, "defer") || count_kw(x.output, "orelse") || count_kw(x.output, "raw")))
 			ok = 0;
-		if (!terms_present(x.output, r->must_have, 1)) ok = 0;
-		if (!terms_present(x.output, r->must_not_have, 0)) ok = 0;
+		/* Reject cells have no emission; must_* only constrains accepted output.
+		 * Axis values that flip to O_REJECT (e.g. reverse subscript traps) must
+		 * not fail a recipe-level `__prism_bchk((` requirement. */
+		if (!(oracle & O_REJECT)) {
+			if (!terms_present(x.output, r->must_have, 1)) ok = 0;
+			if (!terms_present(x.output, r->must_not_have, 0)) ok = 0;
+		}
 		if ((oracle & O_FIXED) && x.status == PRISM_OK && x.output) {
 			PrismFeatures fp = f;
 			fp.zeroinit = fp.auto_static = fp.auto_unreachable = fp.bounds_check = false;
@@ -2885,8 +2906,18 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 			ok = ok && reference_rc >= 0 && prism_rc == reference_rc;
 		}
 		if ((oracle & O_TRAP) && x.status == PRISM_OK && x.output) {
+			/* Bounds traps terminate by signal (`__builtin_trap`). A plain
+			 * `return 1` from an unchecked OOB read (e.g. `x[8]==9?0:1`)
+			 * must not satisfy this oracle — that false pass is how
+			 * `bounds/depth-product` kept `((p[0]))[i]` "green" while
+			 * missing `__prism_bchk`. Require a signal-style status
+			 * (128+signum from compile_output) and, when bounds are on,
+			 * that the emission actually wrapped an index. */
 			int rc = compile_output(x.output, 1);
-			ok = ok && rc > 0 && rc < 256;
+			ok = ok && rc >= 128 && rc < 256;
+			if (ok && (f.bounds_check) &&
+			    !terms_present(x.output, "__prism_bchk((", 1))
+				ok = 0;
 		}
 #endif
 	}
@@ -3141,28 +3172,65 @@ static const AxisValue decl_contexts[] = {
 };
 static const Axis ax_decl_ctx = {"context", decl_contexts, N(decl_contexts)};
 
-static const AxisValue bounds_values[] = {
+/* Split the old trichotomy bounds/product: one oracle cannot require a wrap
+ * for evaluated subscripts, forbid a wrap for sizeof/typeof/_Generic and
+ * `&a[N]`, and accept rejects for `*(a+i)` / `i[a]`. Each family gets its own
+ * product so a missing `__prism_bchk((` call is a hard fail, not a green
+ * fixed-point. */
+static const AxisValue bounds_checked_values[] = {
+	{"read", "a[i]", 0, 0}, {"write", "a[i]=1", 0, 0},
+	{"multi", "m[i][j]", 0, 0}, {"paren-addr", "*&a[i]", 0, 0},
+	{"post-and", "x++ & a[i]", 0, 0}, {"compound-and", "((int){5}) & a[i]", 0, 0},
+};
+static const Axis ax_bounds_checked = {"expr", bounds_checked_values, N(bounds_checked_values)};
+
+static const AxisValue bounds_reject_values[] = {
+	{"deref", "*(a+i)", 0, 0}, {"reverse", "i[a]", 0, 0},
+	{"comma-deref", "(0,*(a+i))", 0, 0},
+	{"reverse-addr", "&(i[a])", 0, 0},
+};
+static const Axis ax_bounds_reject = {"expr", bounds_reject_values, N(bounds_reject_values)};
+
+static const AxisValue bounds_addr_values[] = {
+	{"addr", "&a[8]", 0, 0},
+	{"addr-inner-paren", "&(a[8])", 0, 0},
+};
+static const Axis ax_bounds_addr = {"expr", bounds_addr_values, N(bounds_addr_values)};
+
+/* Full alphabet for unevaluated contexts: every expr must parse, and none may
+ * wrap (the operand is not evaluated). */
+static const AxisValue bounds_uneval_expr_values[] = {
 	{"read", "a[i]", 0, 0}, {"write", "a[i]=1", 0, 0},
 	{"multi", "m[i][j]", 0, 0}, {"deref", "*(a+i)", 0, 0},
 	{"reverse", "i[a]", 0, 0}, {"addr", "&a[8]", 0, 0},
 	{"paren-addr", "*&a[i]", 0, 0}, {"post-and", "x++ & a[i]", 0, 0},
 	{"compound-and", "((int){5}) & a[i]", 0, 0},
+	{"comma-deref", "(0,*(a+i))", 0, 0},
+	{"nested-paren-deref", "(*(a+i))", 0, 0},
 };
-static const Axis ax_bounds = {"expr", bounds_values, N(bounds_values)};
+static const Axis ax_bounds_uneval_expr = {
+	"expr", bounds_uneval_expr_values, N(bounds_uneval_expr_values)
+};
 
-static const AxisValue bounds_contexts[] = {
+static const AxisValue bounds_eval_contexts[] = {
 	{"return", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return (@0@);}", 0, 0},
 	{"assign", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;x=(@0@);return x;}", 0, 0},
 	{"if", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;if(@0@)x++;return x;}", 0, 0},
 	{"while", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;while(@0@)break;return x;}", 0, 0},
-	{"sizeof", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return sizeof(@0@);}", 0, 0},
-	{"typeof", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;typeof(@0@)y=0;return !!y;}", 0, 0},
-	{"generic", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return _Generic(@0@,int:1,default:0);}", 0, 0},
 	{"stmt", "void f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;(void)(@0@);}", 0, 0},
 	{"stmt-expr", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return ({(@0@);});}", 0, 0},
 	{"stmt-expr-nest", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return ({({(@0@);});});}", 0, 0},
 };
-static const Axis ax_bounds_ctx = {"context", bounds_contexts, N(bounds_contexts)};
+static const Axis ax_bounds_eval_ctx = {"context", bounds_eval_contexts, N(bounds_eval_contexts)};
+
+static const AxisValue bounds_uneval_contexts[] = {
+	{"sizeof", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return sizeof(@0@);}", 0, 0},
+	{"typeof", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;typeof(@0@)y=0;return !!y;}", 0, 0},
+	{"generic", "int f(int i,int j){int a[8]={0},m[4][5]={{0}},x=1;return _Generic(@0@,int:1,default:0);}", 0, 0},
+};
+static const Axis ax_bounds_uneval_ctx = {
+	"context", bounds_uneval_contexts, N(bounds_uneval_contexts)
+};
 
 /* Maximalist recursive bounds shapes: pointer hops, static/multi-dim params.
  * Crossed with an index axis that flips the oracle between in-range execute
@@ -3170,7 +3238,11 @@ static const Axis ax_bounds_ctx = {"context", bounds_contexts, N(bounds_contexts
  * subscripts are intentionally unchecked, so a trap axis would be wrong. */
 static const AxisValue bounds_depth_index[] = {
 	{"in", "3", 0, 0, O_OK | O_RUN | O_FIXED},
-	{"trap", "8", 0, 0, O_OK | O_TRAP},
+	/* Index past the product's `[16]` extents. `8` was still in-range, so
+	 * trap cells only ever saw `…==9?0:1` → exit 1 — and the old O_TRAP
+	 * oracle (`rc > 0`) greenlit that as a "trap". Keep O_FIXED: axis
+	 * oracles replace the recipe oracle, they do not OR. */
+	{"trap", "16", 0, 0, O_OK | O_TRAP | O_FIXED},
 };
 static const Axis ax_bounds_depth_index = {"index", bounds_depth_index, N(bounds_depth_index)};
 
@@ -3270,6 +3342,12 @@ static const AxisValue bounds_depth_shapes[] = {
 	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return ({({m[0][@0@];});})==9?0:1;}", 0, 0},
 	{"stmt-expr3-ptr1",
 	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ({({({(*p)[@0@];});});})==9?0:1;}", 0, 0},
+	{"param-static-1d",
+	 "static int f(int a[static 16],int j){return a[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
+	{"param-static-const-1d",
+	 "static int f(int a[static const 16],int j){return a[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(a,@0@)==9?0:1;}", 0, 0},
 };
 static const Axis ax_bounds_depth_shape = {"shape", bounds_depth_shapes, N(bounds_depth_shapes)};
 
@@ -3347,6 +3425,77 @@ static const AxisValue bounds_ptr_shapes[] = {
 	 "int main(void){int t[2][4][16]={{{0}}};t[0][0][3]=9;int (*p)[2][4][16]=&t;return (*p)[0][0][@0@]==9?0:1;}", 0, 0},
 };
 static const Axis ax_bounds_ptr_shape = {"shape", bounds_ptr_shapes, N(bounds_ptr_shapes)};
+
+/* Decl-site × spelling: local vs param registration paths, plus typedef /
+ * typeof / double-paren declarators that hand Recipes kept rediscovering.
+ * Crossed with the same in/trap index axis (extent 16). */
+static const AxisValue bounds_decl_site_shapes[] = {
+	{"local-direct",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return (*p)[@0@]==9?0:1;}", 0, 0},
+	{"local-dbl-decl",
+	 "int main(void){int a[16]={0};a[3]=9;int ((*p))[16]=&a;return ((*p))[@0@]==9?0:1;}", 0, 0},
+	{"local-index0-paren",
+	 "int main(void){int a[16]={0};a[3]=9;int (*p)[16]=&a;return ((p[0]))[@0@]==9?0:1;}", 0, 0},
+	{"param-direct",
+	 "static int f(int (*p)[16],int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-dbl-decl",
+	 "static int f(int ((*p))[16],int j){return ((*p))[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"param-dbl-decl-index0",
+	 "static int f(int ((*p))[16],int j){return ((p[0]))[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"typedef-PA-param",
+	 "typedef int (*PA)[16];static int f(PA p,int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"typedef-CPA-param",
+	 "typedef int (*PA)[16];typedef PA CPA;static int f(CPA p,int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"inline-A-param",
+	 "typedef int A[16];static int f(A (*p)[4],int i,int j){return (*p)[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(&m,0,@0@)==9?0:1;}", 0, 0},
+	{"typeof-param",
+	 "static int f(typeof(int (*)[16]) p,int j){return (*p)[j];}"
+	 "int main(void){int a[16]={0};a[3]=9;return f(&a,@0@)==9?0:1;}", 0, 0},
+	{"typeof-2d-param",
+	 "static int f(typeof(int (*)[4][16]) p,int i,int j){return (*p)[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(&m,0,@0@)==9?0:1;}", 0, 0},
+	{"local-typedef-PA",
+	 "typedef int (*PA)[16];int main(void){int a[16]={0};a[3]=9;PA p=&a;return (*p)[@0@]==9?0:1;}", 0, 0},
+	{"local-typeof",
+	 "int main(void){int a[16]={0};a[3]=9;typeof(int (*)[16]) p=&a;return (*p)[@0@]==9?0:1;}", 0, 0},
+	{"local-index0-paren-2d",
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;return ((p[0]))[0][@0@]==9?0:1;}", 0, 0},
+	{"typedef-M-param",
+	 "typedef int M[4][16];static int f(M a,int i,int j){return a[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(m,0,@0@)==9?0:1;}", 0, 0},
+	{"typedef-PA-2d-param",
+	 "typedef int (*PA)[4][16];static int f(PA p,int i,int j){return (*p)[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(&m,0,@0@)==9?0:1;}", 0, 0},
+	{"typedef-AA-PA-param",
+	 "typedef int AA[16];typedef AA (*PA)[4];static int f(PA p,int i,int j){return (*p)[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(&m,0,@0@)==9?0:1;}", 0, 0},
+	{"typeof-M-param",
+	 "static int f(typeof(int[4][16]) a,int i,int j){return a[i][j];}"
+	 "int main(void){int m[4][16]={{0}};m[0][3]=9;return f(m,0,@0@)==9?0:1;}", 0, 0},
+};
+static const Axis ax_bounds_decl_site_shape = {"shape", bounds_decl_site_shapes, N(bounds_decl_site_shapes)};
+
+/* Phase-1 function bodies written as GNU statement expressions (macro-expanded
+ * `f(void)P({…})` forms). Stmt-expr spellings are classified as bodies for
+ * Phase 1 but emission keeps the wrappers, which host compilers reject — so
+ * only the portable brace form is executed. */
+static const AxisValue parse_fn_body_shapes[] = {
+	{"brace", "int f(void){return 0;}int main(void){return f();}", 0, 0,
+	 O_OK | O_RUN | O_FIXED},
+	{"stmt-expr", "int f(void)({return 0;})int main(void){return f();}", 0, 0,
+	 O_OK | O_FIXED},
+	{"stmt-expr-paren", "int f(void)(({return 0;}))int main(void){return f();}", 0, 0,
+	 O_OK | O_FIXED},
+	{"stmt-expr-paren2", "int f(void)((({return 0;})))int main(void){return f();}", 0, 0,
+	 O_OK | O_FIXED},
+};
+static const Axis ax_parse_fn_body_shape = {"body", parse_fn_body_shapes, N(parse_fn_body_shapes)};
 
 /* Cast / compound-literal / sizeof nesting — grammar disambiguation product. */
 static const AxisValue parse_cl_shapes[] = {
@@ -4302,22 +4451,32 @@ static const Axis ax_runtime_bounds_oob = {
 	"access", runtime_bounds_oob_values, N(runtime_bounds_oob_values)
 };
 
-static const AxisValue runtime_bounds_ok_values[] = {
+static const AxisValue runtime_bounds_ok_wrap_values[] = {
+	{"local", "int main(void){int a[4]={1,2,3,4};volatile int i=3;return a[i]==4?0:1;}", 0, 0},
 	{"2d", "int main(void){int m[2][3]={{1,2,3},{4,5,6}};return m[1][2]==6?0:1;}", 0, 0},
 	{"vla", "int main(int n,char**v){(void)v;n+=2;int a[n];for(int i=0;i<n;i++)a[i]=i;return a[n-1]==n-1?0:1;}", 0, 0},
-	{"tracked-pointer", "int main(void){int a[4]={1,2,3,4};int*p=a;return p[2]==3?0:1;}", 0, 0},
-	{"untracked-pointer", "int main(void){int a[4]={1,2,3,4};int*p=a;volatile int i=3;return p[i]==4?0:1;}", 0, 0},
 	{"defer-index", "int main(void){int a[5]={0};int i=2;defer{(void)a[i];}return 0;}", 0, 0},
 	{"orelse-action-index", "int main(void){int a[5]={0};int i=1;int*p=0;p=p orelse{(void)a[i];return 0;};return 1;}", 0, 0},
 	{"orelse-in-index", "int main(void){int a[4]={1,2,3,4};int z=0;return a[z orelse 2]==3?0:1;}", 0, 0},
 	{"stmt-expr-index", "int main(void){int a[5]={9,8,7,6,5};int i=0;int v=({a[i];});return v==9?0:1;}", 0, 0},
+};
+static const Axis ax_runtime_bounds_ok_wrap = {
+	"access", runtime_bounds_ok_wrap_values, N(runtime_bounds_ok_wrap_values)
+};
+
+/* Pointer decays and one-past `&a[i]` must run without a wrap. Mixing them into
+ * the wrap product made a recipe-level `__prism_bchk((` impossible. */
+static const AxisValue runtime_bounds_ok_nowrap_values[] = {
+	{"tracked-pointer", "int main(void){int a[4]={1,2,3,4};int*p=a;return p[2]==3?0:1;}", 0, 0},
+	{"untracked-pointer", "int main(void){int a[4]={1,2,3,4};int*p=a;volatile int i=3;return p[i]==4?0:1;}", 0, 0},
 	{"one-past-deep-paren", "int main(void){int a[4];volatile int i=4;return &((a[i]))==a+4?0:1;}", 0, 0},
+	{"one-past-inner-paren", "int main(void){int a[4];volatile unsigned long i=4;return &(a[i])==a+4?0:1;}", 0, 0},
 	{"one-past-if-body", "int main(void){int a[4];volatile int i=4;if(1)&a[i];return 0;}", 0, 0},
 	{"one-past-while-body", "int main(void){int a[4];volatile int i=4;while(0)&a[i];return &a[i]==a+4?0:1;}", 0, 0},
 	{"one-past-switch-body", "int main(void){int a[4];volatile int i=4;switch(0){default:&a[i];}return 0;}", 0, 0},
 };
-static const Axis ax_runtime_bounds_ok = {
-	"access", runtime_bounds_ok_values, N(runtime_bounds_ok_values)
+static const Axis ax_runtime_bounds_ok_nowrap = {
+	"access", runtime_bounds_ok_nowrap_values, N(runtime_bounds_ok_nowrap_values)
 };
 
 /* Runtime trap cells must reach every tracked binding kind, not merely the
@@ -4672,21 +4831,33 @@ static const Recipe recipes[] = {
 	{"declarations/product", "@1@", NULL, {&ax_decl, &ax_decl_ctx, &ax_features}, O_OK | O_FIXED, 0, FB_LINE, 0},
 	/* Recursive bounds depth × in-range/trap. Pointer hops, static/qualified
 	 * params, multi-dim locals — every shape must either return 0 on index 3
-	 * or trap on index 8. */
+	 * or signal-trap on index 16 with a `__prism_bchk((` call site. */
 	{"bounds/depth-product", "@1@", NULL,
-	 {&ax_bounds_depth_index, &ax_bounds_depth_shape}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	 {&ax_bounds_depth_index, &ax_bounds_depth_shape}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX,
+	 "__prism_bchk(("},
 	/* Member paren depth 0..8 at an index past the outer array (2) but inside
-	 * the member (16). Must run, never trap — wrong outer extent was the bug. */
+	 * the member (16). Must run, never trap — wrong outer extent was the bug.
+	 * Do not require `__prism_bchk((`: member subscripts are intentionally
+	 * unchecked, and shapes that only touch `q->name` emit the helper with
+	 * no call site. Forbid the wrong `name)[__prism_bchk` wraps instead. */
 	{"bounds/member-paren-depth",
 	 "typedef struct{char name[16];}E;int main(void){E e[2]={{\"abcdefghijklmnop\"},{\"ABCDEFGHIJKLMNOP\"}};E *q=&e[1];"
 	 "return @0@[8]=='I'?0:1;}", NULL,
-	 {&ax_bounds_member_paren}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk",
+	 {&ax_bounds_member_paren}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, NULL,
 	 "name)[__prism_bchk|name))[__prism_bchk|name)))[__prism_bchk|name))))[__prism_bchk|name)))))[__prism_bchk"
-	 "|name))))))[__prism_bchk|name)))))))[__prism_bchk"},
+	 "|name))))))[__prism_bchk|name)))))))[__prism_bchk|name))))))))[__prism_bchk|name)))))))))[__prism_bchk"},
 	/* Ptr-to-array depth × in-range/trap × feature toggles (bounds stays on). */
 	{"bounds/ptr-array-feature-product", "@1@", NULL,
 	 {&ax_bounds_depth_index, &ax_bounds_ptr_shape, &ax_bounds_ptr_features},
-	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	/* Local vs param × declarator spelling (typedef / typeof / double-paren).
+	 * Catches registration-path splits that depth-product's local-only shapes miss. */
+	{"bounds/decl-site-product", "@1@", NULL,
+	 {&ax_bounds_depth_index, &ax_bounds_decl_site_shape},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	/* Function body as stmt-expr (with optional extra parens from macros). */
+	{"parse/function-body-stmt-expr", "@0@", NULL,
+	 {&ax_parse_fn_body_shape}, O_OK | O_FIXED, 0, FB_LINE, CAP_POSIX},
 	/* Cast vs compound-literal vs sizeof nesting (no top-level orelse). */
 	{"parse/cast-compound-product", "int g(void);int h(void);int main(void){ @1@ }", NULL,
 	 {&ax_parse_cl_payload, &ax_parse_cl_shape, &ax_parse_cl_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
@@ -4708,7 +4879,7 @@ static const Recipe recipes[] = {
 	{"parse/defer-context-nest-product", "@1@", NULL,
 	 {&ax_defer_nest_body, &ax_defer_nest_ctx, &ax_parse_keep_defer_features}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"features/product", "int g(void);void c(void);int f(int i){int a[8];const int table[2]={1,2};defer c();int x=g() orelse 2;raw int y;return a[i]+table[0]+x+y;}",
-	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0},
+	 NULL, {&ax_features}, O_TRICHOTOMY, FB_BOUNDS | FB_AS | FB_AUR, FB_LINE, 0, "__prism_bchk(("},
 	{"features/power-set/top", "@0@", NULL,
 	 {&ax_feature_matrix_top, &ax_feature_matrix_emission}, O_FEATURE_MATRIX, 0, 0, 0},
 	{"features/power-set/block", "@0@", NULL,
@@ -4744,11 +4915,20 @@ static const Recipe recipes[] = {
 	 "#line 2 \"recipe.c\""},
 	{"corpus/retired-regressions", "@0@", NULL, {&ax_corpus},
 	 O_ANY_STATUS | O_REPLAY, 0, FB_LINE, 0},
-	{"bounds/product", "@1@", NULL, {&ax_bounds, &ax_bounds_ctx}, O_TRICHOTOMY, FB_BOUNDS, FB_LINE, 0},
+	/* Evaluated subscript contexts must emit a call site. Unevaluated
+	 * contexts and one-past `&a[N]` must not. Rejected shapes stay rejects. */
+	{"bounds/product", "@1@", NULL, {&ax_bounds_checked, &ax_bounds_eval_ctx},
+	 O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, "__prism_bchk(("},
+	{"bounds/unevaluated-product", "@1@", NULL, {&ax_bounds_uneval_expr, &ax_bounds_uneval_ctx},
+	 O_OK | O_FIXED | O_COMPILE, FB_BOUNDS, FB_LINE, CAP_POSIX, NULL, "__prism_bchk(("},
+	{"bounds/reject-product", "@1@", NULL, {&ax_bounds_reject, &ax_bounds_eval_ctx},
+	 O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
+	{"bounds/addr-product", "@1@", NULL, {&ax_bounds_addr, &ax_bounds_eval_ctx},
+	 O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, NULL, "__prism_bchk(("},
 	{"safety/bounds-strict", "@0@", NULL, {&ax_safety_bounds_hazard},
 	 O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
 	{"safety/bounds-warning", "@0@", NULL, {&ax_safety_bounds_hazard},
-	 O_OK | O_FIXED | O_COMPILE, FB_BOUNDS | FB_WARN, FB_LINE, CAP_POSIX},
+	 O_OK | O_FIXED | O_COMPILE, FB_BOUNDS | FB_WARN, FB_LINE, CAP_POSIX, NULL, "__prism_bchk(("},
 	{"runtime/orelse-product",
 	 "static int __lhs,__rhs,__value,__need_fb;static int src(void){__lhs++;return @0@;}"
 	 "static int fbc(void){__rhs++;return 11;}static void test(void){@3@}"
@@ -4839,27 +5019,29 @@ static const Recipe recipes[] = {
 	{"differential/orelse-identifier-shapes", "@0@", NULL,
 	 {&ax_orelse_ident_shape}, O_OK | O_OUTPUT_EQ_OFF | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"runtime/bounds-traps", "int main(void){int a[4]={0},m[4][4]={{0}};volatile unsigned long i=4;@0@}",
-	 NULL, {&ax_runtime_bounds_oob}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	 NULL, {&ax_runtime_bounds_oob}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
 	{"runtime/bounds-vla-trap",
 	 "int main(int n,char**v){(void)v;n+=2;int a[n];volatile int i=n+1;return a[i];}",
-	 NULL, {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA},
-	{"runtime/bounds-inbounds-product", "@0@", NULL, {&ax_runtime_bounds_ok}, O_OK | O_RUN,
-	 FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA},
+	 NULL, {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA, "__prism_bchk(("},
+	{"runtime/bounds-inbounds-product", "@0@", NULL, {&ax_runtime_bounds_ok_wrap},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX | CAP_VLA, "__prism_bchk(("},
+	{"runtime/bounds-nowrap-product", "@0@", NULL, {&ax_runtime_bounds_ok_nowrap},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, NULL, "__prism_bchk(("},
 	{"runtime/bounds-binding-trap-matrix",
 	 "static int g[4]={0};typedef int Row[4];int main(void){int a[4]={0};"
 	 "static int s[4]={0};Row r={0};volatile unsigned long idx=4;@1@}",
 	 NULL, {&ax_runtime_bounds_base, &ax_runtime_bounds_access}, O_OK | O_TRAP | O_FIXED,
-	 FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	 FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
 	{"runtime/bounds-rank-trap-matrix",
 	 "static int gm[4][3]={{0}};typedef int Matrix[4][3];int main(void){"
 	 "int m[4][3]={{0}};static int sm[4][3]={{0}};Matrix tm={{0}};"
 	 "volatile unsigned long idx=4;@1@}",
 	 NULL, {&ax_runtime_bounds_matrix_base, &ax_runtime_bounds_matrix_access},
-	 O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
+	 O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
 	{"runtime/bounds-typeof-vla-rank-traps",
 	 "int main(void){int n=2;typeof(int[n][n]) a;volatile int i=n;@0@}", NULL,
 	 {&ax_runtime_bounds_typeof_vla}, O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE,
-	 CAP_POSIX | CAP_VLA, "__builtin_memset|__prism_bchk"},
+	 CAP_POSIX | CAP_VLA, "__builtin_memset|__prism_bchk(("},
 	{"runtime/auto-static-product", "@0@", NULL, {&ax_runtime_autostatic}, O_OK | O_RUN,
 	 FB_AS, FB_LINE, CAP_POSIX},
 
@@ -4950,9 +5132,8 @@ static const Recipe recipes[] = {
 	 * Mutation testing found the suite could not see any of these: emitting
 	 * defers FIFO instead of LIFO failed one cell of 46,343, stopping `break`
 	 * at the loop instead of the switch failed one, and running `continue`
-	 * only to the innermost block failed none at all. `exact/defer-lifo` above
-	 * asserts both calls appear and never their order, which is how a cell
-	 * named for LIFO passed a FIFO build. */
+	 * only to the innermost block failed none at all. A retired emission-only
+	 * LIFO cell asserted call order in the C text without executing it. */
 	{"runtime/defer-order-continue-to-loop-body",
 	 "static int n;static void a(void){n=n*10+1;}static void b(void){n=n*10+2;}"
 	 "int main(void){for(int i=0;i<2;i++){defer a();{defer b();continue;}}return n==2121?0:1;}",
@@ -4980,9 +5161,6 @@ static const Recipe recipes[] = {
 	 "static void c(void){n=n*10+3;}static void f(void){defer a();{defer b();{defer c();return;}}}"
 	 "int main(void){f();return n==321?0:1;}",
 	 NULL, {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX},
-	{"exact/defer-lifo", "void p(char);int main(void){defer p('A');{defer p('B');p('x');}return 0;}", NULL,
-	 {0}, O_OK | O_NO_EXT | O_FIXED, 0, FB_LINE, 0,
-	 "p('B');} { int __prism_ret_0 = ( 0);  p('A')", NULL},
 	/* Capture discovery precedes normal orelse/raw annotation.  The extension
 	 * spellings inside a deferred declaration must not enter defer_name_set;
 	 * otherwise the unrelated locals below are rejected as false shadows. */
@@ -5009,16 +5187,8 @@ static const Recipe recipes[] = {
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "break"},
 	{"reject/continue-in-braced-defer", "void f(void){for(;;){defer {continue;}break;}}", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "continue"},
-	{"exact/zeroinit-scalar", "void f(void){int x;(void)x;}", NULL, {0}, O_OK, 0, FB_LINE, 0,
-	 "x = 0", NULL},
-	{"exact/zeroinit-array", "void f(void){int a[8];(void)a;}", NULL, {0}, O_OK, 0, FB_LINE, 0,
-	 "a[8] = {0}", NULL},
 	{"exact/raw-suppresses-zero", "void f(void){raw int x;(void)x;}", NULL, {0}, O_OK | O_NO_EXT,
 	 0, FB_LINE, 0, NULL, "memset|x = 0"},
-	{"exact/bounds-wrap", "int f(int i){int a[8]={0};return a[i];}", NULL, {0}, O_OK,
-	 FB_BOUNDS, FB_LINE, 0, "__prism_bchk", NULL},
-	{"exact/bounds-address", "int f(void){int a[8]={0};return &a[8]!=0;}", NULL, {0}, O_OK,
-	 FB_BOUNDS, FB_LINE, 0, "&a[8]", "&a[__prism_bchk"},
 	{"exact/raw-after-pragma", "#pragma pack(push,1)\nraw struct S{char c;int x;};\n#pragma pack(pop)\n", NULL,
 	 {0}, O_OK | O_NO_EXT | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 	{"exact/raw-block-orelse", "int g(void);void f(void){raw {int x=g() orelse 2;(void)x;}}", NULL,
@@ -5043,9 +5213,6 @@ static const Recipe recipes[] = {
 	{"exact/long-double-full-object-zero",
 	 "void f(void){long double x;(void)x;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = 0"},
-	{"exact/long-double-typedef-full-object-zero",
-	 "typedef long double LD;void f(void){LD x;(void)x;}", NULL,
-	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = 0"},
 	{"exact/typeof-typedef-preserves-zero-strategy",
 	 "typedef typeof((long double)0) Base;typedef Base LD;void f(void){LD x;(void)x;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "__builtin_memset", "x = {0}"},
@@ -5060,9 +5227,6 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", NULL},
 	{"exact/typeof-const-binding-brace-init",
 	 "void f(void){const int source=1;typeof(source) copy;(void)copy;}", NULL,
-	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
-	{"exact/typeof-parenthesized-const-binding-brace-init",
-	 "void f(void){const int source=1;typeof(((source))) copy;(void)copy;}", NULL,
 	 {0}, O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX, "= {0}", "memset"},
 	{"exact/typeof-const-parameter-brace-init",
 	 "void f(const int source){typeof(source) copy;(void)copy;}", NULL,
@@ -5222,112 +5386,15 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_FIXED | O_COMPILE, 0, FB_LINE, CAP_POSIX | CAP_VLA},
 	{"reject/orelse-prototype-dimension", "void f(int a[(0 orelse 2)]);", NULL,
 	 {0}, O_REJECT | O_DIAG, 0, FB_LINE, 0, NULL, NULL, "prototype"},
-	{"exact/bounds-cancel-address-paren", "int f(int i){int a[4]={0};return *(&a[i]);}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "__prism_bchk", NULL},
-	{"exact/bounds-address-inner-paren", "int*f(int i){static int a[4];return &(a[i]);}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "&(a[i])", "__prism_bchk(("},
-	{"runtime/bounds-address-inner-paren-one-past",
-	 "int main(void){int a[4];volatile unsigned long i=4;return &(a[i])==a+4?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-control-deref-add", "void f(int c,int i){int a[4]={0};if(c)*(a+i)=0;}", NULL,
-	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
-	{"exact/bounds-control-deref-add-warn", "void f(int c,int i){int a[4]={0};if(c)*(a+i)=0;}", NULL,
-	 {0}, O_OK, FB_BOUNDS | FB_WARN, FB_LINE, 0, NULL, "__prism_bchk(("},
-	{"exact/bounds-unevaluated-nested-paren-deref-add",
-	 "int f(int i){int a[4];return sizeof((*(a+i)));}", NULL,
-	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-unevaluated-comma-deref-add",
-	 "int f(int i){int a[4];return sizeof((0,*(a+i)));}", NULL,
-	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-generic-control-comma-deref-add",
-	 "int f(int i){int a[4];return _Generic((0,*(a+i)),int:1);}", NULL,
-	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-typeof-comma-deref-add",
-	 "int f(int i){int a[4];typeof((0,*(a+i)))x=0;return x;}", NULL,
-	 {0}, O_OK | O_COMPILE | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"reject/bounds-evaluated-nested-paren-deref-add",
-	 "int f(int i){int a[4];return ((0,*(a+i)));}", NULL,
-	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
+	/* `_Generic` association arms are evaluated — not covered by unevaluated-product. */
 	{"reject/bounds-generic-association-deref-add-is-evaluated",
 	 "int f(int i){int a[4];return _Generic(0,int:*(a+i),default:0);}", NULL,
 	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL, "pointer-arithmetic"},
-	{"exact/bounds-parenthesized-reverse-address", "int*f(int i){int a[4]={0};return &(i[a]);}", NULL,
-	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
-	/* Keep the self-hosting lookup shape covered: recovering a tracked outer
-	 * array through a parenthesized member array is valid and must not be
-	 * rejected as a non-identifier base. */
-	{"runtime/bounds-parenthesized-member-array-base",
-	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
-	 "return (entries[1].name)[0]=='b'?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	/* The same shape at an index the outer array does not have. The cell above
-	 * only ever asks for element 0, which is in bounds for both extents, so it
-	 * passed while the member subscript was being checked against the *outer*
-	 * array: `char name[8]` inside `Entry entries[2]` bounded element 3 against
-	 * 2 and trapped on a valid read. The outer subscript keeps its check; the
-	 * member subscript gets none, because prism does not track member extents
-	 * and a bound taken from the wrong array is worse than no bound. */
-	{"runtime/bounds-member-array-index-past-outer-extent",
-	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
-	 "return (entries[1].name)[3]=='a'?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"exact/bounds-member-subscript-unwrapped",
-	 "typedef struct{char name[8];}Entry;static Entry entries[2];"
-	 "char f(int i){return (entries[i].name)[3];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "name)[__prism_bchk"},
-	/* Nested parentheses around the same member must peel too: looking only
-	 * one token back at `))` saw a `)` and recovered `entries` again. */
-	{"runtime/bounds-nested-paren-member-array",
-	 "typedef struct{char name[8];}Entry;int main(void){Entry entries[2]={{\"alpha\"},{\"beta\"}};"
-	 "return ((entries[1].name))[3]=='a'&&(((entries[1].name)))[0]=='b'?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"exact/bounds-nested-paren-member-unwrapped",
-	 "typedef struct{char name[8];}Entry;static Entry entries[2];"
-	 "char f(int i){return ((entries[i].name))[3];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "name))[__prism_bchk"},
-	/* `int a[static 4][3]`: the static promise covers a[i]; a[i][j] indexes a
-	 * real int[3] and must use the sizeof ratio. Rank 1 made the inner index
-	 * bail out before that fallthrough. */
-	{"runtime/bounds-static-param-inner-dim-traps",
-	 "static int f(int a[static 4][3],int i,int j){return a[i][j];}"
-	 "int main(void){int a[4][3]={{0}};volatile int j=3;return f(a,0,j);}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-static-param-inner-dim-inbounds",
-	 "static int f(int a[static 4][3],int i,int j){return a[i][j];}"
-	 "int main(void){int a[4][3]={{0}};a[0][2]=9;volatile int j=2;return f(a,0,j)==9?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"exact/bounds-static-param-inner-dim-shape",
-	 "int f(int a[static 4][3],int i,int j){return a[i][j];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0,
-	 "(__prism_bchk_size_t)(4)|sizeof(a[0])/sizeof(a[0][0])", NULL},
-	/* Qualifiers between `*` and the name, and multi-dim pointer-to-array
-	 * locals/params, must match the bare `int (*p)[N]` path. */
-	{"runtime/bounds-const-ptr-to-array-param-traps",
-	 "static int g(int (*const p)[4],int i){return (*p)[i];}"
-	 "int main(void){int b[4]={0};volatile int i=4;return g(&b,i);}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-volatile-ptr-to-array-param-inbounds",
-	 "static int g(int (*volatile p)[4],int i){return (*p)[i];}"
-	 "int main(void){int b[4]={0,0,0,7};volatile int i=3;return g(&b,i)==7?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"runtime/bounds-local-ptr-to-multi-array-traps-deref",
-	 "int main(void){int m[4][3]={{0}};int (*p)[4][3]=&m;volatile int j=3;return (*p)[0][j];}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-local-ptr-to-multi-array-traps-index",
-	 "int main(void){int m[4][3]={{0}};int (*p)[4][3]=&m;volatile int j=3;return p[0][0][j];}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-local-ptr-to-multi-array-inbounds",
-	 "int main(void){int m[4][3]={{0}};m[0][2]=9;int (*p)[4][3]=&m;"
-	 "volatile int j=2;return (*p)[0][j]==9&&p[0][0][j]==9?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	/* `int (**p)[N]` has two pointer hops: only the array dim is checkable. */
-	{"runtime/bounds-double-ptr-to-array-inbounds",
-	 "int main(void){int r[4]={1,2,3,4};int (*q)[4]=&r;int (**p)[4]=&q;"
-	 "return p[0][0][0]==1&&(*p)[0][3]==4?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"exact/bounds-double-ptr-to-array-outer-unchecked",
-	 "int f(void){int r[4]={0};int (*q)[4]=&r;int (**p)[4]=&q;return p[0][0][0];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])|sizeof(p[0])/sizeof(p[0][0])"},
+	/* Member paren depth × index past outer extent: see bounds/member-paren-depth.
+	 * Ptr-to-array site × spelling × in/trap: see bounds/decl-site-product and
+	 * bounds/depth-product. Stmt-expr function bodies: parse/function-body-stmt-expr.
+	 * Cancel-address / uneval comma-deref / one-past addr / reverse-addr / control
+	 * deref-add: bounds/{product,unevaluated,reject,addr} and safety/bounds-*. */
 	/* A pointer to a VLA is not a VLA object: sizeof(p)/sizeof(p[0]) is a
 	 * pointer division and must not wrap. */
 	{"runtime/bounds-ptr-to-vla-local-unchecked",
@@ -5369,59 +5436,21 @@ static const Recipe recipes[] = {
 	{"exact/no-auto-unreachable-after-deferred-noreturn",
 	 "_Noreturn void die(void);void f(int c){ defer die(); if(c) return; }", NULL,
 	 {0}, O_OK, 0, FB_LINE | FB_AUR, 0, NULL, "__builtin_unreachable|__assume(0)"},
-	/* `int a[4][3]`, `int a[][3]` and `int (*a)[3]` are the same type. Only the
-	 * first dimension decays; the rest belong to the pointed-at type and are as
-	 * checkable as they are on a local. Found by mutation: raising the rank
-	 * recorded for an array parameter failed no cell at all, and the "mutant"
-	 * turned out to check more than the original correctly did. */
-	{"runtime/bounds-array-param-inner-dim-in-range",
-	 "static int f(int a[4][3], int i, int j){ return a[i][j]; }"
-	 "int main(void){ int m[4][3]={{0}}; m[2][2]=9; return f(m,2,2)==9?0:1; }", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"runtime/bounds-array-param-inner-dim-traps",
-	 "static int f(int a[4][3], int i, int j){ return a[i][j]; }"
-	 "int main(void){ int m[4][3]={{0}}; return f(m,0,3); }", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-array-param-unsized-first-dim",
-	 "int f(int a[][3], int i, int j){ return a[i][j]; }", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(a[0])/sizeof(a[0][0])", NULL},
-	{"exact/bounds-array-param-three-dims",
-	 "int f(int a[4][3][2], int i, int j, int k){ return a[i][j][k]; }", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0,
-	 "sizeof(a[0])/sizeof(a[0][0])|sizeof(a[0][0])/sizeof(a[0][0][0])", NULL},
-	/* The first subscript still has nothing to check against, and a VLA
-	 * dimension is not a constant extent. */
+	/* Negative bounds emission: first dim / VLA / plain params stay unwrapped.
+	 * Positive ptr-to-array / typedef / typeof / static-inner coverage lives in
+	 * bounds/depth-product and bounds/decl-site-product. */
 	{"exact/bounds-array-param-first-dim-unwrapped",
 	 "int f(int a[4][3], int i, int j){ return a[i][j]; }", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
 	{"exact/bounds-array-param-vla-dim-unwrapped",
 	 "int f(int n, int a[][n], int i, int j){ return a[i][j]; }", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, CAP_VLA, NULL, "[__prism_bchk"},
-	/* `int (*p)[N]` as a parameter. The extent is in the type, not in a
-	 * promise, so it survives the decay that leaves every other array
-	 * parameter unbounded -- but the local-declaration path reads it off a
-	 * parsed declarator and the parameter path walks tokens, so the same
-	 * pointer was checked as a local and unchecked as a parameter. */
-	{"runtime/bounds-ptr-to-array-param-in-range",
-	 "static int g(int (*p)[4], int i){ return (*p)[i]; }"
-	 "int main(void){ int b[4]={0,0,0,7}; return g(&b,3)==7?0:1; }", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk"},
-	{"runtime/bounds-ptr-to-array-param-traps",
-	 "static int g(int (*p)[4], int i){ return (*p)[i]; }"
-	 "int main(void){ int b[4]={0}; return g(&b,4); }", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	/* An ordinary array parameter still has nothing to check against, and a
-	 * dimension that is not a constant is not an extent worth trusting. */
-	{"exact/bounds-plain-array-param-unwrapped",
-	 "int f(int a[4], int i){ return a[i]; }", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "a[__prism_bchk"},
 	{"exact/bounds-ptr-to-vla-param-unwrapped",
 	 "int f(int n, int (*p)[n], int i){ return (*p)[i]; }", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, CAP_VLA, NULL, "[__prism_bchk"},
-	{"reject/bounds-conditional-array-base",
-	 "int f(int choose,int i){int a[4]={0},b[2]={0};return (choose?a:b)[i];}", NULL,
-	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0, NULL, NULL,
-	 "conditional subscript base derived from tracked array"},
+	{"exact/bounds-double-ptr-to-array-outer-unchecked",
+	 "int f(void){int r[4]={0};int (*q)[4]=&r;int (**p)[4]=&q;return p[0][0][0];}", NULL,
+	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])|sizeof(p[0])/sizeof(p[0][0])"},
 	{"exact/special-wrapper-transitive",
 	 "#include <setjmp.h>\nstatic void inner(jmp_buf p){setjmp(p);}"
 	 "static void outer(jmp_buf p){int touched=1;inner(p);(void)touched;}"
@@ -5459,49 +5488,22 @@ static const Recipe recipes[] = {
 	 {0}, O_OK | O_COMPILE | O_NO_EXT, FB_BOUNDS, FB_LINE, CAP_POSIX},
 	{"file/api", "int main(void){int x;return x;}", NULL, {0}, O_FILE | O_OK | O_COMPILE, 0, FB_LINE, CAP_POSIX},
 
-	{"runtime/orelse-truthy", "static int n;static int g(void){n++;return 5;}static int h(void){n+=10;return 9;}int main(void){int x=g() orelse h();return x==5&&n==1?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/orelse-falsy", "static int n;static int g(void){n++;return 0;}static int h(void){n+=10;return 9;}int main(void){int x=g() orelse h();return x==9&&n==11?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/orelse-chain", "static int n;static int g(int x){n++;return x;}int main(void){int x=g(0) orelse g(7) orelse g(9);return x==7&&n==2?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/defer-return", "static int n;static void c(void){n++;}static int f(void){defer c();return 7;}int main(void){int x=f();return x==7&&n==1?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/defer-lifo", "static int n;static void a(void){n=n*10+1;}static void b(void){n=n*10+2;}int main(void){{defer a();defer b();}return n==21?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/defer-break", "static int n;static void c(void){n++;}int main(void){for(;;){{defer c();break;}}return n==1?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/defer-continue", "static int n;static void c(void){n++;}int main(void){for(int i=0;i<3;i++){{defer c();continue;}}return n==3?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/defer-goto", "static int n;static void c(void){n++;}int main(void){{defer c();goto L;}L:return n==1?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
-	{"runtime/vla-zero", "static void dirty(void){volatile unsigned char x[4096];for(int i=0;i<4096;i++)x[i]=255;}int main(int c,char**v){(void)v;dirty();int n=c+3;int a[n];for(int i=0;i<n;i++)if(a[i])return 1;return 0;}", NULL,
-	 {0}, O_OK | O_RUN, 0, FB_LINE, CAP_POSIX | CAP_VLA, NULL, NULL, NULL, 0},
-	{"runtime/bounds-in", "int main(void){int a[4]={1,2,3,4};volatile int i=3;return a[i]==4?0:1;}", NULL,
-	 {0}, O_OK | O_RUN, FB_BOUNDS, FB_LINE, CAP_POSIX, NULL, NULL, NULL, 0},
+	/* Hand runtime cells that were one-off clones of orelse/defer/zeroinit/
+	 * bounds products lived here; products own those contracts now. Keep only
+	 * shapes products do not yet enumerate (multi-decl return, shadow depth,
+	 * bracket dimensions, return capture). */
 	{.id="runtime/orelse-multidecl-defer-return",
 	 .source="static int logv;static int g(int x){return x;}static int choose(int a,int b){return a+b-18;}static void clean(void){logv++;}static int f(int v){defer clean();int x=g(v) orelse return choose(17,18),y=9;return x+y;}int main(void){logv=0;if(f(0)!=17||logv!=1)return 1;logv=0;return f(3)==12&&logv==1?0:2;}",
 	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
 	{.id="runtime/bounds-shadow-timeline",
 	 .source="int main(void){volatile int i=1;int sum=0;int a[2]={1,2};sum+=a[i];{int a[2]={2,3};sum+=a[i];{int a[2]={3,4};sum+=a[i];{int a[2]={4,5};sum+=a[i];{int a[2]={5,6};sum+=a[i];{int a[2]={6,7};sum+=a[i];{int a[2]={7,8};sum+=a[i];{int a[2]={8,9};sum+=a[i];{int a[2]={9,10};sum+=a[i];sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];}sum+=a[i];return sum==108?0:1;}",
-	 .oracle=O_OK|O_RUN, .set_features=FB_BOUNDS, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
-	{.id="runtime/volatile-atomic-once",
-	 .source="static int g_calls,fb_calls;static int g(int v){g_calls++;return v;}static int fb(int v){fb_calls++;return v;}int main(void){volatile int a=g(0) orelse fb(9);if(a!=9||g_calls!=1||fb_calls!=1)return 1;g_calls=fb_calls=0;_Atomic int b=g(7) orelse fb(3);return b==7&&g_calls==1&&fb_calls==0?0:2;}",
-	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
+	 .oracle=O_OK|O_RUN|O_FIXED, .set_features=FB_BOUNDS, .clear_features=FB_LINE, .requires=CAP_POSIX,
+	 .must_have="__prism_bchk((", .expected_exit=0},
 	{.id="runtime/bracket-dimension",
 	 .source="static int calls;static int dim(int v){calls++;return v;}int main(void){int t[dim(3) orelse 5];if(sizeof(t)/sizeof(t[0])!=3||calls!=1)return 1;calls=0;int a[dim(0) orelse 5];if(sizeof(a)/sizeof(a[0])!=5||calls!=1)return 2;int lo=0,hi=4;int b[lo orelse hi orelse 9];return sizeof(b)/sizeof(b[0])==4?0:3;}",
 	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX|CAP_VLA, .expected_exit=0},
-	{.id="runtime/switch-fallthrough",
-	 .source="static char logv[8];static int lp;static void ev(char c){logv[lp++]=c;}int main(void){int sel=0,acc=0;switch(sel){case 0:{defer ev('A');int a=sel orelse 100;acc+=a;}case 1:{defer ev('B');int b=0 orelse 200;acc+=b;ev('1');}case 2:{int c=7 orelse 300;acc+=c;ev('2');break;}}return acc==307&&logv[0]=='A'&&logv[1]=='1'&&logv[2]=='B'&&logv[3]=='2'?0:1;}",
-	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
-	{.id="runtime/orelse-goto-cleanup",
-	 .source="static char l[8];static int p;static void e(char c){l[p++]=c;}static int g(int v){return v;}static void f(int v){p=0;defer e('A');{defer e('B');int x=g(v) orelse goto done;(void)x;e('x');}e('m');done:e('.');}int main(void){f(0);if(l[0]!='B'||l[1]!='.'||l[2]!='A')return 1;f(1);return l[0]=='x'&&l[1]=='B'&&l[2]=='m'&&l[3]=='.'&&l[4]=='A'?0:2;}",
-	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
 	{.id="runtime/return-capture",
 	 .source="static int f(void){int r=1;defer r=99;return r;}int main(void){return f()==1?0:1;}",
-	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
-	{.id="runtime/zeroinit-stack",
-	 .source="static void poison(void){volatile unsigned char x[4096];for(int i=0;i<4096;i++)x[i]=255;}int main(void){poison();int x;int a[32];if(x)return 1;for(int i=0;i<32;i++)if(a[i])return 2;return 0;}",
 	 .oracle=O_OK|O_RUN, .clear_features=FB_LINE, .requires=CAP_POSIX, .expected_exit=0},
 
 	{"lifecycle/reset", "int f(void){int x;defer(void)0;return x;}", NULL, {0}, O_LIFECYCLE,
@@ -5722,50 +5724,20 @@ static const Recipe recipes[] = {
 	{"runtime/shadowed-defer-identifier-still-emitted",
 	 "typedef int defer;int main(void){defer d=7;return d==7?0:1;}", NULL,
 	 {0}, O_OK | O_RUN | O_FIXED, 0, FB_LINE, CAP_POSIX, "defer d", NULL},
-	/* `int (*p)[4]` carries its extent in the type, so the inner subscript is
-	 * checkable even though `p` is a pointer. `*p` and `p[0]` denote the same
-	 * object, so both spellings bound against `sizeof(p[0])/sizeof(p[0][0])`.
-	 * The outer subscript must stay unchecked: nothing says how many arrays
-	 * `p` points at. */
-	{"runtime/bounds-ptr-to-array-inbounds",
-	 "int main(void){int a[4]={10,20,30,40};int (*p)[4]=&a;volatile int i=3;"
-	 "return (p[0][i]==40 && (*p)[i]==40 && (*(p))[i]==40)?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-ptr-to-array-traps-subscript",
-	 "int main(void){int a[4]={0};int (*p)[4]=&a;volatile int i=4;return p[0][i];}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-ptr-to-array-traps-deref",
-	 "int main(void){int a[4]={0};int (*p)[4]=&a;volatile int i=4;return (*p)[i];}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"exact/bounds-ptr-to-array-bound-shape",
-	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return p[0][i];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(p[0])/sizeof(p[0][0])", NULL},
-	{"exact/bounds-ptr-to-array-deref-bound-shape",
-	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return (*p)[i];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "sizeof(p[0])/sizeof(p[0][0])", NULL},
-	/* The pointer hop itself has no extent, so `p[i]` must not be wrapped --
-	 * `sizeof(p)/sizeof(p[0])` would be 0 and trap on every access. */
+	/* Positive `int (*p)[N]` / `p[0][i]` / `(*p)[i]` coverage: bounds/depth-product
+	 * and bounds/decl-site-product. Keep only the outer-hop negative check. */
 	{"exact/bounds-ptr-to-array-outer-unchecked",
 	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return p[i][0];}", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])"},
-	/* C11 6.7.6.3p7: `int a[static N]` promises the argument points at at least
-	 * N elements. That promise is the only extent an array parameter has -- it
-	 * decays to a pointer, so a sizeof ratio would measure the pointer. The
-	 * bound is the literal N. */
-	{"runtime/bounds-static-param-inbounds",
-	 "static int f(int a[static 4],int i){return a[i];}"
-	 "int main(void){int a[6]={1,2,3,4,5,6};volatile int i=3;return f(a,i)==4?0:1;}", NULL,
-	 {0}, O_OK | O_RUN | O_FIXED | O_COMPILE, FB_BOUNDS, FB_LINE, CAP_POSIX},
-	{"runtime/bounds-static-param-traps",
-	 "static int f(int a[static 4],int i){return a[i];}"
-	 "int main(void){int a[6]={0};volatile int i=4;return f(a,i);}", NULL,
-	 {0}, O_OK | O_TRAP, FB_BOUNDS, FB_LINE, CAP_POSIX},
+	/* C11 6.7.6.3p7: `int a[static N]` promise extent. Runtime in/trap for 1D
+	 * static lives in bounds/depth-product (`param-static-1d`). Keep the
+	 * emission contract that the bound is the literal N, not a sizeof ratio. */
 	{"exact/bounds-static-param-literal-extent",
 	 "int f(int a[static 4],int i){return a[i];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", "sizeof(a)/sizeof(a[0])"},
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", "sizeof(a)/sizeof(a[0])"},
 	{"exact/bounds-static-param-qualified",
 	 "int f(int a[static const 4],int i){return a[i];}", NULL,
-	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", NULL},
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, "(__prism_bchk_size_t)(4)", NULL},
 	/* An array parameter without the promise has no extent at all and must stay
 	 * unwrapped: `sizeof(a)/sizeof(a[0])` would measure the pointer. */
 	{"exact/bounds-plain-array-param-unchecked",
