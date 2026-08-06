@@ -9210,9 +9210,13 @@ static inline bool pparse_param_name_candidate(PParseToken *tok) {
 				  PPARSE_TT_TYPEOF | PPARSE_TT_ATTR;
 	/* A typedef name in the type-spec (`A` in `A (*p)[N]`) is a valid
 	 * identifier spelling but must not steal `last_ident` — that left the
-	 * real parameter unbound and dropped ptr-to-array extents. */
-	if (pparse_is_known_typedef(tok) || pparse_is_type_keyword(tok) ||
-	    pparse_is_known_enum_const(tok) || pparse_is_constexpr_ident(tok))
+	 * real parameter unbound and dropped ptr-to-array extents.
+	 * Do not exclude constexpr / enum-constant spellings here: a parameter
+	 * may shadow them (`constexpr int N; void f(int N)`), and the shadow
+	 * registration below depends on seeing the name. Treating the outer
+	 * constexpr as the dimension ICE made `goto` past `int a[N]` look like
+	 * a fixed array and silently accepted what must be a VLA skip. */
+	if (pparse_is_known_typedef(tok) || pparse_is_type_keyword(tok))
 		return false;
 	return pparse_is_valid_varname(tok) &
 	       (!(tok->tag & non_name) |
