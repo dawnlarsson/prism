@@ -423,26 +423,29 @@ typedef struct {
 	int prev_index;		  // Index of previous entry with same name (-1 if none)
 	uint32_t token_index;	  // PParseToken pool index of the declaration
 	uint32_t scope_close_idx; // PParseToken index of matching '}' (UINT32_MAX for file scope)
-	bool is_vla : 1;
-	bool is_void : 1;
-	bool is_const : 1;
-	bool is_volatile : 1;
-	bool is_ptr : 1;
-	bool is_array : 1;
-	bool is_shadow : 1;
-	bool is_enum_const : 1;
-	bool is_vla_var : 1;
-	bool is_aggregate : 1;
-	bool is_union : 1;
-	bool is_func : 1;
-	bool is_param : 1;
-	bool has_volatile_member : 1;
-	bool is_atomic : 1;	     // _Atomic(...) spelling baked into this typedef name
-	bool is_long_double : 1;      // scalar long double (including _Complex)
-	bool is_typeof : 1;           // typedef originated from typeof()/__typeof__
-	bool is_constexpr : 1;	     // C23 'constexpr' shadow: usable as an array-dimension ICE
-	bool is_struct_tag : 1;	     // struct/union tag (not a typedef name)
-	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
+	/* All bitfields share `unsigned` so MSVC packs them with `ptr_hops` in one
+	 * unit. Mixing `bool : 1` and `unsigned : 4` starts a new allocation unit
+	 * there and breaks the 16-byte size assert (C2118 negative subscript). */
+	unsigned is_vla : 1;
+	unsigned is_void : 1;
+	unsigned is_const : 1;
+	unsigned is_volatile : 1;
+	unsigned is_ptr : 1;
+	unsigned is_array : 1;
+	unsigned is_shadow : 1;
+	unsigned is_enum_const : 1;
+	unsigned is_vla_var : 1;
+	unsigned is_aggregate : 1;
+	unsigned is_union : 1;
+	unsigned is_func : 1;
+	unsigned is_param : 1;
+	unsigned has_volatile_member : 1;
+	unsigned is_atomic : 1;	     // _Atomic(...) spelling baked into this typedef name
+	unsigned is_long_double : 1; // scalar long double (including _Complex)
+	unsigned is_typeof : 1;	     // typedef originated from typeof()/__typeof__
+	unsigned is_constexpr : 1;   // C23 'constexpr' shadow: usable as an array-dimension ICE
+	unsigned is_struct_tag : 1;  // struct/union tag (not a typedef name)
+	unsigned array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	unsigned ptr_hops : 4;	     // pointer-to-array typedef: `*` count baked at the alias
 	uint8_t array_rank;	     // # of array dimensions (0 if not array);
 } PParseTypedefEntry; // 16 bytes — four entries per 64-byte cache line
