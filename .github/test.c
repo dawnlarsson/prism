@@ -3481,6 +3481,211 @@ static const AxisValue bounds_decl_site_shapes[] = {
 };
 static const Axis ax_bounds_decl_site_shape = {"shape", bounds_decl_site_shapes, N(bounds_decl_site_shapes)};
 
+/* ------------------------------------------------------------------ */
+/* Procedural bounds peel products                                    */
+/*                                                                    */
+/* Registration bugs and peel bugs live on different axes. Hand shapes*/
+/* that bake one setup with one access keep rediscovering the other.  */
+/* Cross setup × peel × {in,trap} so every binding spelling is probed */
+/* with every access form that C makes meaningful for that hop count. */
+/* Nested `@2@` / `@3@` in peel/setup text expands to the index axis. */
+/* `_Atomic` is never applied to an array type (ill-formed C).        */
+/* ------------------------------------------------------------------ */
+
+/* 1-hop: `p` is pointer-to-array `[16]`. */
+static const AxisValue bounds_ptr1_setups[] = {
+	{"local", "int a[16]={0};a[3]=9;int (*p)[16]=&a;", 0, 0},
+	{"local-dbl", "int a[16]={0};a[3]=9;int ((*p))[16]=&a;", 0, 0},
+	{"typedef-PA", "typedef int (*PA)[16];int a[16]={0};a[3]=9;PA p=&a;", 0, 0},
+	{"typedef-CPA", "typedef int (*PA)[16];typedef PA CPA;int a[16]={0};a[3]=9;CPA p=&a;", 0, 0},
+	{"typedef-A-star", "typedef int A[16];int a[16]={0};a[3]=9;A *p=&a;", 0, 0},
+	{"typedef-B", "typedef int A[16];typedef A *B;int a[16]={0};a[3]=9;B p=&a;", 0, 0},
+	{"typeof-ctor", "int a[16]={0};a[3]=9;typeof(int (*)[16]) p=&a;", 0, 0},
+	{"typeof-addr", "int a[16]={0};a[3]=9;typeof(&a) p=&a;", 0, 0},
+	{"typeof-arr-star", "int a[16]={0};a[3]=9;typeof(int[16]) *p=&a;", 0, 0},
+	{"typeof-PA", "typedef int (*PA)[16];int a[16]={0};a[3]=9;typeof(PA) p=&a;", 0, 0},
+	/* Stars inside the constructor (`typeof(A*)`), not on the declarator. */
+	{"typeof-A-star-in", "typedef int A[16];int a[16]={0};a[3]=9;typeof(A*) p=&a;", 0, 0},
+	{"atomic-A-star-in", "typedef int A[16];int a[16]={0};a[3]=9;_Atomic(A*) p=&a;", 0, 0},
+	{"baked-typeof-A-star", "typedef int A[16];typedef typeof(A*) B;int a[16]={0};a[3]=9;B p=&a;", 0, 0},
+	{"typeof-A-star-out", "typedef int A[16];int a[16]={0};a[3]=9;typeof(A)* p=&a;", 0, 0},
+	{"atomic-ctor", "int a[16]={0};a[3]=9;_Atomic(int (*)[16]) p=&a;", 0, 0},
+	{"atomic-PA", "typedef int (*PA)[16];int a[16]={0};a[3]=9;_Atomic(PA) p=&a;", 0, 0},
+	{"typedef-APA", "typedef _Atomic(int (*)[16]) APA;int a[16]={0};a[3]=9;APA p=&a;", 0, 0},
+	/* C23 bare `auto p=&a` needs a C23 host; exercise inference via
+	 * `__auto_type` and storage-`auto` with an explicit declarator type. */
+	{"auto-type", "int a[16]={0};a[3]=9;__auto_type p=&a;", 0, 0},
+	{"auto-int-decl", "int a[16]={0};a[3]=9;auto int (*p)[16]=&a;", 0, 0},
+	{"auto-from-q", "int a[16]={0};a[3]=9;typeof(&a) q=&a;__auto_type p=q;", 0, 0},
+};
+static const Axis ax_bounds_ptr1_setup = {"setup", bounds_ptr1_setups, N(bounds_ptr1_setups)};
+
+static const AxisValue bounds_ptr1_peels[] = {
+	{"deref", "(*p)[@2@]==9?0:1", 0, 0},
+	{"deref-p2", "((*p))[@2@]==9?0:1", 0, 0},
+	{"deref-p3", "(((*p)))[@2@]==9?0:1", 0, 0},
+	{"deref-p4", "((((*p))))[@2@]==9?0:1", 0, 0},
+	{"index0", "p[0][@2@]==9?0:1", 0, 0},
+	{"index0-p2", "((p[0]))[@2@]==9?0:1", 0, 0},
+	{"index0-p3", "(((p[0])))[@2@]==9?0:1", 0, 0},
+	{"index0-p4", "((((p[0]))))[@2@]==9?0:1", 0, 0},
+	{"stmt-expr", "({(*p)[@2@];})==9?0:1", 0, 0},
+	{"stmt-expr2", "({({(*p)[@2@];});})==9?0:1", 0, 0},
+	{"cancel-addr", "*&((*p)[@2@])==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_ptr1_peel = {"peel", bounds_ptr1_peels, N(bounds_ptr1_peels)};
+
+/* 2-hop: `p` is pointer-to-pointer-to-array `[16]`. */
+static const AxisValue bounds_ptr2_setups[] = {
+	{"local", "int a[16]={0};a[3]=9;int (*q)[16]=&a;int (**p)[16]=&q;", 0, 0},
+	{"local-dbl", "int a[16]={0};a[3]=9;int (*q)[16]=&a;int ((**p))[16]=&q;", 0, 0},
+	{"typedef-PA-star", "typedef int (*PA)[16];int a[16]={0};a[3]=9;PA q=&a;PA *p=&q;", 0, 0},
+	{"typedef-PPA", "typedef int (*PA)[16];typedef PA *PPA;int a[16]={0};a[3]=9;PA q=&a;PPA p=&q;", 0, 0},
+	{"typeof-dbl", "int a[16]={0};a[3]=9;int (*q)[16]=&a;typeof(int (**)[16]) p=&q;", 0, 0},
+	{"typeof-PA-star-in", "typedef int (*PA)[16];int a[16]={0};a[3]=9;PA q=&a;typeof(PA*) p=&q;", 0, 0},
+	{"atomic-PA-star-in", "typedef int (*PA)[16];int a[16]={0};a[3]=9;PA q=&a;_Atomic(PA*) p=&q;", 0, 0},
+	{"baked-typeof-PA-star", "typedef int (*PA)[16];typedef typeof(PA*) PPA2;int a[16]={0};a[3]=9;PA q=&a;PPA2 p=&q;", 0, 0},
+	{"atomic-dbl", "int a[16]={0};a[3]=9;int (*q)[16]=&a;_Atomic(int (**)[16]) p=&q;", 0, 0},
+	{"typedef-P2", "typedef typeof(int (**)[16]) P2;int a[16]={0};a[3]=9;int (*q)[16]=&a;P2 p=&q;", 0, 0},
+};
+static const Axis ax_bounds_ptr2_setup = {"setup", bounds_ptr2_setups, N(bounds_ptr2_setups)};
+
+static const AxisValue bounds_ptr2_peels[] = {
+	{"dbl-deref", "(**p)[@2@]==9?0:1", 0, 0},
+	{"dbl-deref-p2", "((**p))[@2@]==9?0:1", 0, 0},
+	{"dbl-deref-p3", "(((**p)))[@2@]==9?0:1", 0, 0},
+	{"star-index", "(*p[0])[@2@]==9?0:1", 0, 0},
+	{"star-index-p2", "((*p[0]))[@2@]==9?0:1", 0, 0},
+	{"index-index", "p[0][0][@2@]==9?0:1", 0, 0},
+	{"index-index-p2", "((p[0][0]))[@2@]==9?0:1", 0, 0},
+	{"star-then-index", "(*p)[0][@2@]==9?0:1", 0, 0},
+	{"index0-paren", "((p[0]))[0][@2@]==9?0:1", 0, 0},
+	{"split-nest", "(*((*p)))[@2@]==9?0:1", 0, 0},
+	{"stmt-expr", "({(**p)[@2@];})==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_ptr2_peel = {"peel", bounds_ptr2_peels, N(bounds_ptr2_peels)};
+
+/* Local array-of-pointer-to-array: outer `[2]` kept (`pre_ptr_array`). */
+static const AxisValue bounds_arr_ptr_setups[] = {
+	{"local", "int a[16]={0};a[3]=9;int (*p[2])[16]={&a,&a};", 0, 0},
+	{"local-dbl", "int a[16]={0};a[3]=9;int ((*p[2]))[16]={&a,&a};", 0, 0},
+	{"typedef-PA-arr", "typedef int (*PA)[16];int a[16]={0};a[3]=9;PA p[2]={&a,&a};", 0, 0},
+};
+static const Axis ax_bounds_arr_ptr_setup = {"setup", bounds_arr_ptr_setups, N(bounds_arr_ptr_setups)};
+
+static const AxisValue bounds_arr_ptr_peels[] = {
+	{"star-index", "(*p[0])[@2@]==9?0:1", 0, 0},
+	{"star-index-p2", "((*p[0]))[@2@]==9?0:1", 0, 0},
+	{"index-index", "p[0][0][@2@]==9?0:1", 0, 0},
+	{"index-index-p2", "((p[0][0]))[@2@]==9?0:1", 0, 0},
+	{"stmt-expr", "({(*p[0])[@2@];})==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_arr_ptr_peel = {"peel", bounds_arr_ptr_peels, N(bounds_arr_ptr_peels)};
+
+/* Array-of-ptr-to-multi-dim: outer `[2]` + hop + `[4][16]`. */
+static const AxisValue bounds_arr_ptr_2d_setups[] = {
+	{"local", "int m[4][16]={{0}};m[0][3]=9;int (*p[2])[4][16]={&m,&m};", 0, 0},
+	{"local-dbl", "int m[4][16]={{0}};m[0][3]=9;int ((*p[2]))[4][16]={&m,&m};", 0, 0},
+};
+static const Axis ax_bounds_arr_ptr_2d_setup = {"setup", bounds_arr_ptr_2d_setups, N(bounds_arr_ptr_2d_setups)};
+
+static const AxisValue bounds_arr_ptr_2d_peels[] = {
+	{"star-index", "(*p[0])[0][@2@]==9?0:1", 0, 0},
+	{"star-index-p2", "((*p[0]))[0][@2@]==9?0:1", 0, 0},
+	{"index-index", "p[0][0][0][@2@]==9?0:1", 0, 0},
+	{"index-index-p2", "((p[0][0][0]))[@2@]==9?0:1", 0, 0},
+	{"stmt-expr", "({(*p[0])[0][@2@];})==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_arr_ptr_2d_peel = {"peel", bounds_arr_ptr_2d_peels, N(bounds_arr_ptr_2d_peels)};
+
+/* Multi-dim array cast+paren peels: `(T)((m[0][0]))[i]` must use the row extent. */
+static const AxisValue bounds_md_cast_paren_peels[] = {
+	{"bare", "((m[0][0]))[@1@]==9?0:1", 0, 0},
+	{"cast-int", "(int)((m[0][0]))[@1@]==9?0:1", 0, 0},
+	{"cast-long", "(long)((m[0][0]))[@1@]==9?0:1", 0, 0},
+	{"cast-void-stmt", "((void)((m[0][0]))[@1@],0)", 0, 0},
+	{"cast-nest", "(int)(((m[0][0])))[@1@]==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_md_cast_paren_peel = {"peel", bounds_md_cast_paren_peels, N(bounds_md_cast_paren_peels)};
+
+/* 1-hop parameters: self-contained binding open (typedefs + `f` head) × peel(j)
+ * × index at the call. Arg is always `int (*)[16]`. */
+static const AxisValue bounds_ptr1_param_bind[] = {
+	{"direct", "static int f(int (*p)[16],int j){return ", 0, 0},
+	{"dbl", "static int f(int ((*p))[16],int j){return ", 0, 0},
+	{"const", "static int f(int (*const p)[16],int j){return ", 0, 0},
+	{"volatile", "static int f(int (*volatile p)[16],int j){return ", 0, 0},
+	{"restrict", "static int f(int (*restrict p)[16],int j){return ", 0, 0},
+	{"PA", "typedef int (*PA)[16];static int f(PA p,int j){return ", 0, 0},
+	{"CPA", "typedef int (*PA)[16];typedef PA CPA;static int f(CPA p,int j){return ", 0, 0},
+	{"A-star", "typedef int A[16];static int f(A *p,int j){return ", 0, 0},
+	{"B", "typedef int A[16];typedef A *B;static int f(B p,int j){return ", 0, 0},
+	{"typeof-ctor", "static int f(typeof(int (*)[16]) p,int j){return ", 0, 0},
+	{"typeof-arr-star", "static int f(typeof(int[16]) *p,int j){return ", 0, 0},
+	{"atomic-ctor", "static int f(_Atomic(int (*)[16]) p,int j){return ", 0, 0},
+	{"APA", "typedef _Atomic(int (*)[16]) APA;static int f(APA p,int j){return ", 0, 0},
+	{"typeof-PA", "typedef int (*PA)[16];static int f(typeof(PA) p,int j){return ", 0, 0},
+	{"typeof-A-star-in", "typedef int A[16];static int f(typeof(A*) p,int j){return ", 0, 0},
+	{"atomic-A-star-in", "typedef int A[16];static int f(_Atomic(A*) p,int j){return ", 0, 0},
+};
+static const Axis ax_bounds_ptr1_param_bind = {"bind", bounds_ptr1_param_bind, N(bounds_ptr1_param_bind)};
+
+static const AxisValue bounds_ptr1_param_peels[] = {
+	{"deref", "(*p)[j]", 0, 0},
+	{"deref-p2", "((*p))[j]", 0, 0},
+	{"deref-p3", "(((*p)))[j]", 0, 0},
+	{"index0", "p[0][j]", 0, 0},
+	{"index0-p2", "((p[0]))[j]", 0, 0},
+	{"index0-p3", "(((p[0])))[j]", 0, 0},
+};
+static const Axis ax_bounds_ptr1_param_peel = {"peel", bounds_ptr1_param_peels, N(bounds_ptr1_param_peels)};
+
+/* 2-hop parameters. Call passes `&q` for `q: int (*)[16]`. */
+static const AxisValue bounds_ptr2_param_bind[] = {
+	{"direct", "static int f(int (**p)[16],int j){return ", 0, 0},
+	{"PA-star", "typedef int (*PA)[16];static int f(PA *p,int j){return ", 0, 0},
+	{"PPA", "typedef int (*PA)[16];typedef PA *PPA;static int f(PPA p,int j){return ", 0, 0},
+	{"typeof-dbl", "static int f(typeof(int (**)[16]) p,int j){return ", 0, 0},
+	{"typeof-PA-star-in", "typedef int (*PA)[16];static int f(typeof(PA*) p,int j){return ", 0, 0},
+	{"atomic-PA-star-in", "typedef int (*PA)[16];static int f(_Atomic(PA*) p,int j){return ", 0, 0},
+	{"atomic-dbl", "static int f(_Atomic(int (**)[16]) p,int j){return ", 0, 0},
+	{"P2", "typedef typeof(int (**)[16]) P2;static int f(P2 p,int j){return ", 0, 0},
+	/* Array-of-ptr-to-array decays to pointer-to-pointer-to-array. */
+	{"arr-decay", "static int f(int (*p[2])[16],int j){return ", 0, 0},
+};
+static const Axis ax_bounds_ptr2_param_bind = {"bind", bounds_ptr2_param_bind, N(bounds_ptr2_param_bind)};
+
+static const AxisValue bounds_ptr2_param_peels[] = {
+	{"dbl-deref", "(**p)[j]", 0, 0},
+	{"dbl-deref-p2", "((**p))[j]", 0, 0},
+	{"star-index", "(*p[0])[j]", 0, 0},
+	{"star-index-p2", "((*p[0]))[j]", 0, 0},
+	{"index-index", "p[0][0][j]", 0, 0},
+	{"star-then-index", "(*p)[0][j]", 0, 0},
+};
+static const Axis ax_bounds_ptr2_param_peel = {"peel", bounds_ptr2_param_peels, N(bounds_ptr2_param_peels)};
+
+/* Multi-dim pointed-at extents: setup keeps `p` as `int (*)[4][16]`, peel
+ * indexes the trailing dim with `@2@`. Catches rank-truncation bugs. */
+static const AxisValue bounds_ptr1_2d_setups[] = {
+	{"local", "int m[4][16]={{0}};m[0][3]=9;int (*p)[4][16]=&m;", 0, 0},
+	{"typedef-PA", "typedef int (*PA)[4][16];int m[4][16]={{0}};m[0][3]=9;PA p=&m;", 0, 0},
+	{"typedef-AA-PA", "typedef int AA[16];typedef AA (*PA)[4];int m[4][16]={{0}};m[0][3]=9;PA p=&m;", 0, 0},
+	{"typeof-ctor", "int m[4][16]={{0}};m[0][3]=9;typeof(int (*)[4][16]) p=&m;", 0, 0},
+	{"inline-A", "typedef int A[16];int m[4][16]={{0}};m[0][3]=9;A (*p)[4]=&m;", 0, 0},
+};
+static const Axis ax_bounds_ptr1_2d_setup = {"setup", bounds_ptr1_2d_setups, N(bounds_ptr1_2d_setups)};
+
+static const AxisValue bounds_ptr1_2d_peels[] = {
+	{"deref", "(*p)[0][@2@]==9?0:1", 0, 0},
+	{"deref-p2", "((*p))[0][@2@]==9?0:1", 0, 0},
+	{"index0", "p[0][0][@2@]==9?0:1", 0, 0},
+	{"index0-paren", "((p[0]))[0][@2@]==9?0:1", 0, 0},
+	{"partial-paren", "((*p)[0])[@2@]==9?0:1", 0, 0},
+	{"stmt-expr", "({(*p)[0][@2@];})==9?0:1", 0, 0},
+};
+static const Axis ax_bounds_ptr1_2d_peel = {"peel", bounds_ptr1_2d_peels, N(bounds_ptr1_2d_peels)};
+
 /* Phase-1 function bodies written as GNU statement expressions (macro-expanded
  * `f(void)P({…})` forms). Stmt-expr spellings are classified as bodies for
  * Phase 1 but emission keeps the wrappers, which host compilers reject — so
@@ -4855,6 +5060,37 @@ static const Recipe recipes[] = {
 	{"bounds/decl-site-product", "@1@", NULL,
 	 {&ax_bounds_depth_index, &ax_bounds_decl_site_shape},
 	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	/* Procedural peel products: setup/bind × access peel × in/trap.
+	 * Registration and peel bugs are on different axes — a hand shape that
+	 * pairs one binding with one access cannot keep rediscovering the other.
+	 * Hop families stay separate so every cell is valid C. */
+	{"bounds/ptr1-peel-product", "int main(void){@0@ return @1@;}", NULL,
+	 {&ax_bounds_ptr1_setup, &ax_bounds_ptr1_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/ptr2-peel-product", "int main(void){@0@ return @1@;}", NULL,
+	 {&ax_bounds_ptr2_setup, &ax_bounds_ptr2_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/arr-ptr-peel-product", "int main(void){@0@ return @1@;}", NULL,
+	 {&ax_bounds_arr_ptr_setup, &ax_bounds_arr_ptr_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/arr-ptr-2d-peel-product", "int main(void){@0@ return @1@;}", NULL,
+	 {&ax_bounds_arr_ptr_2d_setup, &ax_bounds_arr_ptr_2d_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/md-cast-paren-peel-product",
+	 "int main(void){int m[2][4][16]={{{0}}};m[0][0][3]=9;return @0@;}", NULL,
+	 {&ax_bounds_md_cast_paren_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/ptr1-2d-peel-product", "int main(void){@0@ return @1@;}", NULL,
+	 {&ax_bounds_ptr1_2d_setup, &ax_bounds_ptr1_2d_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/ptr1-param-peel-product",
+	 "@0@@1@;}\nint main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;return f(q,@2@)==9?0:1;}", NULL,
+	 {&ax_bounds_ptr1_param_bind, &ax_bounds_ptr1_param_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
+	{"bounds/ptr2-param-peel-product",
+	 "@0@@1@;}\nint main(void){int a[16]={0};a[3]=9;int (*q)[16]=&a;return f(&q,@2@)==9?0:1;}", NULL,
+	 {&ax_bounds_ptr2_param_bind, &ax_bounds_ptr2_param_peel, &ax_bounds_depth_index},
+	 O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "__prism_bchk(("},
 	/* Function body as stmt-expr (with optional extra parens from macros). */
 	{"parse/function-body-stmt-expr", "@0@", NULL,
 	 {&ax_parse_fn_body_shape}, O_OK | O_FIXED, 0, FB_LINE, CAP_POSIX},
@@ -5729,6 +5965,37 @@ static const Recipe recipes[] = {
 	{"exact/bounds-ptr-to-array-outer-unchecked",
 	 "int f(int i){int a[4]={0};int (*p)[4]=&a;return p[i][0];}", NULL,
 	 {0}, O_OK, FB_BOUNDS, FB_LINE, 0, NULL, "sizeof(p)/sizeof(p[0])"},
+	/* C23 `auto` inference (host may not compile bare `auto` as a type). */
+	{"exact/bounds-auto-addr-wraps",
+	 "int f(int i){int a[16]={0};auto p=&a;return (*p)[i];}", NULL,
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, "(*p)[__prism_bchk((", NULL},
+	{"exact/bounds-auto-decl-wraps",
+	 "int f(int i){int a[16]={0};auto (*p)[16]=&a;return (*p)[i];}", NULL,
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0, "(*p)[__prism_bchk((", NULL},
+	{"exact/bounds-auto-commutative-reject",
+	 "int f(int i){int a[16]={0};auto p=&a;return i[(*p)];}", NULL,
+	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
+	{"exact/bounds-cast-addr-array-no-false-reject",
+	 "int f(int i){int a[16]={0};return (*((int(*)[16])&a))[i];}", NULL,
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0},
+	{"exact/bounds-cast-paren-addr-no-false-reject",
+	 "int f(int i){int a[16]={0};return (*((int(*)[16])(&a)))[i];}", NULL,
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0},
+	{"exact/bounds-generic-addr-ctrl-no-false-reject",
+	 "int f(int i){int a[16]={0};int (*p)[16]=&a;"
+	 "return (*_Generic(&a,int(*)[16]:p,default:p))[i];}", NULL,
+	 {0}, O_OK | O_FIXED, FB_BOUNDS, FB_LINE, 0},
+	{"exact/bounds-commutative-ptr-index-reject",
+	 "int f(int i){int a[16]={0};int (*p)[16]=&a;return i[p[0]];}", NULL,
+	 {0}, O_REJECT | O_DIAG, FB_BOUNDS, FB_LINE, 0},
+	{"exact/bounds-knr-ptr-array-wraps",
+	 "static int f(a,j) int (*a)[16]; int j; {return (*a)[j];}"
+	 "int main(void){int x[16]={0};x[3]=9;return f(&x,3)==9?0:1;}", NULL,
+	 {0}, O_OK | O_RUN | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "(*a)[__prism_bchk((", NULL},
+	{"exact/bounds-knr-ptr-array-traps",
+	 "static int f(a,j) int (*a)[16]; int j; {return (*a)[j];}"
+	 "int main(void){int x[16]={0};return f(&x,16);}", NULL,
+	 {0}, O_OK | O_TRAP | O_FIXED, FB_BOUNDS, FB_LINE, CAP_POSIX, "(*a)[__prism_bchk((", NULL},
 	/* C11 6.7.6.3p7: `int a[static N]` promise extent. Runtime in/trap for 1D
 	 * static lives in bounds/depth-product (`param-static-1d`). Keep the
 	 * emission contract that the bound is the literal N, not a sizeof ratio. */

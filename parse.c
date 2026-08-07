@@ -443,6 +443,7 @@ typedef struct {
 	bool is_constexpr : 1;	     // C23 'constexpr' shadow: usable as an array-dimension ICE
 	bool is_struct_tag : 1;	     // struct/union tag (not a typedef name)
 	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
+	unsigned ptr_hops : 4;	     // pointer-to-array typedef: `*` count baked at the alias
 	uint8_t array_rank;	     // # of array dimensions (0 if not array);
 } PParseTypedefEntry; // 16 bytes — four entries per 64-byte cache line
 
@@ -472,11 +473,12 @@ typedef struct {
 	uint32_t token_index;
 	uint32_t scope_close_idx;
 	uint8_t array_rank;
-	/* Leading subscripts that traverse a pointer rather than an array
-	 * dimension. `int (*p)[4]` is rank 2 with one hop: `p[i]` has no extent to
-	 * check against, while `p[0][i]` and `(*p)[i]` both bound against the `[4]`.
-	 * Zero for every ordinary array, which is the common path. */
+	/* Pointer hops that carry no extent. For `int (*p)[4]` they are leading
+	 * (`pre_ptr_array == 0`): `p[i]` unchecked, `p[0][i]` bounds the `[4]`.
+	 * For `int (*a[2])[4]` the outer `[2]` comes first (`pre_ptr_array == 1`),
+	 * then one hop, then the pointed-at `[4]`. */
 	uint8_t ptr_hops;
+	uint8_t pre_ptr_array;
 	/* Declarator `[` of an `int a[static N]` parameter, or 0. C11 6.7.6.3p7
 	 * promises at least N elements, which is the only extent an array
 	 * parameter has: it is a pointer, so `sizeof(a)/sizeof(a[0])` would be the
@@ -2836,6 +2838,7 @@ typedef struct {
 	bool type_ptr_array_dim_complete : 1; // typeof/… `(*…)[N]` dims are constant extents
 	uint8_t type_array_rank; // Dimension count for is_array (multi-dim typeof)
 	uint8_t type_ptr_array_rank; // Pointed-at dims for typeof(int (*)[N]) / _Atomic
+	uint8_t type_ptr_hops; // `*` hops for typeof(int (**)[N]) / _Atomic(…) / typeof(&a)
 } PParseTypeSpec;
 
 typedef struct {
@@ -3785,6 +3788,7 @@ static PRISM_PURE uint8_t pparse_array_rank_for_tok(PParseToken *t) {
 typedef struct {
 	uint8_t rank;
 	uint8_t ptr_hops;
+	uint8_t pre_ptr_array;
 	uint32_t static_extent_tok;
 	bool tracked : 1;
 	bool dim_complete : 1;
@@ -3812,6 +3816,7 @@ static PRISM_PURE PParseArrayBindingInfo pparse_array_binding_info(PParseToken *
 	if (array) {
 		info.rank = array->array_rank;
 		info.ptr_hops = array->ptr_hops;
+		info.pre_ptr_array = array->pre_ptr_array;
 		info.static_extent_tok = array->static_extent_tok;
 		info.tracked = !array->blocks_outer;
 		info.dim_complete = array->array_dim_complete;
@@ -3827,7 +3832,7 @@ static PRISM_PURE PParseArrayBindingInfo pparse_array_binding_info(PParseToken *
 
 static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, uint8_t array_rank,
 				     bool dim_complete, bool is_vla_var, bool blocks_outer,
-				     uint8_t ptr_hops, uint32_t static_extent_tok) {
+				     uint8_t ptr_hops, uint8_t pre_ptr_array, uint32_t static_extent_tok) {
 	PPARSE_CTX();
 	uint32_t hash = pparse_fast_hash(name, len);
 	int existing = pparse_hashmap_index_hashed(&pparse_ba.table.name_map, name, len, hash);
@@ -3839,6 +3844,7 @@ static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, u
 			prev->is_vla_var = is_vla_var;
 			prev->blocks_outer = blocks_outer;
 			prev->ptr_hops = ptr_hops;
+			prev->pre_ptr_array = pre_ptr_array;
 			prev->static_extent_tok = static_extent_tok;
 			return;
 		}
@@ -3860,6 +3866,7 @@ static void pparse_bounds_array_add(char *name, int len, uint32_t token_index, u
 					 .is_vla_var = is_vla_var,
 					 .blocks_outer = blocks_outer,
 					 .ptr_hops = ptr_hops,
+					 .pre_ptr_array = pre_ptr_array,
 					 .static_extent_tok = static_extent_tok};
 	pparse_hashmap_put_hashed(
 	    &pparse_ba.table.name_map, name, len, (void *)(intptr_t)(new_index + 1), hash);
@@ -3880,13 +3887,25 @@ static void pparse_register_array_binding_hops(PParseToken *tok,
 				     uint8_t ptr_hops) {
 	PPARSE_CTX();
 	pparse_bounds_array_add(pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, dim_complete,
-				is_vla, blocks_outer, ptr_hops, 0);
+				is_vla, blocks_outer, ptr_hops, 0, 0);
+}
+
+static void pparse_register_array_binding_hops_pre(PParseToken *tok,
+						  uint8_t rank,
+						  bool dim_complete,
+						  bool is_vla,
+						  bool blocks_outer,
+						  uint8_t ptr_hops,
+						  uint8_t pre_ptr_array) {
+	PPARSE_CTX();
+	pparse_bounds_array_add(pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, dim_complete,
+				is_vla, blocks_outer, ptr_hops, pre_ptr_array, 0);
 }
 
 static void pparse_register_static_extent_param(PParseToken *tok, uint8_t rank, uint32_t bracket) {
 	PPARSE_CTX();
 	pparse_bounds_array_add(pparse_loc(_pc, tok), tok->len, pparse_idx(_pc, tok), rank, true, false,
-				false, 0, bracket);
+				false, 0, 0, bracket);
 }
 
 static void pparse_register_array_binding(PParseToken *tok,
@@ -3897,8 +3916,10 @@ static void pparse_register_array_binding(PParseToken *tok,
 	pparse_register_array_binding_hops(tok, rank, dim_complete, is_vla, blocks_outer, 0);
 }
 
-/* Count `*` hops immediately before a declarator name (`(*p)`, `(**p)`). */
-static uint8_t pparse_declarator_star_hops(PParseToken *name) {
+/* Count `*` hops immediately before a declarator name (`(*p)`, `(**p)`).
+ * Returns 0 when the name has no leading stars (unlike the "at least one"
+ * helper used when a pointer-to-array shape is already known). */
+static uint8_t pparse_declarator_star_count(PParseToken *name) {
 	PPARSE_CTX();
 	int stars = 0;
 	for (PParseToken *t = pparse_walk_back(pparse_idx(_pc, name), PPARSE_WB_ATTR_NOISE);
@@ -3913,7 +3934,13 @@ static uint8_t pparse_declarator_star_hops(PParseToken *name) {
 		break;
 	}
 	if (stars > 0 && stars < 15) return (uint8_t)stars;
-	return 1;
+	return 0;
+}
+
+/* Count `*` hops immediately before a declarator name (`(*p)`, `(**p)`). */
+static uint8_t pparse_declarator_star_hops(PParseToken *name) {
+	uint8_t stars = pparse_declarator_star_count(name);
+	return stars > 0 ? stars : 1;
 }
 
 static bool pparse_name_has_declarator_star(PParseToken *name) {
@@ -3982,16 +4009,36 @@ static bool pparse_register_typedef_array_extent(PParseToken *bind_name, PParseT
 	    entry->array_rank == 0 || entry->array_rank == PPARSE_ARRAY_RANK_WRAP_ALL)
 		return false;
 	if (entry->is_ptr && entry->array_rank > 0) {
-		/* Pointer-to-array typedef: hops come from the typedef declarator.
-		 * `typedef AA (*PA)[3]` may also set is_array from the AA alias;
-		 * array_rank still holds the pointed-at extent. */
-		PParseToken *td_name = &pparse_token_pool[entry->token_index];
-		uint8_t hops = pparse_declarator_star_hops(td_name);
+		/* Pointer-to-array typedef: hops come from the alias (including
+		 * chained `typedef PA *PPA`). Extra stars on the use site
+		 * (`PA *pp`) add hops on top. */
+		uint8_t hops = entry->ptr_hops;
+		if (hops == 0) {
+			PParseToken *td_name = &pparse_token_pool[entry->token_index];
+			hops = pparse_declarator_star_hops(td_name);
+		}
+		hops = (uint8_t)(hops + pparse_declarator_star_count(bind_name));
+		/* `typeof(PA*)` / `_Atomic(PA*)`: stars after the typedef name live
+		 * on the constructor (`type_ptr_hops`), not the use-site declarator. */
+		if (type->type_ptr_hops > hops) hops = type->type_ptr_hops;
+		if (hops > 15) hops = 15;
 		int prank = entry->array_rank + hops;
 		if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
 		pparse_register_array_binding_hops(
 		    bind_name, (uint8_t)prank, true, false, false, hops);
 		return true;
+	}
+	/* `typedef int A[N]; A *p` / `A (*p)`: array typedef plus declarator
+	 * stars is pointer-to-array, not a decayed multi-dim param. */
+	{
+		uint8_t hops = pparse_declarator_star_count(bind_name);
+		if (hops > 0 && entry->is_array && !entry->is_ptr) {
+			int prank = entry->array_rank + hops;
+			if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+			pparse_register_array_binding_hops(
+			    bind_name, (uint8_t)prank, true, false, false, hops);
+			return true;
+		}
 	}
 	if (as_param && entry->is_array && !entry->is_ptr && entry->array_rank > 1) {
 		/* Multi-dim array typedef as a parameter decays like `T a[A][B]` —
@@ -4021,8 +4068,29 @@ static bool pparse_register_type_ptr_array_extent(PParseToken *bind_name, PParse
 	if (type->type_ptr_array_rank == 0 || !type->type_ptr_array_dim_complete ||
 	    type->type_ptr_array_rank == PPARSE_ARRAY_RANK_WRAP_ALL || type->type_vm)
 		return false;
-	uint8_t hops = 1;
+	uint8_t hops = type->type_ptr_hops;
+	if (hops == 0) hops = 1;
+	hops = (uint8_t)(hops + pparse_declarator_star_count(bind_name));
+	if (hops > 15) hops = 15;
 	int prank = pparse_ptr_array_rank_with_type_array(type->type_ptr_array_rank + hops, type);
+	if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+	pparse_register_array_binding_hops(
+	    bind_name, (uint8_t)prank, true, false, false, hops);
+	return true;
+}
+
+/* `typeof(int[4]) *p` / `_Atomic(int[4]) *p`: constructor array plus declarator
+ * stars — same shape as `typedef int A[4]; A *p`. */
+static bool pparse_register_type_array_ptr_extent(PParseToken *bind_name, PParseTypeSpec *type) {
+	PPARSE_CTX();
+	if (!bind_name || !type || (bind_name->flags & PPARSE_TF_RAW)) return false;
+	if (!type->is_array || type->type_ptr_array_rank > 0 || type->type_vm) return false;
+	if (type->type_array_rank == 0 || !type->array_dim_complete ||
+	    type->type_array_rank == PPARSE_ARRAY_RANK_WRAP_ALL)
+		return false;
+	uint8_t hops = pparse_declarator_star_count(bind_name);
+	if (hops == 0) return false;
+	int prank = type->type_array_rank + hops;
 	if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
 	pparse_register_array_binding_hops(
 	    bind_name, (uint8_t)prank, true, false, false, hops);
@@ -4533,7 +4601,7 @@ static inline bool pparse_is_value_name_token(PParseToken *t) {
 }
 
 static inline bool pparse_is_unevaluated_operand_intro(PParseToken *t) {
-	return (t->flags & PPARSE_TF_SIZEOF) || (t->tag & PPARSE_TT_TYPEOF);
+	return (t->flags & PPARSE_TF_SIZEOF) || (t->tag & (PPARSE_TT_TYPEOF | PPARSE_TT_GENERIC));
 }
 
 static void pparse_tag_brackets_in_range(PParseToken *open, PParseToken *close) {
@@ -4602,6 +4670,94 @@ static bool pparse_bounds_is_tracked_array(PParseToken *tok) {
 	return pparse_is_value_name_token(tok) && pparse_array_binding_info(tok).tracked;
 }
 
+/* `auto p = &a` / `__auto_type p = &a` / `auto p = q` where `q` is already a
+ * tracked pointer-to-array: C23/`__auto_type` inference carries the extent that
+ * an explicit `typeof(&a)` / `int (*p)[N]` spelling would register. Without this,
+ * `(*p)[i]` stayed bare and nearby `i[(*p)]` skipped the commutative reject. */
+static bool pparse_register_auto_init_ptr_array_extent(PParseToken *bind_name, PParseDecl *decl,
+						       PParseTypeSpec *type) {
+	PPARSE_CTX();
+	if (!bind_name || !decl || !type || !type->has_auto || (bind_name->flags & PPARSE_TF_RAW))
+		return false;
+	if (decl->ptr_array_rank > 0 || decl->is_func_ptr || decl->is_vla) return false;
+	PParseToken *eq = decl->end;
+	if (!eq || !pparse_match_ch(eq, '=')) return false;
+	PParseToken *rhs = pparse_skip_noise(_pc, pparse_next(_pc, eq));
+	while (rhs && pparse_match_ch(rhs, '(') && (rhs->flags & PPARSE_TF_OPEN)) {
+		PParseToken *close = pparse_pair_known(rhs);
+		PParseToken *after = pparse_skip_noise(_pc, pparse_next(_pc, close));
+		if (after && !pparse_match_ch(after, ';') && !pparse_match_ch(after, ',') &&
+		    after->kind != PPARSE_TK_EOF && !pparse_match_ch(after, ')'))
+			break;
+		rhs = pparse_skip_noise(_pc, pparse_next(_pc, rhs));
+		PParseToken *inner = rhs;
+		PParseToken *inner_end = close;
+		while (inner && pparse_match_ch(inner, '(') && (inner->flags & PPARSE_TF_OPEN) &&
+		       pparse_next(_pc, pparse_pair_known(inner)) == inner_end) {
+			inner_end = pparse_pair_known(inner);
+			inner = pparse_skip_noise(_pc, pparse_next(_pc, inner));
+		}
+		rhs = inner;
+		break;
+	}
+	if (!rhs) return false;
+	uint8_t use_hops = pparse_declarator_star_count(bind_name);
+	if (pparse_match_ch(rhs, '&') && !(rhs->flags & PPARSE_TF_OPEN)) {
+		PParseToken *op = pparse_skip_noise(_pc, pparse_next(_pc, rhs));
+		while (op && pparse_match_ch(op, '(') && (op->flags & PPARSE_TF_OPEN)) {
+			PParseToken *ic = pparse_pair_known(op);
+			PParseToken *inner = pparse_skip_noise(_pc, pparse_next(_pc, op));
+			PParseToken *after_close = pparse_next(_pc, ic);
+			if (after_close && !pparse_match_ch(after_close, ';') &&
+			    !pparse_match_ch(after_close, ',') && after_close->kind != PPARSE_TK_EOF)
+				break;
+			PParseToken *walk = inner;
+			if (walk && pparse_is_value_name_token(walk) && !pparse_is_known_typedef(walk)) {
+				PParseToken *after = pparse_next(_pc, walk);
+				while (after && after != ic && pparse_match_ch(after, '[') &&
+				       (after->flags & PPARSE_TF_OPEN))
+					after = pparse_next(_pc, pparse_pair_known(after));
+				if (after == ic) {
+					op = walk;
+					break;
+				}
+			}
+			if (!(inner && pparse_match_ch(inner, '('))) break;
+			op = inner;
+		}
+		if (op && pparse_is_value_name_token(op) && !pparse_is_known_typedef(op)) {
+			PParseArrayBindingInfo info = pparse_array_binding_info(op);
+			if (!info.tracked || !info.dim_complete || info.rank == 0 ||
+			    info.rank == PPARSE_ARRAY_RANK_WRAP_ALL || info.ptr_hops > 0)
+				return false;
+			uint8_t hops = (uint8_t)(1 + use_hops);
+			if (hops > 15) hops = 15;
+			int prank = info.rank + hops;
+			if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+			pparse_register_array_binding_hops(
+			    bind_name, (uint8_t)prank, true, false, false, hops);
+			return true;
+		}
+		return false;
+	}
+	if (pparse_is_value_name_token(rhs) && !pparse_is_known_typedef(rhs)) {
+		PParseArrayBindingInfo info = pparse_array_binding_info(rhs);
+		if (info.tracked && info.ptr_hops > 0 && info.dim_complete && info.rank > 0 &&
+		    info.rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
+			uint8_t hops = (uint8_t)(info.ptr_hops + use_hops);
+			if (hops > 15) hops = 15;
+			int extents = (int)info.rank - (int)info.ptr_hops;
+			if (extents < 1) return false;
+			int prank = extents + hops;
+			if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+			pparse_register_array_binding_hops_pre(
+			    bind_name, (uint8_t)prank, true, false, false, hops, info.pre_ptr_array);
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Peel a parenthesized primary. The commutative-index path asks for every
  * redundant layer; the base-expression path stops after one and preserves a
  * call's argument list. */
@@ -4662,6 +4818,35 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 	PPARSE_FOR_RANGE(t, first, close) {
 		if (pparse_bounds_skip_unevaluated_group(&t)) continue;
 		if ((pparse_match_ch(t, '&') || pparse_match_ch(t, '*')) && !(t->flags & PPARSE_TF_OPEN)) {
+			/* `(int(*)[N])&a` forms a pointer-to-array value; `&a` here is not
+			 * the derived `(&arr[i])` shape the diagnostic targets. A cast
+			 * whose type ends in `)[` (ptr-to-array declarator) must not
+			 * false-reject `(*((int(*)[N])&a))[i]`. */
+			if (pparse_match_ch(t, '&') && pparse_idx(_pc, t) >= 1) {
+				PParseToken *before = &pparse_token_pool[pparse_idx(_pc, t) - 1];
+				/* `(int(*)[N])(&a)`: `&` sits inside a grouping paren after
+				 * the cast close. Walk back one open so the cast `)` is seen
+				 * the same way as the unparenthesized `(int(*)[N])&a`. */
+				if (pparse_match_ch(before, '(') && (before->flags & PPARSE_TF_OPEN) &&
+				    pparse_idx(_pc, before) >= 1)
+					before = &pparse_token_pool[pparse_idx(_pc, before) - 1];
+				if (pparse_match_ch(before, ')') && !(before->flags & PPARSE_TF_OPEN)) {
+					PParseToken *cast_open = pparse_pair_known(before);
+					bool ptr_array_cast = false;
+					if (cast_open) {
+						for (PParseToken *s = pparse_next(_pc, cast_open);
+						     s && s != before; s = pparse_next(_pc, s)) {
+							if (pparse_match_ch(s, ')') &&
+							    pparse_next(_pc, s) &&
+							    pparse_match_ch(pparse_next(_pc, s), '[')) {
+								ptr_array_cast = true;
+								break;
+							}
+						}
+					}
+					if (ptr_array_cast) continue;
+				}
+			}
 			PParseToken *next = pparse_next(_pc, t);
 			while (next && next != close && pparse_match_ch(next, '(') &&
 			       (next->flags & PPARSE_TF_OPEN)) {
@@ -4690,8 +4875,14 @@ static bool pparse_bounds_span_derives_array(PParseToken *first, PParseToken *cl
 				next = inner;
 			}
 			if (next && next != close && pparse_is_value_name_token(next) &&
-			    pparse_bounds_is_tracked_array(next))
+			    pparse_bounds_is_tracked_array(next)) {
+				/* `*p` on a pointer-to-array is the hop peel (`(*p)[i]`),
+				 * not array-to-pointer decay of an array object. */
+				if (pparse_match_ch(t, '*') &&
+				    pparse_array_binding_info(next).ptr_hops > 0)
+					continue;
 				return true;
+			}
 		}
 	}
 	return false;
@@ -5039,18 +5230,48 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		}
 		PParseToken *star = expr_open ? pparse_next(_pc, expr_open) : NULL;
 		if (star && pparse_match_ch(star, '*') && !(star->flags & PPARSE_TF_OPEN)) {
-			/* Count leading `*` hops (`(*p)`, `(**p)`). Partial peels
-			 * (`(*p)[0][i]` on `int (**p)[N]`) must not claim a plan here —
-			 * only a full peel to the array extent does. Dim depth is the
-			 * star count, not the registered ptr_hops (those differ when a
-			 * later `[0]` also consumes a hop). */
+			/* Count `*` hops, including nested `(*(*p))` / `(*(*(*p)))`.
+			 * Consecutive-only counting left split peels bare. */
 			int stars = 0;
 			PParseToken *s = star, *e = expr_close;
-			while (s && s != e && pparse_match_ch(s, '*') && !(s->flags & PPARSE_TF_OPEN)) {
-				stars++;
-				s = pparse_next(_pc, s);
-				while (s && s != e && (s->tag & PPARSE_TT_QUALIFIER))
+			for (;;) {
+				while (s && s != e && pparse_match_ch(s, '*') &&
+				       !(s->flags & PPARSE_TF_OPEN)) {
+					stars++;
 					s = pparse_next(_pc, s);
+					while (s && s != e && (s->tag & PPARSE_TT_QUALIFIER))
+						s = pparse_next(_pc, s);
+				}
+				/* `(*(*p))` and `(*((*(*p))))`: peel redundant wraps until
+				 * a `*` hop or a non-peelable token. */
+				if (s && pparse_match_ch(s, '(') && (s->flags & PPARSE_TF_OPEN)) {
+					PParseToken *layer = s, *layer_close = pparse_pair_known(s);
+					if (!layer_close || pparse_next(_pc, layer_close) != e)
+						break;
+					bool stepped = false;
+					for (;;) {
+						PParseToken *inner = pparse_next(_pc, layer);
+						if (inner && pparse_match_ch(inner, '*') &&
+						    !(inner->flags & PPARSE_TF_OPEN)) {
+							e = layer_close;
+							s = inner;
+							stepped = true;
+							break;
+						}
+						if (inner && pparse_match_ch(inner, '(') &&
+						    (inner->flags & PPARSE_TF_OPEN)) {
+							PParseToken *ic = pparse_pair_known(inner);
+							if (ic && pparse_next(_pc, ic) == layer_close) {
+								layer = inner;
+								layer_close = ic;
+								continue;
+							}
+						}
+						break;
+					}
+					if (stepped) continue;
+				}
+				break;
 			}
 			PParseToken *b = s;
 			while (b && pparse_match_ch(b, '(') && (b->flags & PPARSE_TF_OPEN) &&
@@ -5058,59 +5279,100 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 				e = pparse_pair_known(b);
 				b = pparse_next(_pc, b);
 			}
-			if (stars > 0 && b && pparse_is_value_name_token(b) && pparse_next(_pc, b) == e &&
-			    !pparse_is_known_typedef(b)) {
-				PParseArrayBindingInfo pa = pparse_array_binding_info(b);
-				if (pa.tracked && stars >= pa.ptr_hops && pa.ptr_hops > 0 &&
-				    pa.dim_complete &&
-				    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL ||
-				     (int)pa.rank > stars)) {
-					out->arr = b;
-					out->close = rb;
-					out->cast_close = NULL;
-					out->dim_depth = stars;
-					out->static_extent = NULL;
-					return true;
+			/* `(*a[0])[i]` / `(*(*p[0]))[i]`: stars then a name with
+			 * subscripts before the hop. */
+			int name_dims = 0;
+			PParseToken *base = b;
+			if (base && pparse_is_value_name_token(base) && !pparse_is_known_typedef(base)) {
+				PParseToken *walk = pparse_next(_pc, base);
+				while (walk && walk != e && pparse_match_ch(walk, '[') &&
+				       (walk->flags & PPARSE_TF_OPEN) && !(walk->flags & PPARSE_TF_C23_ATTR)) {
+					PParseToken *wc = pparse_pair_known(walk);
+					if (!wc) break;
+					name_dims++;
+					walk = pparse_next(_pc, wc);
 				}
-			}
-		}
-		/* `(p[0])[i]` / `((p[0]))[i]` are the same object as `(*p)[i]`. Without
-		 * recognising the index-0 (or any single) hop here, the bail below
-		 * saw a tracked ptr-to-array name inside the paren and left the
-		 * subscript unchecked. */
-		{
-			PParseToken *b = expr_open ? pparse_next(_pc, expr_open) : NULL;
-			if (b && pparse_is_value_name_token(b) && !pparse_is_known_typedef(b)) {
-				PParseToken *br = pparse_next(_pc, b);
-				if (br && pparse_match_ch(br, '[') && (br->flags & PPARSE_TF_OPEN) &&
-				    !(br->flags & PPARSE_TF_C23_ATTR)) {
-					PParseToken *br_close = pparse_pair_known(br);
-					if (br_close && pparse_next(_pc, br_close) == expr_close) {
-						PParseArrayBindingInfo pa = pparse_array_binding_info(b);
-						if (pa.tracked && pa.ptr_hops == 1 && pa.dim_complete &&
-						    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL || pa.rank > 1)) {
-							out->arr = b;
-							out->close = rb;
-							out->cast_close = NULL;
-							out->dim_depth = pa.ptr_hops;
-							out->static_extent = NULL;
-							return true;
-						}
+				if (walk == e && stars > 0) {
+					PParseArrayBindingInfo pa = pparse_array_binding_info(base);
+					int depth = name_dims + stars;
+					bool peel_ok = false;
+					if (pa.tracked && pa.ptr_hops > 0 && pa.dim_complete &&
+					    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL ||
+					     (int)pa.rank > depth)) {
+						if (name_dims == 0)
+							peel_ok = stars >= (int)pa.ptr_hops;
+						else if (pa.pre_ptr_array > 0)
+							peel_ok = name_dims == (int)pa.pre_ptr_array &&
+								  stars >= (int)pa.ptr_hops;
+						else
+							peel_ok = depth >= (int)pa.ptr_hops &&
+								  name_dims < (int)pa.ptr_hops;
+					}
+					if (peel_ok) {
+						out->arr = base;
+						out->close = rb;
+						out->cast_close = NULL;
+						out->dim_depth = depth;
+						out->static_extent = NULL;
+						return true;
 					}
 				}
 			}
 		}
-		/* Any other base built from a pointer-to-array name -- a second
-		 * dereference, arithmetic, a conditional -- has no extent this pass can
-		 * prove. Leave it unchecked rather than falling into the derived-pointer
-		 * diagnostics below, which exist for arrays and would now fire on a
-		 * pointer that was untracked until this release. */
+		/* `(p[0])[i]` / `((p[0][0]))[i]` are the same object as a full hop
+		 * peel to the array extent. Count every subscript inside the paren:
+		 * 1-hop needs one `[0]`, array-of-ptr-to-array needs outer+hop
+		 * (`p[0][0]`), 2-hop needs two index hops. A single-bracket guard
+		 * left `((p[0][0]))[i]` bare after fixing `(*p[0])`. */
+		{
+			PParseToken *b = expr_open ? pparse_next(_pc, expr_open) : NULL;
+			if (b && pparse_is_value_name_token(b) && !pparse_is_known_typedef(b)) {
+				int name_dims = 0;
+				PParseToken *walk = pparse_next(_pc, b);
+				while (walk && walk != expr_close && pparse_match_ch(walk, '[') &&
+				       (walk->flags & PPARSE_TF_OPEN) && !(walk->flags & PPARSE_TF_C23_ATTR)) {
+					PParseToken *wc = pparse_pair_known(walk);
+					if (!wc) break;
+					name_dims++;
+					walk = pparse_next(_pc, wc);
+				}
+				if (walk == expr_close && name_dims > 0) {
+					PParseArrayBindingInfo pa = pparse_array_binding_info(b);
+					int need = (int)pa.pre_ptr_array + (int)pa.ptr_hops;
+					/* Exact hop peel (`(p[0])[i]`) or hop+extent peels
+					 * (`((p[0][0][0]))[i]` on `int (*p[N])[M][K]`). */
+					if (pa.tracked && pa.ptr_hops > 0 && pa.dim_complete &&
+					    name_dims >= need &&
+					    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL ||
+					     name_dims < (int)pa.rank)) {
+						out->arr = b;
+						out->close = rb;
+						out->cast_close = NULL;
+						out->dim_depth = name_dims;
+						out->static_extent = NULL;
+						return true;
+					}
+				}
+			}
+		}
+		/* Complex bases built from a pointer-to-array name (arithmetic,
+		 * conditionals) have no extent this pass can prove — leave them
+		 * unchecked rather than derived-pointer-diag. Pure peel shapes
+		 * (`((*p)[0])`, `(*((*p)))`) fall through to the dim walk. */
 		if (expr_open) {
+			bool saw_ptr = false, complex = false;
 			for (PParseToken *t = pparse_next(_pc, expr_open); t && t != rp_prev;
-			     t = pparse_next(_pc, t))
+			     t = pparse_next(_pc, t)) {
 				if (pparse_is_value_name_token(t) && !pparse_is_known_typedef(t) &&
 				    pparse_array_binding_info(t).ptr_hops > 0)
-					return false;
+					saw_ptr = true;
+				else if (!((t->tag & PPARSE_TT_QUALIFIER) || t->kind == PPARSE_TK_NUM ||
+					   pparse_match_ch(t, '*') || pparse_match_ch(t, '(') ||
+					   pparse_match_ch(t, ')') || pparse_match_ch(t, '[') ||
+					   pparse_match_ch(t, ']')))
+					complex = true;
+			}
+			if (saw_ptr && complex) return false;
 		}
 	}
 	if (rp_prev && pparse_match_ch(rp_prev, ')')) {
@@ -5186,6 +5448,10 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					    pparse_bounds_is_tracked_array(le);
 			PParseToken *hit = left_ok_scan ? NULL : pparse_bounds_find_tracked_array(pparse_next(_pc, tok), rb);
 			while (hit) {
+				/* `i[p[0]]` / `i[p[0][0]]`: ptr-to-array peels in the index
+				 * position are still the array object — reject like `i[(*p)]`.
+				 * Skipping past `[` left those commutative forms bare. */
+				if (pparse_array_binding_info(hit).ptr_hops > 0) break;
 				PParseToken *nx = pparse_next(_pc, hit);
 				if (!(pparse_match_ch(nx, '[') && (nx->flags & PPARSE_TF_OPEN))) break;
 				hit = pparse_bounds_find_tracked_array(pparse_next(_pc, nx), rb);
@@ -5228,18 +5494,33 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 						while (s && s != e && (s->tag & PPARSE_TT_QUALIFIER))
 							s = pparse_next(_pc, s);
 					}
-					/* `(*(*p))`: another `(*…)` layer inside. */
+					/* `(*(*p))` and `(*((*(*p))))`: peel redundant wraps. */
 					if (s && pparse_match_ch(s, '(') && (s->flags & PPARSE_TF_OPEN)) {
-						PParseToken *ic = pparse_pair_known(s);
-						if (ic && pparse_next(_pc, ic) == e) {
-							PParseToken *inner = pparse_next(_pc, s);
+						PParseToken *layer = s, *layer_close = pparse_pair_known(s);
+						if (!layer_close || pparse_next(_pc, layer_close) != e)
+							break;
+						bool stepped = false;
+						for (;;) {
+							PParseToken *inner = pparse_next(_pc, layer);
 							if (inner && pparse_match_ch(inner, '*') &&
 							    !(inner->flags & PPARSE_TF_OPEN)) {
-								e = ic;
+								e = layer_close;
 								s = inner;
-								continue;
+								stepped = true;
+								break;
 							}
+							if (inner && pparse_match_ch(inner, '(') &&
+							    (inner->flags & PPARSE_TF_OPEN)) {
+								PParseToken *ic = pparse_pair_known(inner);
+								if (ic && pparse_next(_pc, ic) == layer_close) {
+									layer = inner;
+									layer_close = ic;
+									continue;
+								}
+							}
+							break;
 						}
+						if (stepped) continue;
 					}
 					break;
 				}
@@ -5250,28 +5531,36 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					b = pparse_next(_pc, b);
 				}
 				if (stars > 0 && b && pparse_is_value_name_token(b) &&
-				    pparse_next(_pc, b) == e && !pparse_is_known_typedef(b)) {
-					PParseArrayBindingInfo pa = pparse_array_binding_info(b);
-					/* Add the stars in this paren, not registered
-					 * ptr_hops: `(*p)[0][i]` on `int (**p)[N]` has
-					 * one star here and one hop already in dim_depth
-					 * from `[0]`. Adding ptr_hops (2) overshot rank
-					 * and left `[i]` unchecked. */
-					if (pa.tracked && pa.ptr_hops > 0 && pa.dim_complete &&
-					    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL ||
-					     (int)pa.rank > dim_depth + stars)) {
-						name_tok = b;
-						dim_depth += stars;
-						break;
+				    !pparse_is_known_typedef(b)) {
+					/* Allow `p[0]` / `p[0][0]` inside the paren so
+					 * `(*p[0])[0][i]` can accumulate remaining hops.
+					 * Requiring `next(name)==close` left those bare. */
+					int name_dims = 0;
+					PParseToken *walk = pparse_next(_pc, b);
+					while (walk && walk != e && pparse_match_ch(walk, '[') &&
+					       (walk->flags & PPARSE_TF_OPEN) &&
+					       !(walk->flags & PPARSE_TF_C23_ATTR)) {
+						PParseToken *wc = pparse_pair_known(walk);
+						if (!wc) break;
+						name_dims++;
+						walk = pparse_next(_pc, wc);
+					}
+					if (walk == e) {
+						PParseArrayBindingInfo pa = pparse_array_binding_info(b);
+						int add = stars + name_dims;
+						if (pa.tracked && pa.ptr_hops > 0 && pa.dim_complete &&
+						    (pa.rank == PPARSE_ARRAY_RANK_WRAP_ALL ||
+						     (int)pa.rank > dim_depth + add)) {
+							name_tok = b;
+							dim_depth += add;
+							break;
+						}
 					}
 				}
 			}
-			if (pparse_idx(_pc, open) >= 1) {
-				PParseToken *bp = &pparse_token_pool[pparse_idx(_pc, open) - 1];
-				if (pparse_is_value_name_token(bp) || bp->kind == PPARSE_TK_NUM ||
-				    pparse_match_ch(bp, ')') || pparse_match_ch(bp, ']'))
-					break;
-			}
+			/* Peel nested wraps / trailing `]` before treating a preceding
+			 * `)` (e.g. cast `(int)((m[0][0]))[i]`) as a hard stop — that
+			 * early break left dim_depth 0 and checked the outer extent. */
 			PParseToken *inner = pparse_next(_pc, open);
 			if (pparse_is_value_name_token(inner) && pparse_next(_pc, inner) == name_tok) {
 				name_tok = inner;
@@ -5288,6 +5577,12 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 					name_tok = inner_last;
 					continue;
 				}
+			}
+			if (pparse_idx(_pc, open) >= 1) {
+				PParseToken *bp = &pparse_token_pool[pparse_idx(_pc, open) - 1];
+				if (pparse_is_value_name_token(bp) || bp->kind == PPARSE_TK_NUM ||
+				    pparse_match_ch(bp, ')') || pparse_match_ch(bp, ']'))
+					break;
 			}
 			break;
 		}
@@ -5369,10 +5664,12 @@ static bool pparse_bounds_plan_subscript(PParseToken *tok,
 		PParseArrayBindingInfo array = pparse_array_binding_info(name_tok);
 		if (!array.tracked) return false;
 		if (array.rank > 0 && array.rank != PPARSE_ARRAY_RANK_WRAP_ALL && dim_depth >= array.rank) return false;
-		/* A leading pointer hop carries no extent: `int (*p)[4]` says nothing
-		 * about how many `int[4]`s `p` points at, so `p[i]` stays unchecked
-		 * while `p[0][i]` bounds against the `[4]`. */
-		if (dim_depth < array.ptr_hops) return false;
+		/* Pointer hops carry no extent. Leading hops (`pre_ptr_array == 0`)
+		 * cover `int (*p)[4]`; after outer array dims they cover
+		 * `int (*a[2])[4]` between the `[2]` and the pointed-at `[4]`. */
+		if (dim_depth >= array.pre_ptr_array &&
+		    dim_depth < (int)array.pre_ptr_array + (int)array.ptr_hops)
+			return false;
 		/* Only the outermost subscript is covered by the `static N` promise.
 		 * Deeper ones index a real array type, where the sizeof ratio is
 		 * correct: for `int a[static 4][3]`, `a[0]` is `int[3]`. */
@@ -5745,12 +6042,12 @@ static PParseToken *pparse_declarator_array_dims(PParseToken *tok, PParseDecl *d
 			PParseToken *prev = pparse_walk_back(pparse_idx(_pc, tok), PPARSE_WB_ATTR_NOISE);
 			/* `int (*p)[4][3]`: the first `[]` closes a pointer-only paren, and
 			 * every later `[]` is another dimension of that same pointed-at
-			 * array. Without continuing, only `[4]` became `ptr_array_rank` and
-			 * `[3]` fell into ordinary `array_rank`, so the local path stored
-			 * rank 2 and left `p[0][0][j]` / `(*p)[i][j]` unchecked. */
+			 * array. Do not require `array_rank == 0`: `int (*a[2])[4][16]`
+			 * already recorded the outer `[2]` before the `)`, and that
+			 * guard sent `[16]` into ordinary array_rank so peels missed a
+			 * pointed-at dim and `a[0][0]…` used sizeof(pointer)/sizeof(array). */
 			bool ptr_dim = pparse_array_bracket_closes_ptr_to_array(tok, prev) ||
-				       (decl->ptr_array_rank > 0 && !decl->array_rank &&
-					pparse_match_ch(prev, ']'));
+				       (decl->ptr_array_rank > 0 && pparse_match_ch(prev, ']'));
 			if (!ptr_dim) {
 				if (!decl->array_rank) {
 					decl->array_dim_complete = first && !pparse_match_ch(first, ']');
@@ -6125,8 +6422,7 @@ static void pparse_scan_type_constructor(PParseToken *start,
 			bool dim_vla = pparse_array_size_is_vla(t);
 			r->type_vm |= dim_vla;
 			bool ptr_dim = pparse_array_bracket_closes_ptr_to_array(t, prev) ||
-				       (r->type_ptr_array_rank > 0 && !r->type_array_rank &&
-					pparse_match_ch(prev, ']'));
+				       (r->type_ptr_array_rank > 0 && pparse_match_ch(prev, ']'));
 			if (!ptr_dim) {
 				r->is_array = true;
 				if (!r->type_array_rank) {
@@ -6148,22 +6444,107 @@ static void pparse_scan_type_constructor(PParseToken *start,
 				if (r->type_ptr_array_rank < 15) r->type_ptr_array_rank++;
 				else r->type_ptr_array_rank = PPARSE_ARRAY_RANK_WRAP_ALL;
 				r->is_ptr = true;
+				/* First pointed-at dim: count `*` hops in the closing
+				 * declarator paren so `typeof(int (**)[4])` gets hops=2. */
+				if (r->type_ptr_array_rank == 1 && prev && pparse_match_ch(prev, ')')) {
+					PParseToken *open = pparse_pair_known(prev);
+					int stars = 0;
+					for (PParseToken *s = open ? pparse_next(_pc, open) : NULL;
+					     s && s != prev; s = pparse_next(_pc, s)) {
+						if (pparse_match_ch(s, '*') && !(s->flags & PPARSE_TF_OPEN))
+							stars++;
+						else if (!(s->tag & PPARSE_TT_QUALIFIER) &&
+							 !(pparse_match_ch(s, '(') && (s->flags & PPARSE_TF_OPEN)))
+							break;
+					}
+					if (stars > 0 && stars < 15) r->type_ptr_hops = (uint8_t)stars;
+					else if (stars >= 15) r->type_ptr_hops = 15;
+					else if (r->type_ptr_hops == 0) r->type_ptr_hops = 1;
+				} else if (r->type_ptr_hops == 0) {
+					r->type_ptr_hops = 1;
+				}
 			}
+		}
+		/* `typeof(int(*)[16]*)`: star after the pointed-at dims is another hop
+		 * (same as `typeof(PA*)` after a ptr-to-array typedef). */
+		if (scan_vla && pparse_match_ch(t, '*') && !(t->flags & PPARSE_TF_OPEN) &&
+		    r->type_ptr_array_rank > 0 && prev && pparse_match_ch(prev, ']')) {
+			if (r->type_ptr_hops < 15) r->type_ptr_hops++;
+			else r->type_ptr_hops = 15;
 		}
 		if (scan_vla && pparse_is_identifier_like(t)) {
 			int tf = pparse_typedef_flags(t);
 			r->is_vla |= (tf & PPARSE_TDF_VLA) != 0;
-			if (tf & PPARSE_TDF_ARRAY) {
-				r->is_array = true;
+			PParseTypedefEntry *td = pparse_typedef_lookup(_pc, t);
+			/* Stars written after a typedef name inside the constructor
+			 * (`typeof(A*)`, `typeof(PA*)`) are hops, not part of an
+			 * outer declarator — `typeof(A)*` already works via the
+			 * declarator-star path. */
+			uint8_t trailing_stars = 0;
+			{
+				PParseToken *s = pparse_next(_pc, t);
+				while (s && s != end) {
+					if (pparse_match_ch(s, '*') && !(s->flags & PPARSE_TF_OPEN)) {
+						if (trailing_stars < 15) trailing_stars++;
+						s = pparse_next(_pc, s);
+						continue;
+					}
+					if (s->tag & PPARSE_TT_QUALIFIER) {
+						s = pparse_next(_pc, s);
+						continue;
+					}
+					break;
+				}
+			}
+			/* `typeof(PA)` / `_Atomic(PA)`: recover pointer-to-array extent. */
+			if (td && td->is_ptr && td->array_rank > 0 && td->array_dim_complete &&
+			    td->array_rank != PPARSE_ARRAY_RANK_WRAP_ALL &&
+			    r->type_ptr_array_rank == 0) {
+				r->is_ptr = true;
+				r->type_ptr_array_rank = td->array_rank;
+				r->type_ptr_array_dim_complete = true;
+				uint8_t hops = td->ptr_hops ? td->ptr_hops : 1;
+				hops = (uint8_t)(hops + trailing_stars);
+				if (hops > 15) hops = 15;
+				r->type_ptr_hops = hops;
+				if (!r->object_type_idx) r->object_type_idx = pparse_idx(_pc, t) + 1;
+			} else if (tf & PPARSE_TDF_ARRAY) {
+				/* `typeof(&a)` is pointer-to-array, not an array object.
+				 * Treating it as `is_array` made `s` look tracked and
+				 * `(*s)[i]` falsely reject as derived-pointer. */
+				bool addr_of = prev && pparse_match_ch(prev, '&') &&
+					       !(prev->flags & PPARSE_TF_OPEN);
 				uint8_t rk = pparse_array_rank_for_tok(t);
-				if (rk > 0 && r->type_array_rank < rk)
-					r->type_array_rank = rk;
-				else if (r->type_array_rank == 0)
-					r->type_array_rank = 1;
+				if (rk == 0) rk = 1;
 				PParseArrayBindingInfo info = pparse_array_binding_info(t);
-				r->array_dim_complete |= info.tracked & info.dim_complete;
+				bool complete = info.tracked ? info.dim_complete : true;
+				if (addr_of && complete && r->type_ptr_array_rank == 0) {
+					r->is_ptr = true;
+					r->type_ptr_array_rank = rk;
+					r->type_ptr_array_dim_complete = true;
+					r->type_ptr_hops = 1;
+				} else if (trailing_stars > 0 && complete &&
+					   r->type_ptr_array_rank == 0) {
+					/* `typeof(A*)` / `_Atomic(A*)`: array typedef then
+					 * stars inside the constructor. */
+					r->is_ptr = true;
+					r->is_array = false;
+					r->type_ptr_array_rank = rk;
+					r->type_ptr_array_dim_complete = true;
+					r->type_ptr_hops = trailing_stars > 15 ? 15 : trailing_stars;
+					r->type_array_rank = 0;
+					if (!r->object_type_idx) r->object_type_idx = pparse_idx(_pc, t) + 1;
+				} else {
+					r->is_array = true;
+					if (rk > 0 && r->type_array_rank < rk)
+						r->type_array_rank = rk;
+					else if (r->type_array_rank == 0)
+						r->type_array_rank = 1;
+					r->array_dim_complete |= complete;
+				}
 			}
 			vla_done |= (tf & (PPARSE_TDF_VLA | PPARSE_TDF_ARRAY)) != 0;
+			vla_done |= td && td->is_ptr && td->array_rank > 0;
 		}
 
 		outer_ptr |= (depth == 0) & pparse_match_ch(t, '*');
@@ -6364,8 +6745,13 @@ static PParseTypeSpec pparse_type_specifier_parse(PParseToken *tok) {
 			}
 		}
 
+		/* Only `_Atomic` takes the `(type)` constructor form. `auto` shares
+		 * QUALIFIER|TYPE (C23 type-specifier-or-qualifier) and must not steal
+		 * `auto (*p)[N]` as a fake `_Atomic(*p)` scan — that swallowed the
+		 * declarator name and left ptr-to-array extents unregistered. */
 		bool atomic_kw = (tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE)) ==
-				 (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE);
+				 (PPARSE_TT_QUALIFIER | PPARSE_TT_TYPE) &&
+				 tok->ch0 == '_' && tok->len == 7;
 		PParseToken *atomic_open = pparse_next(_pc, tok);
 		bool atomic_ctor = atomic_kw & pparse_match_ch(atomic_open, '(');
 		if (is_type && atomic_kw && !atomic_ctor)
@@ -6647,6 +7033,62 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 					added->array_rank = (uint8_t)rank;
 					added->array_dim_complete =
 					    !type_spec.is_array || type_spec.array_dim_complete;
+					{
+						uint8_t hops = pparse_declarator_star_count(decl.var_name);
+						added->ptr_hops = hops > 0 ? (hops > 15 ? 15 : hops) : 1;
+					}
+				} else if (!decl.is_array && !decl.is_func_ptr && !decl.is_vla &&
+					   type_spec.type_ptr_array_rank > 0 &&
+					   type_spec.type_ptr_array_dim_complete &&
+					   type_spec.type_ptr_array_rank != PPARSE_ARRAY_RANK_WRAP_ALL &&
+					   !type_spec.type_vm) {
+					/* `typedef _Atomic(int (*)[4]) APA` / `typedef typeof(int (**)[4]) P2`:
+					 * extent lives on the constructor, not the bare alias name. */
+					int rank = type_spec.type_ptr_array_rank;
+					if (type_spec.is_array && type_spec.type_array_rank > 0 &&
+					    type_spec.type_array_rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
+						rank += type_spec.type_array_rank;
+						if (rank > 15) rank = PPARSE_ARRAY_RANK_WRAP_ALL;
+					}
+					added->array_rank = (uint8_t)rank;
+					added->array_dim_complete = true;
+					added->is_ptr = true;
+					added->is_array = false;
+					{
+						uint8_t hops = type_spec.type_ptr_hops;
+						if (hops == 0) hops = 1;
+						hops = (uint8_t)(hops + pparse_declarator_star_count(decl.var_name));
+						if (hops > 15) hops = 15;
+						added->ptr_hops = hops;
+					}
+				} else if (decl.is_pointer && !decl.is_array && !decl.is_func_ptr &&
+					   type_spec.object_type_idx &&
+					   type_spec.object_type_idx <= pparse_token_count) {
+					/* `typedef A *B` / `typedef PA *PPA`: pointer to an
+					 * array or pointer-to-array typedef keeps the pointee
+					 * extent in array_rank with is_ptr set. Require a real
+					 * declarator star — `typedef PA CPA` is is_ptr via the
+					 * type-spec alone and must use the identity path. */
+					PParseToken *source =
+					    &pparse_token_pool[type_spec.object_type_idx - 1];
+					PParseTypedefEntry *src = pparse_typedef_lookup(_pc, source);
+					if (src && src->array_dim_complete && src->array_rank > 0 &&
+					    src->array_rank != PPARSE_ARRAY_RANK_WRAP_ALL &&
+					    (src->is_array || src->is_ptr)) {
+						added->array_rank = src->array_rank;
+						added->array_dim_complete = true;
+						uint8_t hops = pparse_declarator_star_count(decl.var_name);
+						if (hops == 0) hops = 1;
+						if (src->is_ptr) {
+							uint8_t src_hops = src->ptr_hops;
+							if (src_hops == 0)
+								src_hops = pparse_declarator_star_hops(
+								    &pparse_token_pool[src->token_index]);
+							hops = (uint8_t)(hops + src_hops);
+						}
+						if (hops > 15) hops = 15;
+						added->ptr_hops = hops;
+					}
 				} else if (!decl.is_pointer && !decl.is_array && !decl.is_func_ptr &&
 					   !decl.is_vla && type_spec.object_type_idx &&
 					   type_spec.object_type_idx <= pparse_token_count) {
@@ -6660,6 +7102,11 @@ static void pparse_typedef_declaration(PParseToken *tok, int scope_depth) {
 					    src->array_rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
 						added->array_rank = src->array_rank;
 						added->array_dim_complete = true;
+						added->ptr_hops = src->ptr_hops;
+						if (src->is_ptr) {
+							added->is_ptr = true;
+							added->is_array = false;
+						}
 					}
 				}
 				added->is_aggregate = type_spec.is_struct && !type_spec.is_enum &&
@@ -9493,6 +9940,19 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 						break;
 					}
 					if (stars > 0 && stars < 15) hops = (uint8_t)stars;
+					/* `int (*a[2])[4]` adjusts to `int (**a)[4]`.
+					 * `int (*a[2][3])[4]` adjusts to `int (*(*a)[3])[4]`:
+					 * every outer array dim becomes a hop in the adjusted
+					 * type (first decays; survivors sit between pointer
+					 * hops). Counting only +1 left middle dims checked
+					 * with sizeof(pointer)/sizeof(array)==0 false traps.
+					 * Locals keep outer extents via pre_ptr_array. */
+					if (param_decl.var_name == last_ident && param_decl.is_array &&
+					    param_decl.array_rank > 0 &&
+					    param_decl.array_rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
+						hops = (uint8_t)(hops + param_decl.array_rank);
+						if (hops > 15) hops = 15;
+					}
 					int full_rank = pparse_ptr_array_rank_with_type_array(prank + hops, &param_type);
 					if (full_rank > 15) full_rank = PPARSE_ARRAY_RANK_WRAP_ALL;
 					pparse_register_array_binding_hops(
@@ -9556,8 +10016,12 @@ p1_register_param_shadows(PParseToken *open, PParseToken *close, uint16_t scope_
 			 * `typedef int M[4][3]; void f(M a)` must match the bare forms. */
 			if (pparse_feat(PPARSE_F_BOUNDS_CHECK) && !(last_ident->flags & PPARSE_TF_RAW) &&
 			    !static_dim && !pparse_bounds_is_tracked_array(last_ident)) {
-				bool reg = pparse_register_typedef_array_extent(last_ident, &param_type, true) ||
-					   pparse_register_type_ptr_array_extent(last_ident, &param_type) ||
+				/* Constructor extents (`typeof(PA*)`, `_Atomic(int (*)[N])`)
+				 * before bare typedef recovery — the latter used to win with
+				 * hops from the alias alone and drop stars inside the ctor. */
+				bool reg = pparse_register_type_ptr_array_extent(last_ident, &param_type) ||
+					   pparse_register_type_array_ptr_extent(last_ident, &param_type) ||
+					   pparse_register_typedef_array_extent(last_ident, &param_type, true) ||
 					   pparse_register_type_array_extent(last_ident, &param_type, true);
 				/* `typedef int A[N]; void f(A (*p)[M])` carries A's rank in the
 				 * type-spec, not the typedef entry (plain array alias). When the
@@ -9723,20 +10187,53 @@ static P1FuncEntry *p1_analyze_decl(PParseToken *type_start,
 		bool from_typedef = false;
 		if (ptr_to_array) {
 			uint8_t hops = pparse_declarator_star_hops(decl->var_name);
-			int prank = pparse_ptr_array_rank_with_type_array(decl->ptr_array_rank + hops, type);
+			/* `int (*a[2])[4]`: outer array dims precede the pointer hop.
+			 * Registering only the ptr-to-array shape, then overwriting
+			 * with the outer `[2]`, dropped the pointed-at `[4]`. */
+			uint8_t outer = (own_array && decl->array_rank > 0 &&
+					 decl->array_rank != PPARSE_ARRAY_RANK_WRAP_ALL)
+					    ? decl->array_rank
+					    : 0;
+			int prank = pparse_ptr_array_rank_with_type_array(
+			    decl->ptr_array_rank + hops + outer, type);
 			if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
-			pparse_register_array_binding_hops(
-			    decl->var_name, (uint8_t)prank, true, false, false, hops);
+			pparse_register_array_binding_hops_pre(
+			    decl->var_name, (uint8_t)prank, true, false, false, hops, outer);
 		} else if (!is_raw) {
-			from_typedef = pparse_register_typedef_array_extent(decl->var_name, type, false) ||
-				       pparse_register_type_ptr_array_extent(decl->var_name, type) ||
-				       pparse_register_type_array_extent(decl->var_name, type, false);
+			from_typedef = pparse_register_type_ptr_array_extent(decl->var_name, type) ||
+				       pparse_register_type_array_ptr_extent(decl->var_name, type) ||
+				       pparse_register_typedef_array_extent(decl->var_name, type, false) ||
+				       pparse_register_type_array_extent(decl->var_name, type, false) ||
+				       pparse_register_auto_init_ptr_array_extent(decl->var_name, decl, type);
+			/* `PA a[2]` with `typedef int (*PA)[4]`: typedef recovery
+			 * registers the pointed-at extent; fold the outer array on
+			 * top instead of letting register_array wipe it. */
+			if (from_typedef && own_array && decl->array_rank > 0 &&
+			    decl->array_rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
+				PParseBoundsArrayEntry *be =
+				    pparse_bounds_array_entry_for_token(decl->var_name);
+				if (be && be->ptr_hops > 0) {
+					uint8_t outer = decl->array_rank;
+					int prank = be->array_rank + outer;
+					if (prank > 15) prank = PPARSE_ARRAY_RANK_WRAP_ALL;
+					pparse_register_array_binding_hops_pre(
+					    decl->var_name, (uint8_t)prank, be->array_dim_complete,
+					    false, false, be->ptr_hops, outer);
+				}
+			}
 		}
 		bool complete = (own_array & (decl->array_dim_complete | pparse_match_ch(decl->end, '='))) |
 				((!own_array) & ((!base_array) | type->array_dim_complete));
 		bool register_array = (!is_raw) &
 			((brace_depth > 0) | ((brace_depth == 0) & (own_array | base_array))) &
 			complete & (own_array | base_array) & (!decl->is_func_ptr);
+		/* Combined ptr-to-array + outer array already recorded the full
+		 * shape; a second register_array would drop pointed-at dims. */
+		if (ptr_to_array) register_array = false;
+		if (from_typedef) {
+			PParseBoundsArrayEntry *be = pparse_bounds_array_entry_for_token(decl->var_name);
+			if (be && be->ptr_hops > 0 && be->pre_ptr_array > 0) register_array = false;
+		}
 		if (!register_array && !ptr_to_array && !from_typedef &&
 		    pparse_bounds_is_tracked_array(decl->var_name))
 			pparse_register_array_binding(decl->var_name, 0, false, false, true);
@@ -11821,6 +12318,52 @@ static void p1_register_knr_param_bindings(PParseToken *rparen, PParseToken *lbr
 			pparse_binding_apply_traits(pparse_typedef_lookup(_pc, decl.var_name), traits);
 			if (pparse_declarator_has_vla_after_first_bracket(seg, decl.end, semi, true))
 				pparse_register_vla_binding(decl.var_name, brace_depth);
+			/* Bounds extents: same shapes as ANSI parameters. Register on the
+			 * K&R declarator name; ENTRY_COVERS reaches body uses after it. */
+			if (pparse_feat(PPARSE_F_BOUNDS_CHECK) &&
+			    !(decl.var_name->flags & PPARSE_TF_RAW)) {
+				bool ptr_to_array = (decl.ptr_array_rank > 0) & !decl.is_func_ptr &
+						    !decl.is_vla & decl.ptr_array_dim_complete &
+						    (decl.ptr_array_rank != PPARSE_ARRAY_RANK_WRAP_ALL);
+				if (ptr_to_array) {
+					uint8_t hops = pparse_declarator_star_hops(decl.var_name);
+					if (decl.is_array && decl.array_rank > 0 &&
+					    decl.array_rank != PPARSE_ARRAY_RANK_WRAP_ALL) {
+						hops = (uint8_t)(hops + decl.array_rank);
+						if (hops > 15) hops = 15;
+					}
+					int full_rank = pparse_ptr_array_rank_with_type_array(
+					    decl.ptr_array_rank + hops, &ts);
+					if (full_rank > 15) full_rank = PPARSE_ARRAY_RANK_WRAP_ALL;
+					pparse_register_array_binding_hops(
+					    decl.var_name, (uint8_t)full_rank, true, false, false, hops);
+				} else {
+					(void)(pparse_register_type_ptr_array_extent(decl.var_name, &ts) ||
+					       pparse_register_type_array_ptr_extent(decl.var_name, &ts) ||
+					       pparse_register_typedef_array_extent(decl.var_name, &ts, true) ||
+					       pparse_register_type_array_extent(decl.var_name, &ts, true));
+				}
+				/* `int a[static N]`: locate `static` in the first bracket. */
+				if (!pparse_bounds_is_tracked_array(decl.var_name) && decl.is_array) {
+					PParseToken *br = pparse_next(_pc, decl.var_name);
+					while (br && br != decl.end &&
+					       !(pparse_match_ch(br, '[') && (br->flags & PPARSE_TF_OPEN)))
+						br = pparse_next(_pc, br);
+					if (br && pparse_match_ch(br, '[')) {
+						PParseToken *n = pparse_skip_noise(_pc, pparse_next(_pc, br));
+						while (n && n != pparse_pair_known(br) &&
+						       (n->tag & (PPARSE_TT_QUALIFIER | PPARSE_TT_STORAGE))) {
+							if (n->tag & PPARSE_TT_STORAGE &&
+							    pparse_equal(n, "static")) {
+								pparse_register_static_extent_param(
+								    decl.var_name, 1, pparse_idx(_pc, br));
+								break;
+							}
+							n = pparse_skip_noise(_pc, pparse_next(_pc, n));
+						}
+					}
+				}
+			}
 			seg = decl.end;
 			if (pparse_match_ch(seg, ',')) seg = pparse_next(_pc, seg);
 			else
