@@ -423,9 +423,10 @@ typedef struct {
 	int prev_index;		  // Index of previous entry with same name (-1 if none)
 	uint32_t token_index;	  // PParseToken pool index of the declaration
 	uint32_t scope_close_idx; // PParseToken index of matching '}' (UINT32_MAX for file scope)
-	/* All bitfields share `unsigned` so MSVC packs them with `ptr_hops` in one
-	 * unit. Mixing `bool : 1` and `unsigned : 4` starts a new allocation unit
-	 * there and breaks the 16-byte size assert (C2118 negative subscript). */
+	/* All members after scope_close_idx are `unsigned` bitfields so MSVC packs
+	 * flags + ptr_hops + array_rank into one 32-bit unit (20+4+8). A trailing
+	 * `uint8_t array_rank` is fine on clang/gcc (fills the leftover byte) but
+	 * MSVC starts a new storage unit and breaks the 16-byte size assert. */
 	unsigned is_vla : 1;
 	unsigned is_void : 1;
 	unsigned is_const : 1;
@@ -447,7 +448,7 @@ typedef struct {
 	unsigned is_struct_tag : 1;  // struct/union tag (not a typedef name)
 	unsigned array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	unsigned ptr_hops : 4;	     // pointer-to-array typedef: `*` count baked at the alias
-	uint8_t array_rank;	     // # of array dimensions (0 if not array);
+	unsigned array_rank : 8;     // # of array dimensions (0 if not array); 255 = WRAP_ALL
 } PParseTypedefEntry; // 16 bytes — four entries per 64-byte cache line
 
 typedef char prism_assert_typedef_entry_16[(sizeof(PParseTypedefEntry) == 16) ? 1 : -1];
