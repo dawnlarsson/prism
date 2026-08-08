@@ -7,11 +7,14 @@ on:
     branches: [main]
 
 jobs:
-  # Native x86_64 builds
   build-linux:
     name: linux - x86_64
     runs-on: ubuntu-latest
-    container: alpine:latest
+    container:
+      image: alpine:latest
+      # Overlay /tmp on GH made thousands of O_RUN compile temps crawl; keep them
+      # on tmpfs. Recipe run/compile also have hard timeouts in the harness.
+      options: --tmpfs /tmp:rw,exec,nosuid,size=1g
     steps:
       - name: Install Build Dependencies
         run: apk add --no-cache gcc g++ musl-dev git
@@ -26,7 +29,7 @@ jobs:
           gcc --version
 
       - name: "Stage 0: Build with host compiler"
-        run: gcc -o /tmp/prism_stage0 prism.c
+        run: gcc -O2 -o /tmp/prism_stage0 prism.c
 
       - name: "Stage 1: Prism builds itself"
         run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
@@ -53,15 +56,10 @@ jobs:
           prism test_hello.c
 
       - name: Run Test Suite
-        run: prism run .github/test.c
+        run: prism -O2 run .github/test.c
 
       - name: "Translation validation (--prism-verify on real, non-self-referential targets)"
         run: |
-          # Verify prism's own transpilation (large real program), and a
-          # defer/orelse-heavy demo. NOT test.c: it #includes the whole
-          # transpiler + test-data source, an unrepresentative self-referential
-          # input. The in-process contexts/insertion fixed-point oracles cover
-          # per-construct idempotence.
           prism --prism-verify prism.c -o /tmp/prism_verified
           prism --prism-verify .github/verify_smoke.c -o /tmp/verify_smoke && /tmp/verify_smoke
 
@@ -79,7 +77,7 @@ jobs:
           clang --version
 
       - name: "Stage 0: Build with host compiler"
-        run: clang -o /tmp/prism_stage0 prism.c
+        run: clang -O2 -o /tmp/prism_stage0 prism.c
 
       - name: "Stage 1: Prism builds itself"
         run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
@@ -106,7 +104,7 @@ jobs:
           prism test_hello.c
 
       - name: Run Test Suite
-        run: prism run .github/test.c
+        run: prism -O2 run .github/test.c
 
   build-macos-arm:
     name: macos - arm64
@@ -122,7 +120,7 @@ jobs:
           clang --version
 
       - name: "Stage 0: Build with host compiler"
-        run: clang -o /tmp/prism_stage0 prism.c
+        run: clang -O2 -o /tmp/prism_stage0 prism.c
 
       - name: "Stage 1: Prism builds itself"
         run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
@@ -149,7 +147,7 @@ jobs:
           prism test_hello.c
 
       - name: Run Test Suite
-        run: prism run .github/test.c
+        run: prism -O2 run .github/test.c
 
   build-windows:
     name: windows - x86_64
@@ -193,7 +191,6 @@ jobs:
       - name: Run Test Suite
         run: prism run .github/test.c
 
-  # Native arm64 build (GitHub ARM runner, Alpine via Docker)
   build-arm64:
     name: linux - arm64
     runs-on: ubuntu-24.04-arm
@@ -205,13 +202,14 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
             alpine:latest sh -c '
               set -e
               apk add --no-cache gcc g++ musl-dev
               echo "Architecture: $(uname -m)"
               gcc --version
               echo "=== Stage 0: Build with host compiler ==="
-              gcc -o /tmp/prism_stage0 prism.c
+              gcc -O2 -o /tmp/prism_stage0 prism.c
               echo "=== Stage 1: Prism builds itself ==="
               /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
               echo "=== Stage 2: Self-built Prism builds itself again ==="
@@ -225,7 +223,8 @@ jobs:
           int main() { printf("Hello from Alpine arm64!\n"); return 0; }
           EOF
               prism test_hello.c
-              prism run .github/test.c
+              export TMPDIR=/tmp
+              prism -O2 run .github/test.c
             '
 
   build-riscv:
@@ -253,6 +252,7 @@ jobs:
           docker run --rm --platform linux/riscv64 \
             --cpus ${{ steps.resources.outputs.cpus }} \
             --memory ${{ steps.resources.outputs.memory }} \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             alpine:edge sh -c '
@@ -261,7 +261,7 @@ jobs:
               echo "Architecture: $(uname -m)"
               gcc --version
               echo "=== Stage 0: Build with host compiler ==="
-              gcc -o /tmp/prism_stage0 prism.c
+              gcc -O2 -o /tmp/prism_stage0 prism.c
               echo "=== Stage 1: Prism builds itself ==="
               /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
               echo "=== Stage 2: Self-built Prism builds itself again ==="
@@ -275,5 +275,6 @@ jobs:
           int main() { printf("Hello from Alpine riscv64!\n"); return 0; }
           EOF
               prism test_hello.c
-              prism run .github/test.c
+              export TMPDIR=/tmp
+              prism -O2 run .github/test.c
             '

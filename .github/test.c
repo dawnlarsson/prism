@@ -140,6 +140,9 @@ static void fault_free(void *ptr) {
 #include <stdarg.h>
 
 #ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -676,9 +679,49 @@ static int run_shell_command(const char *cmd) {
 	return rc;
 }
 
+/* Recipe binaries must not be allowed to wedge the gate: a missing trap or a
+ * stuck compiler held GitHub Alpine runners until "lost communication" (~47m)
+ * because heartbeats only fire between cells. */
+static void recipe_alarm_nop(int sig) { (void)sig; }
+
+static int wait_pid_deadline(pid_t pid, int timeout_sec) {
+	struct sigaction sa, old;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = recipe_alarm_nop;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGALRM, &sa, &old);
+	alarm((unsigned)timeout_sec);
+	int status = 0;
+	pid_t r = waitpid(pid, &status, 0);
+	int saved = errno;
+	alarm(0);
+	sigaction(SIGALRM, &old, NULL);
+	if (r == pid) return status;
+	kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	errno = (r < 0 && saved == EINTR) ? ETIMEDOUT : saved;
+	return -1;
+}
+
+static int run_argv_timeout(char *const argv[], int timeout_sec) {
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	return wait_pid_deadline(pid, timeout_sec);
+}
+
 static int compile_output(const char *out, int run) {
 	static unsigned serial;
-	char src[256], bin[256], cmd[1024];
+	char src[256], bin[256];
 	unsigned id = ++serial;
 	snprintf(src, sizeof(src), "/tmp/prism_recipe_%ld_%u.c", (long)getpid(), id);
 	snprintf(bin, sizeof(bin), "/tmp/prism_recipe_%ld_%u.bin", (long)getpid(), id);
@@ -686,29 +729,31 @@ static int compile_output(const char *out, int run) {
 	if (!fp) return -1000;
 	fwrite(out, 1, strlen(out), fp);
 	fclose(fp);
-	snprintf(cmd, sizeof(cmd), "%s -w -std=gnu11 %s %s -o %s >/dev/null 2>&1",
-		 backend_cc(), run ? "" : "-fsyntax-only", src, bin);
-	int rc = run_shell_command(cmd);
-	if (rc != 0) {
-		unlink(src);
-		unlink(bin);
-		return -1001;
+	{
+		char *argv_syntax[] = {(char *)backend_cc(), "-w", "-std=gnu11", "-fsyntax-only", src, NULL};
+		char *argv_link[] = {(char *)backend_cc(), "-w", "-std=gnu11", src, "-o", bin, NULL};
+		int status = run_argv_timeout(run ? argv_link : argv_syntax, 30);
+		if (status < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			unlink(src);
+			unlink(bin);
+			return status < 0 && errno == ETIMEDOUT ? -1003 : -1001;
+		}
 	}
 	if (!run) {
 		unlink(src);
 		unlink(bin);
 		return 0;
 	}
-	/* Redirect the shell's own signal diagnostic as well as the program's
-	 * streams; bounds-trap cells intentionally terminate by signal. */
-	snprintf(cmd, sizeof(cmd), "{ %s; } >/dev/null 2>&1", bin);
-	rc = system(cmd);
-	unlink(src);
-	unlink(bin);
-	if (rc == -1) return -1002;
-	if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc);
-	if (!WIFEXITED(rc)) return -1002;
-	return WEXITSTATUS(rc);
+	{
+		char *argv_run[] = {bin, NULL};
+		int status = run_argv_timeout(argv_run, 8);
+		unlink(src);
+		unlink(bin);
+		if (status < 0) return errno == ETIMEDOUT ? -1004 : -1002;
+		if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+		if (!WIFEXITED(status)) return -1002;
+		return WEXITSTATUS(status);
+	}
 }
 
 /* `transpile()` preprocesses with the backend's selected dialect.  A direct
@@ -2929,21 +2974,34 @@ static void run_source_cell(const Recipe *r, const AxisValue *sel[4], long cell,
 	free(src);
 }
 
+/* GitHub-hosted runners have dropped mid-suite with "lost communication" when
+ * the gate stayed silent for tens of minutes on slow Alpine containers. Emit a
+ * line every so often so the job log stays alive and a stall is diagnosable. */
+static void recipe_heartbeat(const Stats *st, const char *id) {
+	static long last_cells;
+	static time_t last_t;
+	time_t now = time(NULL);
+	if (!last_t) last_t = now;
+	if (st->cells - last_cells < 2000 && now - last_t < 30) return;
+	last_cells = st->cells;
+	last_t = now;
+	fprintf(stderr, "PRISM RECIPES: progress %ld cells (+%ld pass / %ld fail) @ %s\n",
+		st->cells, st->passed, st->failed, id ? id : "-");
+	fflush(stderr);
+}
+
 static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 	const char *filter = getenv("PRISM_RECIPE_FILTER");
 	/* Optional focused-shard selector.  Unlike PRISM_RECIPE_FILTER this matches
 	 * an axis value tag, so a large product can be bisected without changing
 	 * generator code or weakening its unfiltered gate. */
 	const char *axis_filter = getenv("PRISM_AXIS_FILTER");
-	/* Optional shard selector, "i/n": run only the recipes whose index is
-	 * congruent to i modulo n. Recipes are independent and every temp path
-	 * already carries the pid, so n processes cover the gate between them with
-	 * no thread pool and no shared state -- 24.9s becomes 3.1s at n=32 on a
-	 * 32-core host. Interleaving rather than blocking keeps adjacent expensive
-	 * families (the four feature-matrix layouts) in different shards. Splitting
-	 * this way is only sound because run_internal now restores the environment
-	 * it borrows; before that, results depended on what had run earlier.
-	 * CI runs with the variable unset. */
+	/* Optional shard selector, "i/n": run only cells whose ordinal is
+	 * congruent to i modulo n. Cell-level (not recipe-level) so a single
+	 * huge product like contexts/expression cannot pin one shard while the
+	 * others idle — that is what made Alpine CI look wedged past 20m.
+	 * Temp paths already carry the pid, so shards do not collide. CI uses
+	 * this via .github/ci_run_suite.sh. */
 	long shard_i = 0, shard_n = 1;
 	{
 		const char *sh = getenv("PRISM_RECIPE_SHARD");
@@ -2959,8 +3017,8 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 			}
 		}
 	}
+	long gate_cell = 0;
 	for (size_t ri = 0; ri < count; ri++) {
-		if (shard_n > 1 && (long)(ri % (size_t)shard_n) != shard_i) continue;
 		const Recipe *r = &recipes[ri];
 		if (filter && *filter && !strstr(r->id, filter)) continue;
 		if ((r->requires & capabilities()) != r->requires) {
@@ -2969,13 +3027,18 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 		}
 		if (r->oracle & O_CLI) {
 			const AxisValue *none[4] = {0};
+			long cell_id = gate_cell++;
+			if (shard_n > 1 && (cell_id % shard_n) != shard_i) continue;
 			st->cells++;
 			if (run_cli(r, st, none)) st->passed++;
+			recipe_heartbeat(st, r->id);
 			continue;
 		}
 		if (r->oracle & O_INTERNAL) {
 			const AxisValue *none[4] = {0};
 			char failed_action = 0;
+			long cell_id = gate_cell++;
+			if (shard_n > 1 && (cell_id % shard_n) != shard_i) continue;
 			st->cells++;
 #ifndef _WIN32
 			if (run_internal(r, &failed_action)) st->passed++;
@@ -2989,12 +3052,16 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 			else
 				st->skipped++;
 #endif
+			recipe_heartbeat(st, r->id);
 			continue;
 		}
 		if (r->oracle & O_LIFECYCLE) {
 			const AxisValue *none[4] = {0};
+			long cell_id = gate_cell++;
+			if (shard_n > 1 && (cell_id % shard_n) != shard_i) continue;
 			st->cells++;
 			if (run_lifecycle(r, st, none)) st->passed++;
+			recipe_heartbeat(st, r->id);
 			continue;
 		}
 		size_t dims = 0, idx[4] = {0}, sizes[4] = {1, 1, 1, 1};
@@ -3011,10 +3078,14 @@ static void recipe_run(const Recipe *recipes, size_t count, Stats *st) {
 				if (axis_filter && *axis_filter && strstr(sel[i]->tag, axis_filter)) selected = true;
 			}
 			if (selected) {
-				long before = st->failed, skipped_before = st->skipped;
-				st->cells++;
-				run_source_cell(r, sel, st->cells, st);
-				if (st->failed == before && st->skipped == skipped_before) st->passed++;
+				long cell_id = gate_cell++;
+				if (!(shard_n > 1 && (cell_id % shard_n) != shard_i)) {
+					long before = st->failed, skipped_before = st->skipped;
+					st->cells++;
+					run_source_cell(r, sel, st->cells, st);
+					if (st->failed == before && st->skipped == skipped_before) st->passed++;
+					recipe_heartbeat(st, r->id);
+				}
 			}
 			if (!dims) break;
 			for (size_t i = dims; i-- > 0;) {
